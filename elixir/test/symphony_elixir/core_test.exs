@@ -510,6 +510,9 @@ defmodule SymphonyElixir.CoreTest do
             ref: nil,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "Todo", identifier: issue_identifier},
+            backend: :pi,
+            backend_process_pid: 42_424,
+            session_id: "pi-cancel-session",
             started_at: DateTime.utc_now()
           }
         },
@@ -533,6 +536,16 @@ defmodule SymphonyElixir.CoreTest do
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
       assert File.exists?(workspace)
+
+      [receipt_path] =
+        Path.wildcard(Path.join(test_root, ".symphony/cancellation-receipts/MT-555-*.json"))
+
+      receipt = receipt_path |> File.read!() |> Jason.decode!()
+      assert receipt["outcome"] == "cancelled"
+      assert receipt["reason"] in ["non_active_state:Backlog", "routing_revoked"]
+      assert receipt["backend"] == "pi"
+      assert receipt["backend_process_pid"] == 42_424
+      assert receipt["session_id"] == "pi-cancel-session"
     after
       File.rm_rf(test_root)
     end

@@ -44,9 +44,35 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert turn.result["data"] == %{"text" => "done"}
     assert turn.stats["success"]
     assert turn.stats["data"] == %{"tokens" => %{"input" => 12, "output" => 7, "total" => 19}}
+    assert turn.backend == :pi
+    assert turn.model == %{"id" => "gpt-5.6", "name" => "GPT-5.6", "provider" => "openai"}
+    assert turn.thinking_level == "xhigh"
+    assert is_integer(turn.backend_process_pid)
+    assert File.regular?(turn.receipt_path)
+
+    receipt = turn.receipt_path |> File.read!() |> Jason.decode!()
+    assert receipt["backend"] == "pi"
+    assert receipt["outcome"] == "completed"
+    assert receipt["session"]["id"] == "pi-session"
+    assert receipt["session"]["model"]["id"] == "gpt-5.6"
+    assert receipt["session"]["thinking_level"] == "xhigh"
+    assert receipt["details"]["assistant_text"] == "done"
+    assert receipt["details"]["stats"]["tokens"]["total"] == 19
+    assert receipt["runtime"]["pid"] == turn.backend_process_pid
+    assert receipt["stderr_tail"] == "fake Pi stderr\n"
     assert :ok = Backend.stop_session(session)
 
-    assert_receive {:pi_message, %{event: :session_started, session_id: "pi-session", backend: :pi}}
+    assert_receive {:pi_message,
+                    %{
+                      event: :session_started,
+                      session_id: "pi-session",
+                      backend: :pi,
+                      model: %{"id" => "gpt-5.6"},
+                      thinking_level: "xhigh",
+                      backend_process_pid: backend_process_pid
+                    }}
+
+    assert is_integer(backend_process_pid)
     assert_receive {:pi_message, %{event: :agent_started, backend: :pi}}
     assert_receive {:pi_message, %{event: :message_update, backend: :pi}}
     assert_receive {:pi_message, %{event: :agent_settled, backend: :pi}}
@@ -95,7 +121,63 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert :ok =
              AgentRunner.run(issue, nil, issue_state_fetcher: fn _issue_ids -> {:ok, []} end)
 
-    assert File.dir?(Path.join(workspace_root, "JARVIS-863"))
+    workspace = Path.join(workspace_root, "JARVIS-863")
+    assert File.dir?(workspace)
+
+    [receipt_path] =
+      Path.wildcard(Path.join(workspace, ".symphony/attempt-receipts/attempt-0000-turn-0001-*.json"))
+
+    assert File.regular?(receipt_path)
+    assert receipt_path |> File.read!() |> Jason.decode!() |> Map.fetch!("outcome") == "completed"
+    File.rm_rf!(test_root)
+  end
+
+  test "persists a typed receipt when Pi rejects turn setup" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-error-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    issue = %Issue{
+      id: "issue-pi-error",
+      identifier: "JARVIS-ERR",
+      title: "FAIL_SESSION_NAME"
+    }
+
+    on_message = fn message -> send(self(), {:pi_message, message}) end
+    assert {:ok, session} = Backend.start_session(workspace)
+
+    assert {:error, {:command_failed, %{"error" => "fixture rejection"}}} =
+             Backend.run_turn(session, "do not run", issue, on_message: on_message)
+
+    assert_receive {:pi_message,
+                    %{
+                      event: :turn_ended_with_error,
+                      payload: %{
+                        "outcome" => "failed",
+                        "details" => %{
+                          "stage" => "set_session_name_failed",
+                          "reason" => reason
+                        },
+                        "receipt_path" => receipt_path
+                      },
+                      session_id: "pi-session",
+                      backend: :pi
+                    }}
+
+    assert reason =~ "fixture rejection"
+    assert File.regular?(receipt_path)
+
+    receipt = receipt_path |> File.read!() |> Jason.decode!()
+    assert receipt["outcome"] == "failed"
+    assert receipt["details"]["stage"] == "set_session_name_failed"
+    assert :ok = Backend.stop_session(session)
     File.rm_rf!(test_root)
   end
 
@@ -118,7 +200,23 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert {:error, {:turn_timeout, :abort_acknowledged}} =
              Backend.run_turn(session, "hang", issue, timeout_ms: 30, on_message: on_message)
 
-    assert_receive {:pi_message, %{event: :turn_aborted, payload: %{reason: :timeout, outcome: :acknowledged}}}
+    assert_receive {:pi_message,
+                    %{
+                      event: :turn_aborted,
+                      payload: %{
+                        "outcome" => "aborted",
+                        "details" => %{
+                          "reason" => "{:turn_timeout, :abort_acknowledged}",
+                          "abort_outcome" => ":acknowledged"
+                        },
+                        "receipt_path" => receipt_path
+                      },
+                      session_id: "pi-session",
+                      backend: :pi
+                    }}
+
+    assert File.regular?(receipt_path)
+    assert receipt_path |> File.read!() |> Jason.decode!() |> Map.fetch!("outcome") == "aborted"
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(test_root)
   end
@@ -145,10 +243,17 @@ defmodule SymphonyElixir.Pi.BackendTest do
       id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
       case "$line" in
         *'"type":"get_state"'*)
-          printf '{"type":"response","id":"%s","success":true,"data":{"sessionId":"pi-session"}}\\n' "$id"
+          printf '{"type":"response","id":"%s","success":true,"data":{"sessionId":"pi-session","sessionFile":"/tmp/pi-session.jsonl","thinkingLevel":"xhigh","model":{"id":"gpt-5.6","name":"GPT-5.6","provider":"openai"}}}\\n' "$id"
           ;;
         *'"type":"set_session_name"'*)
-          printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+          case "$line" in
+            *'FAIL_SESSION_NAME'*)
+              printf '{"type":"response","id":"%s","success":false,"error":"fixture rejection"}\\n' "$id"
+              ;;
+            *)
+              printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+              ;;
+          esac
           ;;
         *'"type":"prompt"'*)
           case "$line" in

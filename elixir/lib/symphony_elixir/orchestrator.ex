@@ -218,7 +218,10 @@ defmodule SymphonyElixir.Orchestrator do
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
+        workspace_path: Map.get(running_entry, :workspace_path),
+        backend: Map.get(running_entry, :backend),
+        session_id: Map.get(running_entry, :session_id),
+        receipt_path: Map.get(running_entry, :receipt_path)
       })
     end
   end
@@ -249,7 +252,10 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: running_entry.issue.url,
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
+      workspace_path: Map.get(running_entry, :workspace_path),
+      backend: Map.get(running_entry, :backend),
+      session_id: Map.get(running_entry, :session_id),
+      receipt_path: Map.get(running_entry, :receipt_path)
     })
   end
 
@@ -423,12 +429,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, "terminal_state:#{issue.state}")
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "routing_revoked")
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -436,7 +442,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, "non_active_state:#{issue.state}")
     end
   end
 
@@ -490,7 +496,7 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        terminate_running_issue(state_acc, issue_id, false, "issue_missing")
       end
     end)
   end
@@ -551,13 +557,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(
+         %State{} = state,
+         issue_id,
+         cleanup_workspace,
+         cancellation_reason
+       ) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        persist_cancellation_receipt(running_entry, cancellation_reason)
 
         stop_running_task(pid, ref, state.task_supervisor)
 
@@ -575,6 +587,62 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp persist_cancellation_receipt(running_entry, reason) when is_map(running_entry) do
+    identifier = Map.get(running_entry, :identifier, "unknown")
+    directory = Path.join(Config.local_workspace_root(), ".symphony/cancellation-receipts")
+    nonce = System.unique_integer([:positive, :monotonic])
+    path = Path.join(directory, "#{safe_receipt_component(identifier)}-#{nonce}.json")
+    temporary_path = "#{path}.tmp"
+
+    receipt = %{
+      "schema_version" => 1,
+      "outcome" => "cancelled",
+      "reason" => reason,
+      "cancelled_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "issue" => %{
+        "id" => running_entry |> Map.get(:issue) |> issue_field(:id),
+        "identifier" => identifier,
+        "url" => running_entry |> Map.get(:issue) |> issue_field(:url)
+      },
+      "backend" => Map.get(running_entry, :backend),
+      "backend_process_pid" => Map.get(running_entry, :backend_process_pid),
+      "session_id" => Map.get(running_entry, :session_id),
+      "workspace_path" => Map.get(running_entry, :workspace_path),
+      "last_event" => Map.get(running_entry, :last_codex_event),
+      "prior_receipt_path" => Map.get(running_entry, :receipt_path)
+    }
+
+    with :ok <- File.mkdir_p(directory),
+         :ok <- File.write(temporary_path, Jason.encode_to_iodata!(receipt, pretty: true)),
+         :ok <- File.rename(temporary_path, path) do
+      Logger.info("Recorded orchestrator cancellation receipt path=#{path} issue_identifier=#{identifier} backend=#{Map.get(running_entry, :backend)}")
+      :ok
+    else
+      {:error, receipt_reason} ->
+        File.rm(temporary_path)
+        Logger.warning("Unable to record orchestrator cancellation receipt for issue_identifier=#{identifier}: #{inspect(receipt_reason)}")
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("Unable to record orchestrator cancellation receipt: #{inspect(error)}")
+      :ok
+  end
+
+  defp issue_field(%Issue{} = issue, key), do: Map.get(issue, key)
+  defp issue_field(_issue, _key), do: nil
+
+  defp safe_receipt_component(value) do
+    value
+    |> to_string()
+    |> String.replace(~r/[^A-Za-z0-9._-]+/, "-")
+    |> String.trim("-")
+    |> case do
+      "" -> "unknown"
+      safe -> safe
     end
   end
 
@@ -626,11 +694,14 @@ defmodule SymphonyElixir.Orchestrator do
         next_attempt = next_retry_attempt_from_running(running_entry)
 
         state
-        |> terminate_running_issue(issue_id, false)
+        |> terminate_running_issue(issue_id, false, "stall_timeout")
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
+          error: "stalled for #{elapsed_ms}ms without codex activity",
+          backend: Map.get(running_entry, :backend),
+          session_id: Map.get(running_entry, :session_id),
+          receipt_path: Map.get(running_entry, :receipt_path)
         })
       end
     else
@@ -762,6 +833,8 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
+      backend: Map.get(running_entry, :backend),
+      receipt_path: Map.get(running_entry, :receipt_path),
       error: error,
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
@@ -1053,6 +1126,9 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    backend = pick_retry_runtime_value(previous_retry, metadata, :backend)
+    session_id = pick_retry_runtime_value(previous_retry, metadata, :session_id)
+    receipt_path = pick_retry_runtime_value(previous_retry, metadata, :receipt_path)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1076,7 +1152,10 @@ defmodule SymphonyElixir.Orchestrator do
             issue_url: issue_url,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            backend: backend,
+            session_id: session_id,
+            receipt_path: receipt_path
           })
     }
   end
@@ -1089,7 +1168,10 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          backend: Map.get(retry_entry, :backend),
+          session_id: Map.get(retry_entry, :session_id),
+          receipt_path: Map.get(retry_entry, :receipt_path)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1281,6 +1363,10 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
 
+  defp pick_retry_runtime_value(previous_retry, metadata, key) do
+    Map.get(metadata, key) || Map.get(previous_retry, key)
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
@@ -1442,6 +1528,12 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
+        |> maybe_put_runtime_value(:backend, Map.get(metadata, :backend))
+        |> maybe_put_runtime_value(:backend_process_pid, Map.get(metadata, :backend_process_pid))
+        |> maybe_put_runtime_value(:model, Map.get(metadata, :model))
+        |> maybe_put_runtime_value(:thinking_level, Map.get(metadata, :thinking_level))
+        |> maybe_put_runtime_value(:session_file, Map.get(metadata, :session_file))
+        |> maybe_put_runtime_value(:receipt_path, Map.get(metadata, :receipt_path))
       end)
 
     retrying =
@@ -1457,6 +1549,9 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path)
         }
+        |> maybe_put_runtime_value(:backend, Map.get(retry, :backend))
+        |> maybe_put_runtime_value(:session_id, Map.get(retry, :session_id))
+        |> maybe_put_runtime_value(:receipt_path, Map.get(retry, :receipt_path))
       end)
 
     blocked =
@@ -1476,6 +1571,8 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_message: Map.get(metadata, :last_codex_message),
           last_codex_event: Map.get(metadata, :last_codex_event)
         }
+        |> maybe_put_runtime_value(:backend, Map.get(metadata, :backend))
+        |> maybe_put_runtime_value(:receipt_path, Map.get(metadata, :receipt_path))
       end)
 
     {:reply,
@@ -1520,6 +1617,11 @@ defmodule SymphonyElixir.Orchestrator do
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
+    backend_process_pid = Map.get(running_entry, :backend_process_pid)
+    model = Map.get(running_entry, :model)
+    thinking_level = Map.get(running_entry, :thinking_level)
+    session_file = Map.get(running_entry, :session_file)
+    receipt_path = Map.get(running_entry, :receipt_path)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
@@ -1533,6 +1635,11 @@ defmodule SymphonyElixir.Orchestrator do
         backend: backend_for_update(Map.get(running_entry, :backend), update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
+        backend_process_pid: runtime_value_for_update(backend_process_pid, update, :backend_process_pid),
+        model: runtime_value_for_update(model, update, :model),
+        thinking_level: runtime_value_for_update(thinking_level, update, :thinking_level),
+        session_file: runtime_value_for_update(session_file, update, :session_file),
+        receipt_path: runtime_value_for_update(receipt_path, update, :receipt_path),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
@@ -1565,6 +1672,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp backend_for_update(_existing, %{backend: backend}) when is_atom(backend), do: backend
   defp backend_for_update(existing, _update), do: existing
+
+  defp runtime_value_for_update(existing, update, key) do
+    case Map.get(update, key) do
+      nil -> existing
+      value -> value
+    end
+  end
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

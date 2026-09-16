@@ -1,6 +1,6 @@
 # Jarvis thin Pi backend plan
 
-Status: first local feasibility spike implemented; live acceptance still blocked by baseline validation gaps
+Status: candidate hardening implemented; live single-ticket acceptance is still pending
 
 This fork stays close to `openai/symphony`. It adds a removable Pi execution path without replacing
 Symphony's tracker, workspace, polling, retry, reconciliation, concurrency, lifecycle, or
@@ -51,29 +51,35 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
 - `SymphonyElixir.Codex.AppServer` now implements the contract directly; its wire protocol and
   existing call sites remain unchanged.
 - `SymphonyElixir.Pi.Rpc` provides strict stdout JSONL request correlation, partial-line buffering,
-  CRLF tolerance, separate stderr capture, async event callbacks, unattended UI cancellation,
-  completion predicates, timeout, and graceful abort support.
+  CRLF tolerance, separate stderr capture, async event callbacks, unattended dialog cancellation,
+  fire-and-forget UI observation without protocol responses, completion predicates, timeout, and
+  graceful abort support.
 - `SymphonyElixir.Pi.Backend` performs `get_state`, `set_session_name`, `prompt` through
   `agent_settled`, `get_last_assistant_text`, and `get_session_stats`, with Pi-native event and
   usage mapping. It is explicitly local-only; configured SSH workers are rejected rather than
   silently claimed as supported.
 - The orchestrator snapshots the selected backend into each new running attempt and passes that
-  value to `AgentRunner`; an in-flight attempt does not follow a later workflow reload.
+  value to `AgentRunner`; an in-flight attempt does not follow a later workflow reload. Running,
+  blocked, and retry snapshots preserve backend and receipt identity when available.
+- Pi turn completion, typed failure, timeout/abort, and orchestrator cancellation now write bounded
+  JSON receipts. Pi receipts include the native session, effective model and thinking level,
+  backend PID, final assistant text or failure, stats, and a bounded stderr tail.
 - `pi_rpc_test.exs` and `pi_backend_test.exs` use deterministic fake processes only. They do not
   call an LLM, mutate Linear, install Pi extensions, or replace the Jarvis runtime.
-- Focused validation currently passes: `9 tests, 0 failures` for the Pi RPC/backend modules,
-  including backend resolution, the `AgentRunner` opt-in path, and timeout-to-abort behavior.
+- Focused validation currently passes: `11 tests, 0 failures` for the Pi RPC/backend modules. The
+  targeted Pi plus orchestrator/cancellation receipt run passes `57 tests, 0 failures`.
 - A real no-prompt Pi smoke through `SymphonyElixir.Pi.Rpc` successfully completed `get_state` in
   WSL2 and on the authorized M2 Air; no LLM prompt was sent.
 
 
 ## PR readiness
 
-This first slice is suitable for a transparent draft PR for CI and review, but it is not
-merge-ready. The clean upstream baseline has been measured separately; the full WSL2 suite still
-has the known fake-process, SSH, snapshot, and timing-fixture failures noted above. The
-cross-device no-prompt bootstrap is proven; a single-ticket LLM turn, orchestrator receipt
-coverage, and acceptance/rollback evidence are still required before a non-draft merge candidate.
+This first slice remains a transparent draft PR until live acceptance completes. The clean upstream
+baseline has been measured separately; the full WSL2 suite still has the known fake-process, SSH,
+snapshot, and timing-fixture failures noted above. The cross-device no-prompt bootstrap, durable
+worker receipts, and orchestrator receipt propagation are proven by focused tests. A supported-host
+CI rerun for the hardened head plus a single-ticket LLM turn and acceptance/rollback evidence are
+still required before a non-draft merge candidate.
 
 ## Fixed boundaries
 
@@ -126,16 +132,13 @@ The spike must use a fake Pi process for deterministic tests and one no-prompt r
 available. It must not make an LLM call, mutate Linear, install extensions, or write to shared user
 sessions.
 
-### 2. Backend integration — first slice started
+### 2. Backend integration — candidate hardening implemented
 
-The resolver, `agent.backend: codex|pi` validation, `AgentRunner` session/turn selection, and
-Pi-to-existing-update mapping are now present. Remaining integration work is intentionally
-bounded:
+The resolver, `agent.backend: codex|pi` validation, `AgentRunner` session/turn selection,
+Pi-to-existing-update mapping, durable Pi receipts, generic orchestrator cancellation receipts,
+and snapshot proof fields are now present. Remaining integration work is intentionally bounded:
 
-- establish a green Codex regression baseline in a supported native environment
-- add orchestrator-level coverage for backend identity, error, timeout, and cancellation receipts
-- make proof/session summary fields durable at the worker boundary without making the orchestrator
-  Pi-aware
+- re-run supported-host CI for the hardened candidate head
 - decide the upstream-sync and release pin procedure before any live use
 
 ### 3. Single-ticket acceptance

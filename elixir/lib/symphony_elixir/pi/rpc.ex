@@ -10,11 +10,15 @@ defmodule SymphonyElixir.Pi.Rpc do
 
   @port_line_bytes 1_048_576
   @default_timeout_ms 5_000
+  @dialog_ui_methods ["select", "confirm", "input", "editor"]
+  @fire_and_forget_ui_methods ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]
 
   @type session :: %{
           port: port(),
           workspace: Path.t(),
-          stderr_path: Path.t()
+          stderr_path: Path.t(),
+          command: String.t(),
+          os_pid: non_neg_integer() | nil
         }
 
   @spec start(Path.t(), String.t(), keyword()) :: {:ok, session()} | {:error, term()}
@@ -125,7 +129,20 @@ defmodule SymphonyElixir.Pi.Rpc do
           ]
         )
 
-      {:ok, %{port: port, workspace: workspace, stderr_path: stderr_path}}
+      os_pid =
+        case Port.info(port, :os_pid) do
+          {:os_pid, pid} when is_integer(pid) and pid >= 0 -> pid
+          _ -> nil
+        end
+
+      {:ok,
+       %{
+         port: port,
+         workspace: workspace,
+         stderr_path: stderr_path,
+         command: command,
+         os_pid: os_pid
+       }}
     end
   end
 
@@ -158,10 +175,29 @@ defmodule SymphonyElixir.Pi.Rpc do
   defp dispatch_message(state, %{"type" => "response"} = response),
     do: handle_response_message(state, response)
 
-  defp dispatch_message(state, %{"type" => "extension_ui_request", "id" => ui_id} = request)
-       when is_binary(ui_id) do
-    result = handle_ui_request(state, request)
+  defp dispatch_message(
+         state,
+         %{"type" => "extension_ui_request", "id" => ui_id, "method" => method} = request
+       )
+       when is_binary(ui_id) and method in @dialog_ui_methods do
+    result = cancel_dialog_ui_request(state, request)
     continue_after_ui_request(result, state)
+  end
+
+  defp dispatch_message(
+         %{on_event: on_event} = state,
+         %{"type" => "extension_ui_request", "id" => ui_id, "method" => method} = request
+       )
+       when is_binary(ui_id) and method in @fire_and_forget_ui_methods do
+    on_event.(Map.put(request, "handled", "observed"))
+    receive_response(state)
+  end
+
+  defp dispatch_message(
+         _state,
+         %{"type" => "extension_ui_request", "method" => method}
+       ) do
+    {:error, {:unsupported_extension_ui_method, method}}
   end
 
   defp dispatch_message(state, %{} = event) do
@@ -206,7 +242,10 @@ defmodule SymphonyElixir.Pi.Rpc do
 
   defp response_result(response), do: {:ok, response}
 
-  defp handle_ui_request(%{session: %{port: port}, on_event: on_event}, %{"id" => ui_id} = request)
+  defp cancel_dialog_ui_request(
+         %{session: %{port: port}, on_event: on_event},
+         %{"id" => ui_id} = request
+       )
        when is_binary(ui_id) do
     case send_message(port, %{"type" => "extension_ui_response", "id" => ui_id, "cancelled" => true}) do
       :ok ->

@@ -130,7 +130,9 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: agent_message_handler(codex_update_recipient, issue, backend_name(backend))
+             on_message: agent_message_handler(codex_update_recipient, issue, backend_name(backend)),
+             attempt: Keyword.get(opts, :attempt),
+             turn_number: turn_number
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 

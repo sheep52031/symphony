@@ -85,6 +85,77 @@ defmodule SymphonyElixir.Pi.RpcTest do
     File.rm_rf!(test_root)
   end
 
+  test "records fire-and-forget extension UI requests without sending a response" do
+    test_root = temp_root!()
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+
+    write_script!(script, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"type":"prompt"'*)
+          id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+          printf '%s\\n' '{"type":"extension_ui_request","id":"ui-notify","method":"notify","message":"working"}'
+          printf '%s\\n' '{"type":"agent_settled"}'
+          printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+          ;;
+        *'"type":"extension_ui_response"'*)
+          exit 8
+          ;;
+      esac
+    done
+    """)
+
+    assert {:ok, session} = Rpc.start(workspace, script)
+    on_event = fn event -> send(self(), {:pi_event, event}) end
+
+    assert {:ok, %{"success" => true}} =
+             Rpc.request(session, "prompt", %{"message" => "fixture prompt"},
+               on_event: on_event,
+               until: fn event -> event["type"] == "agent_settled" end
+             )
+
+    assert_receive {:pi_event,
+                    %{
+                      "type" => "extension_ui_request",
+                      "method" => "notify",
+                      "handled" => "observed"
+                    }}
+
+    assert_receive {:pi_event, %{"type" => "agent_settled"}}
+    assert :ok = Rpc.close(session)
+
+    File.rm_rf!(test_root)
+  end
+
+  test "rejects unknown extension UI methods instead of guessing response semantics" do
+    test_root = temp_root!()
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+
+    write_script!(script, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"type":"prompt"'*)
+          printf '%s\\n' '{"type":"extension_ui_request","id":"ui-future","method":"futureMethod"}'
+          ;;
+      esac
+    done
+    """)
+
+    assert {:ok, session} = Rpc.start(workspace, script)
+
+    assert {:error, {:unsupported_extension_ui_method, "futureMethod"}} =
+             Rpc.request(session, "prompt", %{"message" => "fixture prompt"})
+
+    assert :ok = Rpc.close(session)
+    File.rm_rf!(test_root)
+  end
+
   test "returns timeout and then permits a graceful abort request" do
     test_root = temp_root!()
     workspace = Path.join(test_root, "workspace")

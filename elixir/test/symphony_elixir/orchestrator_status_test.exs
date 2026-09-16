@@ -102,6 +102,115 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator preserves Pi identity and timeout receipt across retry" do
+    issue_id = "issue-pi-receipt"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-PI",
+      title: "Pi receipt test",
+      description: "Capture Pi runtime proof",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-PI"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :PiReceiptOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      backend: "pi",
+      worker_host: nil,
+      workspace_path: "/tmp/MT-PI",
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      retry_attempt: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "pi-session-live",
+         backend: :pi,
+         backend_process_pid: 42_424,
+         model: %{"id" => "gpt-5.6", "provider" => "openai"},
+         thinking_level: "xhigh",
+         session_file: "/tmp/pi-session.jsonl",
+         timestamp: now
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_aborted,
+         session_id: "pi-session-live",
+         backend: :pi,
+         receipt_path: "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json",
+         payload: %{"outcome" => "aborted"},
+         timestamp: now
+       }}
+    )
+
+    assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
+    assert snapshot_entry.backend == :pi
+    assert snapshot_entry.backend_process_pid == 42_424
+    assert snapshot_entry.model == %{"id" => "gpt-5.6", "provider" => "openai"}
+    assert snapshot_entry.thinking_level == "xhigh"
+    assert snapshot_entry.session_id == "pi-session-live"
+    assert snapshot_entry.session_file == "/tmp/pi-session.jsonl"
+
+    assert snapshot_entry.receipt_path ==
+             "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json"
+
+    assert snapshot_entry.last_codex_event == :turn_aborted
+
+    send(pid, {:DOWN, process_ref, :process, self(), {:turn_timeout, :abort_acknowledged}})
+
+    retry_snapshot = GenServer.call(pid, :snapshot)
+    assert retry_snapshot.running == []
+    assert [retry_entry] = retry_snapshot.retrying
+    assert retry_entry.backend == :pi
+    assert retry_entry.session_id == "pi-session-live"
+
+    assert retry_entry.receipt_path ==
+             "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json"
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
