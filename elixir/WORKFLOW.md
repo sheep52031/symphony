@@ -28,8 +28,13 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
+  # Keep the default on Codex; Pi is an explicit local-only opt-in.
+  backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+pi:
+  # Executed by non-interactive bash -lc; use a host-specific absolute launcher when PATH is not inherited.
+  command: pi --mode rpc --session-dir .symphony/pi-session
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

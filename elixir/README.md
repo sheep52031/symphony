@@ -27,6 +27,11 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
+`agent.backend` defaults to `codex`. Set it to `pi` only when PiAgent is installed on the same
+local worker. The first Pi backend is local-worker-only and runs its command through non-interactive
+`bash -lc`; on Windows, run Symphony and Pi inside the same WSL2 environment. On macOS, prefer a
+host-specific absolute Pi launcher when interactive shell PATH entries are not inherited.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -135,8 +140,11 @@ hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
 agent:
+  backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+pi:
+  command: pi --mode rpc --session-dir .symphony/pi-session
 codex:
   command: codex app-server
 ---
@@ -149,6 +157,9 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `pi.command` defaults to `pi --mode rpc --session-dir .symphony/pi-session`. The command must
+  resolve from non-interactive `bash -lc`; keep the session directory inside the issue workspace.
+- Pi SSH workers are rejected in this first slice rather than being silently treated as supported.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -169,8 +180,13 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
+- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` is an explicit,
+  local-only opt-in in this fork; Pi workers configured with SSH hosts are rejected until a native
+  remote Pi transport is added.
+- `pi.command` is the complete local Pi RPC command. It should use `--mode rpc` and an explicit
+  per-workspace `--session-dir`; stderr is captured beside the workspace session proof.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+  invocation when a turn completes normally but the issue is still in an active state. Default: `20`."}]} رهي даирилири=functions.edit  (commentary json娱乐彩票.. )}
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

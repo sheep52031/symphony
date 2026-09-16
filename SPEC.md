@@ -445,6 +445,10 @@ Fields:
 
 Fields:
 
+- `backend` (string)
+  - Default: `codex`.
+  - Supported values in this fork: `codex` and `pi`.
+  - Selects only the execution backend for new attempts; an in-flight attempt keeps its selected backend.
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -460,7 +464,18 @@ Fields:
   - State keys are normalized (`trim + lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `pi` (object)
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `pi --mode rpc --session-dir .symphony/pi-session`.
+  - The runtime launches this command via `bash -lc` in the issue workspace.
+  - The launched process MUST speak Pi's strict JSONL RPC protocol on stdout; stderr is diagnostics.
+  - In this fork's first slice, Pi is local-only. Configured SSH workers are rejected rather than
+    silently treated as supported.
+
+#### 5.3.7 `codex` (object)
 
 Fields:
 
@@ -600,7 +615,8 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- `codex.command` is present and non-empty when `agent.backend` is `codex`.
+- `pi.command` is present and non-empty when `agent.backend` is `pi`.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -620,10 +636,12 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
+- `agent.backend`: string, default `codex`, supported values `codex` and `pi`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `pi.command`: shell command string, default `pi --mode rpc --session-dir .symphony/pi-session`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
