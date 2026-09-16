@@ -164,7 +164,6 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp backend_name(SymphonyElixir.Codex.AppServer), do: :codex
   defp backend_name(SymphonyElixir.Pi.Backend), do: :pi
-  defp backend_name(backend), do: backend
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
