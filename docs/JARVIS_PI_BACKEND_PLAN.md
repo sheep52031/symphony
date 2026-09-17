@@ -1,8 +1,8 @@
 # Jarvis thin Pi backend plan
 
-Status: local remediations are implemented and validated; a no-prompt live Pi smoke passed in WSL2.
-The second authorized single-ticket canary remains pending because this host has no approved
-tracker/provider credentials for an LLM run.
+Status: release candidate validated. The authorized JARVIS-877 single-ticket canary proved the
+isolated Pi worker, host-mediated tracker bridge, durable completion/handoff receipts, Human Review
+transition, and rollback to the Codex default on candidate `d11bbb780bc8ab1ed4a3aee222e6f709bf37e579`.
 
 This fork stays close to `openai/symphony`. It adds a removable Pi execution path without replacing
 Symphony's tracker, workspace, polling, retry, reconciliation, concurrency, lifecycle, or
@@ -95,25 +95,35 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
   the full native suite and quality gate above cover them. The dependency lock was refreshed within
   the declared constraints to patched Bandit/Plug/Phoenix/Req/Mint/LiveView/Decimal releases.
 - A real no-prompt Pi smoke through `SymphonyElixir.Pi.Rpc` successfully completed `get_state` in
-  WSL2 using PiAgent `0.85.1` and the explicit Linux launcher; no LLM prompt was sent. A full
-  single-ticket live acceptance (tracker mutation, credential-negative proof, and durable handoff)
-  is not claimed without an authorized provider credential and issue.
+  WSL2 using PiAgent `0.85.1` and the explicit Linux launcher; no LLM prompt was sent.
 - The first authorized live Pi ticket (JARVIS-868) produced one workspace/branch/PR and stopped at
   Human Review. It also proved two blockers: Pi could discover a Windows User-scope Linear token via
   PowerShell, and reconciliation cancelled the final turn before a per-ticket completion receipt
   existed. The loopback bridge, deferred handoff, and interrupted receipt are direct remediations;
   JARVIS-868 is failure evidence for those old paths, not acceptance evidence for the remediations.
-
+- The second authorized live canary, JARVIS-877, ran candidate `d11bbb7` with one Pi worker and one
+  workspace. PiAgent `0.85.1` used `openai-codex` / `gpt-5.6-luna` / `high`, committed the bounded
+  evidence change at `68bb5e6926ca61c293c20b126848110373c17afb`, opened
+  `sheep52031/symphony#2`, and staged `Human Review` through `symphony_handoff`. Symphony persisted
+  the settled completion receipt before the host-side Linear mutation and then persisted the
+  separate `handoff_completed` receipt. Stable copies and a manifest remain under
+  `workspaces-pi-canary/.symphony/completion-receipts/JARVIS-877/`.
+- JARVIS-877's LLM-callable shell reported `LINEAR_API_KEY` and `BW_SESSION` absent. Pi loaded only
+  the generated tracker extension plus an isolated workspace-owned agent/session directory; the
+  extension removes its actual bridge URL, capability, and tool-spec bootstrap variables before
+  agent tools run, as covered by deterministic bridge tests. A separate negative-auth probe removed
+  ambient credential-like variables, failed closed without an isolated provider credential, and
+  still reached authoritative `agent_settled`. The post-canary empty-selector launch restored
+  `agent.backend: codex`, started no LLM worker, and left the product issue unchanged.
 
 ## PR readiness
 
-This slice remains a transparent draft PR. The first single-ticket LLM canary completed its scoped
-code work but failed the security/lifecycle gate, so it did not make the backend production-ready.
-The bridge, secret-command, deferred-handoff, and interrupted-receipt remediations now have full
-native local validation and a real no-prompt Pi smoke. A separately authorized one-ticket canary
-must still prove that Pi cannot read the Linear/Bitwarden credentials and that completion evidence is
-durable before Human Review reconciliation. Rollback to the official Codex runtime remains part of
-the gate.
+The release gate is satisfied for the bounded, opt-in, local-only Pi backend. Candidate `d11bbb7`
+passed the authorized JARVIS-877 tracker/security/lifecycle canary, durable receipt read-back,
+Human Review handoff, negative credential probe, and Codex-default rollback. The branch also passed
+fresh native-Linux `make all` and GitHub `make-all`. Pi remains disabled unless a workflow explicitly
+selects `agent.backend: pi`; SSH Pi workers remain unsupported, and Codex remains the default and
+rollback path.
 
 ## Fixed boundaries
 
@@ -166,33 +176,30 @@ The spike must use a fake Pi process for deterministic tests and one no-prompt r
 available. It must not make an LLM call, mutate Linear, install extensions, or write to shared user
 sessions.
 
-### 2. Backend integration — security/lifecycle rework implemented locally
+### 2. Backend integration — security/lifecycle rework completed
 
 The resolver, `agent.backend: codex|pi` validation, `AgentRunner` session/turn selection,
 Pi-to-existing-update mapping, durable receipts, session-scoped host tracker bridge, deferred
-handoff, host secret command, and snapshot proof fields are present. Remaining work is bounded:
+handoff, host secret command, and snapshot proof fields are present. Deterministic lifecycle,
+cancellation, receipt, isolation, secret-command, bridge, and Codex-regression coverage passes on a
+supported LF-native WSL/Linux checkout. The exact candidate has supported-host GitHub CI and an
+owner-approved Bitwarden Secrets Manager launcher supplies only the control-plane Linear secret.
 
-- finish any remaining deterministic cancellation-race edge cases
-- run the full suite and `make all` on a supported LF-native host; this WSL/Windows checkout still
-  reports the measured baseline line-ending/fake-process/SSH/snapshot failures
-- push an exact reviewed commit and require supported-host CI
-- define an operator-approved non-interactive Bitwarden unlock/session provisioning policy; the
-  inspected Windows vault is currently locked and no unattended auth value is available
+### 3. Single-ticket acceptance — second canary passed
 
-### 3. Single-ticket acceptance — first canary rejected; second canary required
+JARVIS-877 supplied the required live evidence with one explicitly authorized Linear issue and one
+worker only:
 
-Use one new disposable, explicitly authorized Linear ticket and one worker only:
-
-- exact issue/workspace/branch identity
-- no auto-merge and stop at Human Review
-- Codex baseline regression remains green
-- Pi worker proof includes event stream, session identity, final text, stats, stderr tail, and
-  timeout/abort outcome
-- prove tracker operations traverse the loopback bridge, bridge/bootstrap/Bitwarden/Linear secrets
-  are absent from Pi and its shell descendants, and no ambient host credential fallback is usable
-- prove completion receipt persistence precedes the provider handoff, the handoff has a separate
-  receipt, and cancellation evidence links a non-null prior receipt
-- verify single-writer behavior and rollback to `agent.backend: codex`
+- exact issue/workspace/branch/PR identity and no duplicate runtime or workspace
+- no auto-merge; the worker stopped at Human Review
+- Codex baseline regression remained green
+- Pi worker evidence includes event stream, session identity, effective model/thinking level, final
+  text, stats, bounded stderr, and deterministic timeout/abort coverage
+- tracker operations traversed the loopback bridge; ambient Bitwarden/Linear credentials were absent
+  from Pi and shell descendants, and the negative-auth probe failed closed
+- completion receipt persistence preceded provider handoff; handoff has a separate durable receipt,
+  and cancellation evidence links a non-null prior receipt
+- rollback restored `agent.backend: codex` with an empty selector and no product mutation
 
 ## Non-goals
 
