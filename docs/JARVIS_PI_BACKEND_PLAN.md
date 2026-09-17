@@ -1,7 +1,8 @@
 # Jarvis thin Pi backend plan
 
-Status: first live canary completed but exposed credential-boundary and handoff-evidence defects;
-remediations are implemented locally and require full validation plus a second authorized canary
+Status: local remediations are implemented and validated; a no-prompt live Pi smoke passed in WSL2.
+The second authorized single-ticket canary remains pending because this host has no approved
+tracker/provider credentials for an LLM run.
 
 This fork stays close to `openai/symphony`. It adds a removable Pi execution path without replacing
 Symphony's tracker, workspace, polling, retry, reconciliation, concurrency, lifecycle, or
@@ -11,22 +12,20 @@ observability responsibilities.
 
 - Fork: `sheep52031/symphony`
 - Upstream: `openai/symphony`
-- Baseline: `be10a1b79df723d6d7612b5651c8522704dafb2e` (`main`, currently identical to upstream)
+- Baseline: Official Symphony v0.0.3 peeled commit `1c0fb6c8e8ef9031a2c861e62af5f9e66cee39cb`,
+  contained by the post-release nightly `be10a1b79df723d6d7612b5651c8522704dafb2e` (`main`)
 - Working branch: `jarvis/symphony-pi-backends`
-- Current Jarvis runtime pin: Symphony Elixir `v0.0.2`, commit `653f8b3cc476db03420479ba6f95b2ed7281c401`
+- Current branch tip: `475463b5796f5b6ca9891868827bf93cc5052446`
 - Jarvis-specific tracker and prompt policy remains in the separate `jarvis-next` checkout. This
   fork's generic `elixir/WORKFLOW.md` must not acquire Jarvis-private project identifiers or
   credentials.
-- WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. At pushed candidate
-  `e53c8e9f9b34f39047e2cea96acfd7a57f0ebb42`, the local branch reported `312 tests, 40 failures,
-  6 skipped`; a clean upstream baseline reported `299 tests, 47 failures, 6 skipped`. Exact-head
-  supported-host CI passed with `312 tests, 0 failures, 6 skipped`. The local failures remain the
-  known WSL/Windows fake-process, SSH, snapshot, and timing-fixture mismatch and are not described
-  as green CI. With the bridge/handoff/security changes, the latest local run reports `330 tests,
-  40 failures, 6 skipped`; the failure families remain the measured WSL/Windows baseline and no
-  new focused test fails. A source-equivalent candidate copied onto a Linux-native filesystem passes
-  `make all`: `330 tests, 0 failures, 6 skipped`, `100.00%` measured coverage, lint with no issues,
-  and Dialyzer with zero errors. Exact-head supported-host CI is still required after commit/push.
+- WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. The native Linux
+  export of the branch passes `330 tests, 0 failures, 6 skipped`; `make all` also passes with
+  format/spec checks, Credo (no issues), `100.00%` measured coverage, and Dialyzer (zero errors).
+  The v0.0.3/nightly baseline passes `299 tests` with `6 skipped` but has one intermittent timing
+  failure in `CoreTest`'s active-state continuation retry assertion. On the Windows-mounted
+  checkout, generated shell fixtures inherit CRLF and fail with bad-interpreter statuses; that is
+  a checkout artifact, not the supported-host result.
 
 ## Cross-device execution contract
 
@@ -82,13 +81,13 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
 - Linear may resolve `tracker.provider.api_key_command` host-side without shell parsing. The
   included PowerShell helper reads one Bitwarden custom field; helper-auth environment names are
   explicitly removed from coding-agent children. A locked vault fails closed.
-- Deterministic bridge/backend/RPC/secret/cancellation tests do not call an LLM or mutate Linear.
-  The latest focused checkpoint passes `74 tests, 0 failures` with unrelated tests excluded;
-  warnings-as-errors compilation and Dialyzer pass. The dependency lock was refreshed within the
-  declared constraints to patched Bandit/Plug/Phoenix/Req/Mint/LiveView/Decimal releases, and
-  `mix hex.audit` reports no retired or advisory packages. Full supported-host CI is still required.
+- Deterministic bridge/backend/RPC/secret/cancellation tests do not call an LLM or mutate Linear;
+  the full native suite and quality gate above cover them. The dependency lock was refreshed within
+  the declared constraints to patched Bandit/Plug/Phoenix/Req/Mint/LiveView/Decimal releases.
 - A real no-prompt Pi smoke through `SymphonyElixir.Pi.Rpc` successfully completed `get_state` in
-  WSL2 and on the authorized M2 Air; no LLM prompt was sent.
+  WSL2 using PiAgent `0.85.1` and the explicit Linux launcher; no LLM prompt was sent. A full
+  single-ticket live acceptance (tracker mutation, credential-negative proof, and durable handoff)
+  is not claimed without an authorized provider credential and issue.
 - The first authorized live Pi ticket (JARVIS-868) produced one workspace/branch/PR and stopped at
   Human Review. It also proved two blockers: Pi could discover a Windows User-scope Linear token via
   PowerShell, and reconciliation cancelled the final turn before a per-ticket completion receipt
@@ -100,9 +99,9 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
 
 This slice remains a transparent draft PR. The first single-ticket LLM canary completed its scoped
 code work but failed the security/lifecycle gate, so it did not make the backend production-ready.
-The bridge, secret-command, deferred-handoff, and interrupted-receipt remediations require full local
-validation, an exact-head supported-host CI run, and a second separately authorized one-ticket
-canary proving that Pi cannot read the Linear/Bitwarden credentials and that completion evidence is
+The bridge, secret-command, deferred-handoff, and interrupted-receipt remediations now have full
+native local validation and a real no-prompt Pi smoke. A separately authorized one-ticket canary
+must still prove that Pi cannot read the Linear/Bitwarden credentials and that completion evidence is
 durable before Human Review reconciliation. Rollback to the official Codex runtime remains part of
 the gate.
 
