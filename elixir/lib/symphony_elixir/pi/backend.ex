@@ -13,6 +13,15 @@ defmodule SymphonyElixir.Pi.Backend do
 
   @receipt_schema_version 1
   @stderr_tail_bytes 8_192
+  @pi_isolation_flags [
+    "--no-extensions",
+    "--no-skills",
+    "--no-themes",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-approve"
+  ]
+  @pi_secret_name_pattern ~r/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE[_-]?KEY)/i
 
   @type session :: %{
           rpc: Rpc.session(),
@@ -40,21 +49,47 @@ defmodule SymphonyElixir.Pi.Backend do
 
     case TrackerBridge.start(workspace, bridge_opts) do
       {:ok, tracker_bridge} ->
-        rpc_opts = [
-          stderr_path: stderr_path,
-          env: tracker_secret_port_env(config) ++ tracker_bridge_environment(tracker_bridge)
-        ]
-
-        case Rpc.start(workspace, pi_command(config.pi.command, tracker_bridge), rpc_opts) do
-          {:ok, rpc} ->
-            initialize_session(rpc, config, tracker_bridge)
-
-          {:error, _reason} = error ->
-            TrackerBridge.stop(tracker_bridge)
-            error
-        end
+        start_local_session_with_bridge(
+          workspace,
+          config,
+          stderr_path,
+          tracker_bridge
+        )
 
       {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp start_local_session_with_bridge(workspace, config, stderr_path, tracker_bridge) do
+    case prepare_pi_isolation(workspace) do
+      {:ok, isolation} ->
+        start_rpc_session(workspace, config, stderr_path, tracker_bridge, isolation)
+
+      {:error, _reason} = error ->
+        TrackerBridge.stop(tracker_bridge)
+        error
+    end
+  end
+
+  defp start_rpc_session(workspace, config, stderr_path, tracker_bridge, isolation) do
+    rpc_opts = [
+      stderr_path: stderr_path,
+      env:
+        pi_secret_port_env() ++
+          tracker_secret_port_env(config) ++
+          pi_isolation_environment(isolation) ++
+          tracker_bridge_environment(tracker_bridge)
+    ]
+
+    command = pi_command(config.pi.command, isolation, tracker_bridge)
+
+    case Rpc.start(workspace, command, rpc_opts) do
+      {:ok, rpc} ->
+        initialize_session(rpc, config, tracker_bridge)
+
+      {:error, _reason} = error ->
+        TrackerBridge.stop(tracker_bridge)
         error
     end
   end
@@ -510,10 +545,46 @@ defmodule SymphonyElixir.Pi.Backend do
     TrackerBridge.stop(tracker_bridge)
   end
 
-  defp pi_command(command, nil), do: command
+  defp prepare_pi_isolation(workspace) when is_binary(workspace) do
+    agent_dir = Path.join(workspace, ".symphony/pi-agent")
+    session_dir = Path.join(workspace, ".symphony/pi-session")
 
-  defp pi_command(command, %{extension_path: extension_path}) do
-    command <> " --extension " <> shell_escape(extension_path)
+    with :ok <- File.mkdir_p(agent_dir),
+         :ok <- File.mkdir_p(session_dir),
+         :ok <- File.chmod(agent_dir, 0o700),
+         :ok <- File.chmod(session_dir, 0o700) do
+      {:ok, %{agent_dir: agent_dir, session_dir: session_dir}}
+    end
+  rescue
+    error in [ArgumentError, File.Error] -> {:error, error}
+  end
+
+  defp pi_isolation_environment(%{agent_dir: agent_dir, session_dir: session_dir}) do
+    [
+      {~c"PI_CODING_AGENT_DIR", String.to_charlist(agent_dir)},
+      {~c"PI_CODING_AGENT_SESSION_DIR", String.to_charlist(session_dir)}
+    ]
+  end
+
+  defp pi_secret_port_env do
+    System.get_env()
+    |> Map.keys()
+    |> Enum.filter(&Regex.match?(@pi_secret_name_pattern, &1))
+    |> Enum.map(&{String.to_charlist(&1), false})
+  end
+
+  defp pi_command(command, isolation, tracker_bridge) do
+    isolation_flags =
+      ["--session-dir", shell_escape(isolation.session_dir) | @pi_isolation_flags]
+      |> Enum.join(" ")
+
+    extension_flag =
+      case tracker_bridge do
+        %{extension_path: extension_path} -> " --extension " <> shell_escape(extension_path)
+        _ -> ""
+      end
+
+    command <> " " <> isolation_flags <> extension_flag
   end
 
   defp tracker_bridge_environment(%{environment: environment}) when is_list(environment),
@@ -538,7 +609,6 @@ defmodule SymphonyElixir.Pi.Backend do
   defp session_id_from_state(_response), do: nil
 
   defp settled_event?(%{"type" => "agent_settled"}), do: true
-  defp settled_event?(%{"type" => "agent_end", "willRetry" => false}), do: true
   defp settled_event?(_event), do: false
 
   defp emit_event(on_message, event) when is_function(on_message, 1) and is_map(event) do

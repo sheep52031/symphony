@@ -469,9 +469,16 @@ Fields:
 Fields:
 
 - `command` (string shell command)
-  - Default: `pi --mode rpc --session-dir .symphony/pi-session`.
+  - Default: `pi --mode rpc`.
   - The runtime launches this command via `bash -lc` in the issue workspace.
   - The launched process MUST speak Pi's strict JSONL RPC protocol on stdout; stderr is diagnostics.
+  - The runtime MUST append Pi's supported `--session-dir`, `--no-extensions`, `--no-skills`,
+    `--no-themes`, `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls,
+    set `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` to workspace-owned `0700`
+    directories, and remove ambient credential-like environment names before launch. A generated
+    Symphony tracker extension MAY be loaded through an explicit `--extension` argument; ambient
+    extensions, packages, skills, themes, prompt templates, context files, and credentials MUST NOT
+    be used as a worker boundary.
   - In this fork's first slice, Pi is local-only. Configured SSH workers are rejected rather than
     silently treated as supported.
   - When the selected tracker advertises agent tools, the runtime MUST register them through a
@@ -482,7 +489,8 @@ Fields:
     The extension MUST delete them before agent-authored shell commands can inherit them. Declared
     tracker and secret-command auth environment names MUST be removed at process launch.
   - A final state handoff MAY be staged during a turn, but MUST NOT execute until the targeted Pi
-    completion signal has arrived and the completion receipt is durable. The handoff result MUST
+    `agent_settled` event has arrived and the completion receipt is durable. `agent_end` with
+    `willRetry: false` is not authoritative completion evidence. The handoff result MUST
     have its own durable receipt. Direct provider calls that observably bypass this ordering SHOULD
     be rejected. A host-owned handoff MUST bind the current issue internally and SHOULD accept only
     a target state name, resolve it within the bound provider scope, and construct the mutation
@@ -663,7 +671,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `pi.command`: shell command string, default `pi --mode rpc --session-dir .symphony/pi-session`
+- `pi.command`: shell command string, default `pi --mode rpc`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined

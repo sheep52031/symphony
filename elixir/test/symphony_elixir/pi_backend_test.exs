@@ -91,6 +91,110 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.rm_rf!(test_root)
   end
 
+  test "does not complete on agent_end with willRetry false before agent_settled" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-agent-end-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    issue = %Issue{id: "issue-pi-agent-end", identifier: "JARVIS-END", title: "Agent end"}
+    on_message = fn message -> send(self(), {:pi_message, message}) end
+
+    assert {:ok, session} = Backend.start_session(workspace)
+
+    assert {:error, {:turn_timeout, :abort_acknowledged}} =
+             Backend.run_turn(session, "agent_end_only", issue, timeout_ms: 40, on_message: on_message)
+
+    assert_receive {:pi_message, %{event: :agent_ended, payload: %{"willRetry" => false}}}
+    refute_receive {:pi_message, %{event: :turn_completed}}
+    assert_receive {:pi_message, %{event: :turn_aborted}}
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "waits through retry and compaction events for authoritative agent_settled" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-settled-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    issue = %Issue{id: "issue-pi-settled", identifier: "JARVIS-SETTLED", title: "Settled"}
+    on_message = fn message -> send(self(), {:pi_message, message}) end
+
+    assert {:ok, session} = Backend.start_session(workspace)
+    assert {:ok, turn} = Backend.run_turn(session, "retry_then_settled", issue, on_message: on_message)
+
+    assert turn.result["success"]
+    assert_receive {:pi_message, %{event: :agent_ended, payload: %{"willRetry" => false}}}
+    assert_receive {:pi_message, %{event: :notification, payload: %{"type" => "compaction_start"}}}
+    assert_receive {:pi_message, %{event: :agent_started}}
+    assert_receive {:pi_message, %{event: :agent_settled}}
+    assert_receive {:pi_message, %{event: :turn_completed}}
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "starts Pi inside an explicit extension, package, skill, credential, and session boundary" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-isolation-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "probe-pi")
+    ambient_agent_dir = Path.join(test_root, "ambient-agent")
+    File.mkdir_p!(workspace)
+    write_isolation_probe_pi!(script)
+
+    previous_api_key = System.get_env("OPENAI_API_KEY")
+    previous_agent_dir = System.get_env("PI_CODING_AGENT_DIR")
+    System.put_env("OPENAI_API_KEY", "ambient-secret-that-must-not-reach-pi")
+    System.put_env("PI_CODING_AGENT_DIR", ambient_agent_dir)
+
+    on_exit(fn ->
+      restore_env("OPENAI_API_KEY", previous_api_key)
+      restore_env("PI_CODING_AGENT_DIR", previous_agent_dir)
+    end)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    assert {:ok, session} =
+             Backend.start_session(workspace, tracker_bridge_opts: [binding: fixture_tracker_binding()])
+
+    command = session.rpc.command
+    assert command =~ "--session-dir"
+    assert command =~ "--no-extensions"
+    assert command =~ "--no-skills"
+    assert command =~ "--no-themes"
+    assert command =~ "--no-prompt-templates"
+    assert command =~ "--no-context-files"
+    assert command =~ "--no-approve"
+    assert command =~ "--extension"
+    assert command =~ session.tracker_bridge.extension_path
+
+    agent_dir = workspace |> Path.join(".symphony/pi-agent") |> Path.expand()
+    session_dir = workspace |> Path.join(".symphony/pi-session") |> Path.expand()
+    assert File.read!(Path.join(workspace, ".symphony/pi-agent-dir")) == agent_dir
+    assert File.read!(Path.join(workspace, ".symphony/pi-session-dir")) == session_dir
+    refute File.exists?(ambient_agent_dir)
+    assert Bitwise.band(File.stat!(agent_dir).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(session_dir).mode, 0o777) == 0o700
+
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
   test "resolves Codex by default and accepts Pi only as an explicit selector" do
     assert {:ok, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
     assert {:ok, SymphonyElixir.Pi.Backend} = AgentBackend.resolve(:pi)
@@ -505,6 +609,19 @@ defmodule SymphonyElixir.Pi.BackendTest do
             *'"message":"hang"'*)
               printf '%s\\n' '{"type":"agent_start"}'
               ;;
+            *'"message":"agent_end_only"'*)
+              printf '%s\\n' '{"type":"agent_start"}'
+              printf '%s\\n' '{"type":"agent_end","willRetry":false}'
+              printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+              ;;
+            *'"message":"retry_then_settled"'*)
+              printf '%s\\n' '{"type":"agent_start"}'
+              printf '%s\\n' '{"type":"agent_end","willRetry":false}'
+              printf '%s\\n' '{"type":"compaction_start"}'
+              printf '%s\\n' '{"type":"agent_start"}'
+              printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+              printf '%s\\n' '{"type":"agent_settled"}'
+              ;;
             *'"message":"stage_handoff"'*)
               response=$(curl --silent --show-error --fail \
                 --header "authorization: Bearer $SYMPHONY_PI_TRACKER_BRIDGE_CAPABILITY" \
@@ -533,6 +650,34 @@ defmodule SymphonyElixir.Pi.BackendTest do
           ;;
         *'"type":"get_session_stats"'*)
           printf '{"type":"response","id":"%s","success":true,"data":{"tokens":{"input":12,"output":7,"total":19}}}\\n' "$id"
+          ;;
+        *) exit 9 ;;
+      esac
+    done
+    """)
+
+    File.chmod!(path, 0o755)
+  end
+
+  defp write_isolation_probe_pi!(path) do
+    File.write!(path, """
+    #!/bin/sh
+    for required in --no-extensions --no-skills --no-themes --no-prompt-templates --no-context-files --no-approve; do
+      case " $* " in
+        *" $required "*) ;;
+        *) exit 13 ;;
+      esac
+    done
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+      exit 12
+    fi
+    printf '%s' "${PI_CODING_AGENT_DIR:-}" > "$PWD/.symphony/pi-agent-dir"
+    printf '%s' "${PI_CODING_AGENT_SESSION_DIR:-}" > "$PWD/.symphony/pi-session-dir"
+    while IFS= read -r line; do
+      id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+      case "$line" in
+        *'"type":"get_state"'*)
+          printf '{"type":"response","id":"%s","success":true,"data":{"sessionId":"pi-isolation-session"}}\\n' "$id"
           ;;
         *) exit 9 ;;
       esac

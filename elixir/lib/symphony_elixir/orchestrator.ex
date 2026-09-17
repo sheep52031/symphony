@@ -639,9 +639,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cancellation_prior_receipt(running_entry, reason) do
-    existing_receipt_path(running_entry) ||
-      latest_session_receipt(running_entry) ||
-      persist_interrupted_attempt_receipt(running_entry, reason)
+    candidate_path =
+      existing_receipt_path(running_entry) ||
+        latest_session_receipt(running_entry) ||
+        persist_interrupted_attempt_receipt(running_entry, reason)
+
+    materialize_stable_receipt(candidate_path, running_entry)
   end
 
   defp existing_receipt_path(running_entry) do
@@ -739,11 +742,52 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp interrupted_receipt_directory(%{workspace_path: workspace_path})
        when is_binary(workspace_path) and workspace_path != "" do
-    Path.join(workspace_path, ".symphony/attempt-receipts")
+    Path.join(Config.local_workspace_root(), ".symphony/interrupted-attempt-receipts")
   end
 
   defp interrupted_receipt_directory(_running_entry) do
     Path.join(Config.local_workspace_root(), ".symphony/interrupted-attempt-receipts")
+  end
+
+  defp materialize_stable_receipt(nil, _running_entry), do: nil
+
+  defp materialize_stable_receipt(path, _running_entry)
+       when is_binary(path) and not is_nil(path) do
+    if stable_receipt_path?(path) and File.regular?(path) do
+      path
+    else
+      identifier = Path.basename(path, Path.extname(path))
+
+      directory = Path.join(Config.local_workspace_root(), ".symphony/cancellation-receipts/prior-receipts")
+      nonce = System.unique_integer([:positive, :monotonic])
+      stable_path = Path.join(directory, "#{safe_receipt_component(identifier)}-#{nonce}.json")
+      temporary_path = "#{stable_path}.tmp"
+
+      with true <- File.regular?(path),
+           :ok <- File.mkdir_p(directory),
+           :ok <- File.cp(path, temporary_path),
+           :ok <- File.rename(temporary_path, stable_path) do
+        stable_path
+      else
+        _reason ->
+          File.rm(temporary_path)
+          Logger.warning("Unable to copy prior receipt to stable host-owned storage path=#{path}")
+          nil
+      end
+    end
+  rescue
+    error ->
+      Logger.warning("Unable to copy prior receipt to stable host-owned storage: #{inspect(error)}")
+      nil
+  end
+
+  defp stable_receipt_path?(path) do
+    stable_root = Path.expand(Path.join(Config.local_workspace_root(), ".symphony"))
+    expanded_path = Path.expand(path)
+
+    expanded_path == stable_root or
+      String.starts_with?(expanded_path, stable_root <> "/") or
+      String.starts_with?(expanded_path, stable_root <> "\\")
   end
 
   defp cancellation_stats(running_entry) do

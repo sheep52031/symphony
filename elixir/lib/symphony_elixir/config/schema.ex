@@ -180,7 +180,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:command, :string, default: "pi --mode rpc --session-dir .symphony/pi-session")
+      field(:command, :string, default: "pi --mode rpc")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()

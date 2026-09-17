@@ -15,12 +15,13 @@ observability responsibilities.
 - Baseline: Official Symphony v0.0.3 peeled commit `1c0fb6c8e8ef9031a2c861e62af5f9e66cee39cb`,
   contained by the post-release nightly `be10a1b79df723d6d7612b5651c8522704dafb2e` (`main`)
 - Working branch: `jarvis/symphony-pi-backends`
-- Current branch tip: `30231a905a83b7c7ccf2ed51bd30d6b070bab035`
+- Current branch: `jarvis/symphony-pi-backends` (the exact mutable HEAD is reported with delivery
+  evidence rather than duplicated in this plan)
 - Jarvis-specific tracker and prompt policy remains in the separate `jarvis-next` checkout. This
   fork's generic `elixir/WORKFLOW.md` must not acquire Jarvis-private project identifiers or
   credentials.
 - WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. The native Linux
-  export of the branch passes `330 tests, 0 failures, 6 skipped`; `make all` also passes with
+  export of the branch passes `334 tests, 0 failures, 6 skipped`; `make all` also passes with
   format/spec checks, Credo (no issues), `100.00%` measured coverage, and Dialyzer (zero errors).
   The v0.0.3/nightly baseline passes `299 tests` with `6 skipped` but has one intermittent timing
   failure in `CoreTest`'s active-state continuation retry assertion. On the Windows-mounted
@@ -58,21 +59,30 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
   CRLF tolerance, separate stderr capture, async event callbacks, unattended dialog cancellation,
   fire-and-forget UI observation without protocol responses, completion predicates, timeout, and
   graceful abort support.
-- `SymphonyElixir.Pi.Backend` performs `get_state`, `set_session_name`, `prompt` through
-  `agent_settled`, `get_last_assistant_text`, and `get_session_stats`, with Pi-native event and
-  usage mapping. It is explicitly local-only; configured SSH workers are rejected rather than
-  silently claimed as supported.
+- `SymphonyElixir.Pi.Backend` performs `get_state`, `set_session_name`, `prompt` through the
+  authoritative `agent_settled` event, `get_last_assistant_text`, and `get_session_stats`, with
+  Pi-native event and usage mapping. `agent_end` with `willRetry: false` is deliberately not a
+  completion signal, so compaction/retry/queued continuation cannot race handoff. It is explicitly
+  local-only; configured SSH workers are rejected rather than silently claimed as supported.
 - The orchestrator snapshots the selected backend into each new running attempt and passes that
   value to `AgentRunner`; an in-flight attempt does not follow a later workflow reload. Running,
   blocked, and retry snapshots preserve backend and receipt identity when available.
 - Pi turn completion, typed failure, timeout/abort, and orchestrator cancellation write bounded
   JSON receipts. Pi receipts include the native session, effective model and thinking level,
-  backend PID, final/last assistant text, stats, and a bounded stderr tail. Reconciliation now links
-  an existing receipt or persists an `interrupted` partial attempt receipt before cancellation.
+  backend PID, final/last assistant text, stats, and a bounded stderr tail. Reconciliation now
+  copies an existing attempt receipt into host-owned stable storage (or persists an `interrupted`
+  partial receipt there) before cancellation and workspace cleanup, so every returned prior-receipt
+  link remains resolvable after the workspace is removed.
 - `SymphonyElixir.Pi.TrackerBridge` gives each Pi session a random bearer capability to a dedicated
   `127.0.0.1` listener, binds one adapter/settings/tool-spec snapshot and normalized issue, and
   executes adapter tools inside Symphony. The generated mode-`0600` Pi extension deletes bridge
   bootstrap values from `process.env` immediately after registration.
+- Pi launch is an explicit supported isolation boundary: Symphony sets workspace-owned `0700`
+  `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR`, appends `--session-dir` and Pi's
+  `--no-extensions`, `--no-skills`, `--no-themes`, `--no-prompt-templates`, `--no-context-files`,
+  and `--no-approve` controls, scrubs credential-like inherited environment names, and explicitly
+  appends only the generated tracker bridge extension. The proof test rejects ambient credentials,
+  verifies all flags, and verifies the effective directories.
 - `symphony_handoff` stages only a non-active, non-terminal target state name. For Linear,
   Symphony resolves the target inside the bound issue's team, constructs the mutation host-side,
   and requires the response to confirm the exact state. Pi completion is settled and written first;

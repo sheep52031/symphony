@@ -33,8 +33,8 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 pi:
-  # Executed by non-interactive bash -lc; use a host-specific absolute launcher when PATH is not inherited.
-  command: pi --mode rpc --session-dir .symphony/pi-session
+  # Base command for non-interactive bash -lc; Symphony supplies the isolation/session flags.
+  command: pi --mode rpc
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
