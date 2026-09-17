@@ -15,7 +15,7 @@ observability responsibilities.
 - Baseline: Official Symphony v0.0.3 peeled commit `1c0fb6c8e8ef9031a2c861e62af5f9e66cee39cb`,
   contained by the post-release nightly `be10a1b79df723d6d7612b5651c8522704dafb2e` (`main`)
 - Working branch: `jarvis/symphony-pi-backends`
-- Current branch tip: `475463b5796f5b6ca9891868827bf93cc5052446`
+- Current branch tip: `30231a905a83b7c7ccf2ed51bd30d6b070bab035`
 - Jarvis-specific tracker and prompt policy remains in the separate `jarvis-next` checkout. This
   fork's generic `elixir/WORKFLOW.md` must not acquire Jarvis-private project identifiers or
   credentials.
