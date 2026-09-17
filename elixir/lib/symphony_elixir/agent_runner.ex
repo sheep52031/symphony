@@ -1,11 +1,10 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single tracker work item in its workspace with Codex.
+  Executes a single tracker work item in its workspace with the configured execution backend.
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentBackend, Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -44,7 +43,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -55,9 +54,9 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp agent_message_handler(recipient, issue, backend_name) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      send_codex_update(recipient, issue, Map.put_new(message, :backend, backend_name))
     end
   end
 
@@ -85,28 +84,55 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, backend} <- resolve_backend(opts),
+         {:ok, session} <- backend.start_session(workspace, worker_host: worker_host, issue: issue) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_agent_turns(
+          %{
+            backend: backend,
+            app_session: session,
+            workspace: workspace,
+            issue: issue,
+            recipient: codex_update_recipient,
+            opts: opts,
+            issue_state_fetcher: issue_state_fetcher,
+            max_turns: max_turns
+          },
+          1
+        )
       after
-        AppServer.stop_session(session)
+        backend.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_agent_turns(
+         %{
+           backend: backend,
+           app_session: app_session,
+           workspace: workspace,
+           issue: issue,
+           recipient: codex_update_recipient,
+           opts: opts,
+           issue_state_fetcher: issue_state_fetcher,
+           max_turns: max_turns
+         } = context,
+         turn_number
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           backend.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: agent_message_handler(codex_update_recipient, issue, backend_name(backend)),
+             attempt: Keyword.get(opts, :attempt),
+             turn_number: turn_number
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -114,15 +140,9 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
+          do_run_agent_turns(
+            %{context | issue: refreshed_issue},
+            turn_number + 1
           )
 
         {:continue, refreshed_issue} ->
@@ -138,6 +158,14 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp resolve_backend(opts) do
+    backend_name = Keyword.get(opts, :backend, Config.settings!().agent.backend)
+    AgentBackend.resolve(backend_name)
+  end
+
+  defp backend_name(SymphonyElixir.Codex.AppServer), do: :codex
+  defp backend_name(SymphonyElixir.Pi.Backend), do: :pi
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 

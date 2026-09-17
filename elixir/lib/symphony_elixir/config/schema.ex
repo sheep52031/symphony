@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   import Ecto.Changeset
 
-  alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.{PathSafety, SecretCommand}
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
@@ -149,6 +149,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:backend, :string, default: "codex")
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
@@ -160,14 +161,40 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [:backend, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
         empty_values: []
       )
+      |> validate_inclusion(:backend, ["codex", "pi"])
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+  end
+
+  defmodule Pi do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "pi --mode rpc")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command], empty_values: [])
+      |> validate_required([:command])
+      |> validate_change(:command, fn :command, command ->
+        if String.trim(command) == "" do
+          [command: "can't be blank"]
+        else
+          []
+        end
+      end)
     end
   end
 
@@ -215,7 +242,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
-        if command != "" and String.trim(command) == "" do
+        if String.trim(command) == "" do
           [command: "can't be blank"]
         else
           []
@@ -295,6 +322,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:pi, Pi, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -310,7 +338,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> apply_action(:validate)
     |> case do
       {:ok, settings} ->
-        {:ok, finalize_settings(settings)}
+        finalize_settings(settings)
 
       {:error, changeset} ->
         {:error, {:invalid_workflow_config, format_errors(changeset)}}
@@ -389,6 +417,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
+    |> cast_embed(:pi, with: &Pi.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -398,69 +427,90 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     provider = normalize_optional_map(settings.tracker.provider) || %{}
 
-    {api_key, assignee, provider, secret_environment_names} =
-      case settings.tracker.kind do
-        "linear" ->
-          linear_provider =
-            provider
-            |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
-            |> Map.put_new("api_key", settings.tracker.api_key)
-            |> Map.put_new("project_slug", settings.tracker.project_slug)
-            |> Map.put_new("assignee", settings.tracker.assignee)
+    with {:ok, {api_key, assignee, provider, secret_environment_names}} <-
+           finalize_tracker_credentials(settings, provider) do
+      {active_states, terminal_states} =
+        case settings.tracker.kind do
+          kind when kind in ["linear", "memory"] ->
+            {
+              settings.tracker.active_states || @linear_active_states,
+              settings.tracker.terminal_states || @linear_terminal_states
+            }
 
-          resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+          _ ->
+            {settings.tracker.active_states, settings.tracker.terminal_states}
+        end
 
-          resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+      tracker = %{
+        settings.tracker
+        | endpoint: Map.get(provider, "endpoint", settings.tracker.endpoint),
+          api_key: api_key,
+          project_slug: Map.get(provider, "project_slug", settings.tracker.project_slug),
+          assignee: assignee,
+          provider: provider,
+          secret_environment_names: Enum.uniq(secret_environment_names),
+          active_states: active_states,
+          terminal_states: terminal_states
+      }
 
-          {
-            resolved_api_key,
-            resolved_assignee,
-            linear_provider,
-            ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
-          }
+      workspace = %{
+        settings.workspace
+        | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      }
 
-        _ ->
-          {settings.tracker.api_key, settings.tracker.assignee, provider, []}
-      end
+      codex = %{
+        settings.codex
+        | approval_policy: normalize_keys(settings.codex.approval_policy),
+          turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
+      }
 
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
+      {:ok, %{settings | tracker: tracker, workspace: workspace, codex: codex}}
+    end
+  end
 
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+  defp finalize_tracker_credentials(%{tracker: %{kind: "linear"}} = settings, provider) do
+    linear_provider =
+      provider
+      |> Map.put_new("endpoint", settings.tracker.endpoint || @linear_endpoint)
+      |> Map.put_new("api_key", settings.tracker.api_key)
+      |> Map.put_new("project_slug", settings.tracker.project_slug)
+      |> Map.put_new("assignee", settings.tracker.assignee)
 
-    tracker = %{
-      settings.tracker
-      | endpoint: Map.get(provider, "endpoint", settings.tracker.endpoint),
-        api_key: api_key,
-        project_slug: Map.get(provider, "project_slug", settings.tracker.project_slug),
-        assignee: assignee,
-        provider: provider,
-        secret_environment_names: Enum.uniq(secret_environment_names),
-        active_states: active_states,
-        terminal_states: terminal_states
-    }
+    with {:ok, resolved_api_key} <- resolve_linear_api_key(linear_provider),
+         {:ok, secret_command_environment_names} <-
+           secret_command_environment_names(linear_provider) do
+      resolved_assignee =
+        resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
 
-    workspace = %{
-      settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
-    }
+      {:ok,
+       {
+         resolved_api_key,
+         resolved_assignee,
+         linear_provider,
+         [
+           "LINEAR_API_KEY"
+           | env_reference_names([linear_provider["api_key"]]) ++
+               secret_command_environment_names
+         ]
+       }}
+    end
+  end
 
-    codex = %{
-      settings.codex
-      | approval_policy: normalize_keys(settings.codex.approval_policy),
-        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
-    }
+  defp finalize_tracker_credentials(settings, provider) do
+    {:ok, {settings.tracker.api_key, settings.tracker.assignee, provider, []}}
+  end
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  defp resolve_linear_api_key(provider) do
+    case Map.get(provider, "api_key_command") do
+      nil ->
+        {:ok, resolve_secret_setting(provider["api_key"], System.get_env("LINEAR_API_KEY"))}
+
+      command ->
+        case SecretCommand.resolve(command) do
+          {:ok, secret} -> {:ok, secret}
+          {:error, reason} -> {:error, {:tracker_secret_command_failed, reason}}
+        end
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -552,6 +602,19 @@ defmodule SymphonyElixir.Config.Schema do
         :error -> []
       end
     end)
+  end
+
+  defp secret_command_environment_names(provider) do
+    names = Map.get(provider, "api_key_command_secret_environment_names", [])
+
+    if is_list(names) and
+         Enum.all?(names, fn name ->
+           is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+         end) do
+      {:ok, names}
+    else
+      {:error, {:invalid_secret_command_environment_names, names}}
+    end
   end
 
   defp resolve_env_token(env_name) do

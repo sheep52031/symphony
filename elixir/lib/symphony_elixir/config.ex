@@ -116,12 +116,23 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
-    if is_nil(settings.tracker.kind) do
-      {:error, :missing_tracker_kind}
-    else
-      Tracker.validate_config(settings.tracker)
+    cond do
+      is_nil(settings.tracker.kind) ->
+        {:error, :missing_tracker_kind}
+
+      settings.agent.backend == "pi" and non_empty_hosts?(settings.worker.ssh_hosts) ->
+        {:error, {:unsupported_backend_worker_hosts, :pi}}
+
+      true ->
+        Tracker.validate_config(settings.tracker)
     end
   end
+
+  defp non_empty_hosts?(hosts) when is_list(hosts) do
+    Enum.any?(hosts, fn host -> is_binary(host) and String.trim(host) != "" end)
+  end
+
+  defp non_empty_hosts?(_hosts), do: false
 
   defp format_config_error(reason) do
     case reason do
@@ -133,6 +144,9 @@ defmodule SymphonyElixir.Config do
 
       {:workflow_parse_error, raw_reason} ->
         "Failed to parse WORKFLOW.md: #{inspect(raw_reason)}"
+
+      {:unsupported_backend_worker_hosts, :pi} ->
+        "Pi backend is local-only and cannot be configured with SSH workers"
 
       :workflow_front_matter_not_a_map ->
         "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"

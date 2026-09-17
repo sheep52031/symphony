@@ -76,6 +76,19 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "/bin/sh app-server")
     assert :ok = Config.validate!()
 
+    write_workflow_file!(Workflow.workflow_file_path(), pi_command: "")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "pi.command"
+    assert message =~ "can't be blank"
+
+    write_workflow_file!(Workflow.workflow_file_path(), pi_command: "   ")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "pi.command"
+    assert message =~ "can't be blank"
+
+    write_workflow_file!(Workflow.workflow_file_path(), pi_command: "/opt/pi --mode rpc")
+    assert :ok = Config.validate!()
+
     write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: "definitely-not-valid")
     assert :ok = Config.validate!()
 
@@ -485,6 +498,7 @@ defmodule SymphonyElixir.CoreTest do
     issue_id = "issue-1"
     issue_identifier = "MT-555"
     workspace = Path.join(test_root, issue_identifier)
+    stderr_path = Path.join(workspace, ".symphony/pi-rpc.stderr.log")
 
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
@@ -494,7 +508,8 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       File.mkdir_p!(test_root)
-      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.dirname(stderr_path))
+      File.write!(stderr_path, "partial Pi stderr\n")
 
       agent_pid =
         spawn(fn ->
@@ -510,6 +525,22 @@ defmodule SymphonyElixir.CoreTest do
             ref: nil,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "Todo", identifier: issue_identifier},
+            backend: :pi,
+            backend_command: "pi --mode rpc",
+            backend_process_pid: 42_424,
+            session_id: "pi-cancel-session",
+            session_file: "/tmp/pi-cancel-session.jsonl",
+            model: %{"id" => "gpt-5.6", "provider" => "openai"},
+            thinking_level: "xhigh",
+            workspace_path: workspace,
+            stderr_path: stderr_path,
+            last_assistant_text: "last available assistant text",
+            last_codex_event: :message_ended,
+            codex_input_tokens: 21,
+            codex_output_tokens: 8,
+            codex_total_tokens: 29,
+            retry_attempt: 0,
+            turn_count: 1,
             started_at: DateTime.utc_now()
           }
         },
@@ -533,6 +564,212 @@ defmodule SymphonyElixir.CoreTest do
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
       assert File.exists?(workspace)
+
+      [receipt_path] =
+        Path.wildcard(Path.join(test_root, ".symphony/cancellation-receipts/MT-555-*.json"))
+
+      receipt = receipt_path |> File.read!() |> Jason.decode!()
+      assert receipt["outcome"] == "cancelled"
+      assert receipt["reason"] in ["non_active_state:Backlog", "routing_revoked"]
+      assert receipt["backend"] == "pi"
+      assert receipt["backend_process_pid"] == 42_424
+      assert receipt["session_id"] == "pi-cancel-session"
+      assert is_binary(receipt["prior_receipt_path"])
+      assert File.regular?(receipt["prior_receipt_path"])
+      refute String.starts_with?(receipt["prior_receipt_path"], workspace)
+
+      interrupted = receipt["prior_receipt_path"] |> File.read!() |> Jason.decode!()
+      assert interrupted["outcome"] == "interrupted"
+      assert interrupted["partial"]
+      assert interrupted["assistant_text"] == "last available assistant text"
+      assert interrupted["available_stats"]["tokens"]["total"] == 29
+      assert interrupted["runtime"]["pid"] == 42_424
+      assert interrupted["runtime"]["stderr_path"] == stderr_path
+      assert interrupted["stderr_tail"] == "partial Pi stderr\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "cancellation links a current-turn receipt persisted before its event is processed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-receipt-race-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-receipt-race"
+    identifier = "MT-RACE"
+    workspace = Path.join(test_root, identifier)
+    attempt_directory = Path.join(workspace, ".symphony/attempt-receipts")
+    attempt_receipt_path = Path.join(attempt_directory, "attempt-0000-turn-0001-race.json")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Done"]
+      )
+
+      File.mkdir_p!(attempt_directory)
+
+      File.write!(
+        attempt_receipt_path,
+        Jason.encode!(%{
+          "backend" => "pi",
+          "outcome" => "completed",
+          "attempt" => 0,
+          "turn" => 1,
+          "session" => %{"id" => "pi-race-session"}
+        })
+      )
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: identifier},
+            backend: :pi,
+            session_id: "pi-race-session",
+            attempt_receipt_index: 0,
+            turn_receipt_index: 1,
+            receipt_path: nil,
+            workspace_path: workspace,
+            retry_attempt: 0,
+            turn_count: 1,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      refreshed_issue = %Issue{
+        id: issue_id,
+        identifier: identifier,
+        state: "Human Review",
+        title: "Receipt race",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], state)
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute Process.alive?(agent_pid)
+
+      [cancellation_path] =
+        Path.wildcard(Path.join(test_root, ".symphony/cancellation-receipts/MT-RACE-*.json"))
+
+      cancellation = cancellation_path |> File.read!() |> Jason.decode!()
+      assert is_binary(cancellation["prior_receipt_path"])
+      assert cancellation["prior_receipt_path"] != attempt_receipt_path
+      assert File.regular?(cancellation["prior_receipt_path"])
+      refute String.starts_with?(cancellation["prior_receipt_path"], workspace)
+      assert Path.wildcard(Path.join(attempt_directory, "*-interrupted-*.json")) == []
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal cleanup preserves cancellation and prior receipt links after removing workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-receipt-stability-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-receipt"
+    issue_identifier = "MT-RECEIPT"
+    workspace = Path.join(test_root, issue_identifier)
+    attempt_directory = Path.join(workspace, ".symphony/attempt-receipts")
+    attempt_receipt_path = Path.join(attempt_directory, "attempt-0000-turn-0001-completed.json")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Done"]
+      )
+
+      File.mkdir_p!(attempt_directory)
+
+      File.write!(
+        attempt_receipt_path,
+        Jason.encode!(%{
+          "backend" => "pi",
+          "outcome" => "completed",
+          "attempt" => 0,
+          "turn" => 1,
+          "session" => %{"id" => "pi-terminal-receipt"}
+        })
+      )
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            backend: :pi,
+            backend_process_pid: 42_425,
+            session_id: "pi-terminal-receipt",
+            attempt_receipt_index: 0,
+            turn_receipt_index: 1,
+            receipt_path: attempt_receipt_path,
+            workspace_path: workspace,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Done",
+        title: "Done",
+        description: "Completed",
+        labels: []
+      }
+
+      _updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute File.exists?(workspace)
+
+      [cancellation_path] =
+        Path.wildcard(Path.join(test_root, ".symphony/cancellation-receipts/MT-RECEIPT-*.json"))
+
+      cancellation = cancellation_path |> File.read!() |> Jason.decode!()
+      assert File.regular?(cancellation_path)
+      assert File.regular?(cancellation["prior_receipt_path"])
+      refute String.starts_with?(cancellation["prior_receipt_path"], workspace)
+
+      assert cancellation["prior_receipt_path"] |> File.read!() |> Jason.decode!() == %{
+               "backend" => "pi",
+               "outcome" => "completed",
+               "attempt" => 0,
+               "turn" => 1,
+               "session" => %{"id" => "pi-terminal-receipt"}
+             }
     after
       File.rm_rf(test_root)
     end
@@ -1048,6 +1285,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1056,7 +1294,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_after(due_at_ms, down_sent_at_ms, 1_000)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1089,6 +1327,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1096,7 +1335,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_after(due_at_ms, down_sent_at_ms, 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1128,6 +1367,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1135,7 +1375,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_after(due_at_ms, down_sent_at_ms, 10_000)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1255,11 +1495,11 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp assert_due_after(due_at_ms, event_sent_at_ms, delay_ms) do
+    observed_at_ms = System.monotonic_time(:millisecond)
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert due_at_ms >= event_sent_at_ms + delay_ms
+    assert due_at_ms <= observed_at_ms + delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

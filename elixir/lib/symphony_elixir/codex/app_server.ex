@@ -4,6 +4,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
+
+  @behaviour SymphonyElixir.AgentBackend
+
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
@@ -36,6 +39,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
+  @impl true
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
@@ -69,6 +73,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  @impl true
   def run_turn(
         %{
           port: port,
@@ -143,6 +148,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
+  @impl true
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
   end
