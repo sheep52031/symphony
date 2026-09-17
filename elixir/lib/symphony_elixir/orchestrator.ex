@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @receipt_stderr_tail_bytes 8_192
+  @receipt_assistant_text_bytes 65_536
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -596,6 +598,7 @@ defmodule SymphonyElixir.Orchestrator do
     nonce = System.unique_integer([:positive, :monotonic])
     path = Path.join(directory, "#{safe_receipt_component(identifier)}-#{nonce}.json")
     temporary_path = "#{path}.tmp"
+    prior_receipt_path = cancellation_prior_receipt(running_entry, reason)
 
     receipt = %{
       "schema_version" => 1,
@@ -612,13 +615,16 @@ defmodule SymphonyElixir.Orchestrator do
       "session_id" => Map.get(running_entry, :session_id),
       "workspace_path" => Map.get(running_entry, :workspace_path),
       "last_event" => Map.get(running_entry, :last_codex_event),
-      "prior_receipt_path" => Map.get(running_entry, :receipt_path)
+      "prior_receipt_path" => prior_receipt_path
     }
 
     with :ok <- File.mkdir_p(directory),
          :ok <- File.write(temporary_path, Jason.encode_to_iodata!(receipt, pretty: true)),
          :ok <- File.rename(temporary_path, path) do
-      Logger.info("Recorded orchestrator cancellation receipt path=#{path} issue_identifier=#{identifier} backend=#{Map.get(running_entry, :backend)}")
+      Logger.info(
+        "Recorded orchestrator cancellation receipt path=#{path} issue_identifier=#{identifier} backend=#{Map.get(running_entry, :backend)} prior_receipt_path=#{prior_receipt_path || "n/a"}"
+      )
+
       :ok
     else
       {:error, receipt_reason} ->
@@ -631,6 +637,146 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.warning("Unable to record orchestrator cancellation receipt: #{inspect(error)}")
       :ok
   end
+
+  defp cancellation_prior_receipt(running_entry, reason) do
+    existing_receipt_path(running_entry) ||
+      latest_session_receipt(running_entry) ||
+      persist_interrupted_attempt_receipt(running_entry, reason)
+  end
+
+  defp existing_receipt_path(running_entry) do
+    case Map.get(running_entry, :receipt_path) do
+      path when is_binary(path) -> if File.regular?(path), do: path
+      _ -> nil
+    end
+  end
+
+  defp latest_session_receipt(%{workspace_path: workspace_path} = running_entry)
+       when is_binary(workspace_path) do
+    workspace_path
+    |> Path.join(".symphony/attempt-receipts/*.json")
+    |> Path.wildcard()
+    |> Enum.sort(:desc)
+    |> Enum.find(&receipt_matches_running_session?(&1, running_entry))
+  end
+
+  defp latest_session_receipt(_running_entry), do: nil
+
+  defp receipt_matches_running_session?(path, running_entry) do
+    expected_session_id = Map.get(running_entry, :session_id)
+    expected_attempt = Map.get(running_entry, :attempt_receipt_index)
+    expected_turn = Map.get(running_entry, :turn_receipt_index)
+
+    with true <- is_binary(expected_session_id),
+         true <- is_integer(expected_attempt),
+         true <- is_integer(expected_turn),
+         {:ok, contents} <- File.read(path),
+         {:ok,
+          %{
+            "attempt" => ^expected_attempt,
+            "turn" => ^expected_turn,
+            "session" => %{"id" => ^expected_session_id}
+          }} <- Jason.decode(contents) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp persist_interrupted_attempt_receipt(running_entry, reason) do
+    identifier = Map.get(running_entry, :identifier, "unknown")
+    directory = interrupted_receipt_directory(running_entry)
+    nonce = System.unique_integer([:positive, :monotonic])
+    path = Path.join(directory, "#{safe_receipt_component(identifier)}-interrupted-#{nonce}.json")
+    temporary_path = "#{path}.tmp"
+
+    receipt = %{
+      "schema_version" => 1,
+      "backend" => Map.get(running_entry, :backend),
+      "outcome" => "interrupted",
+      "partial" => true,
+      "reason" => reason,
+      "cancelled_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "attempt" => Map.get(running_entry, :attempt_receipt_index) || Map.get(running_entry, :retry_attempt, 0),
+      "turn" => Map.get(running_entry, :turn_receipt_index) || Map.get(running_entry, :turn_count, 0),
+      "issue" => %{
+        "id" => running_entry |> Map.get(:issue) |> issue_field(:id),
+        "identifier" => identifier,
+        "url" => running_entry |> Map.get(:issue) |> issue_field(:url)
+      },
+      "session" => %{
+        "id" => Map.get(running_entry, :session_id),
+        "file" => Map.get(running_entry, :session_file),
+        "model" => Map.get(running_entry, :model),
+        "thinking_level" => Map.get(running_entry, :thinking_level)
+      },
+      "runtime" => %{
+        "command" => Map.get(running_entry, :backend_command),
+        "pid" => Map.get(running_entry, :backend_process_pid),
+        "stderr_path" => Map.get(running_entry, :stderr_path)
+      },
+      "assistant_text" => bounded_assistant_text(Map.get(running_entry, :last_assistant_text)),
+      "available_stats" => cancellation_stats(running_entry),
+      "stderr_tail" => receipt_stderr_tail(Map.get(running_entry, :stderr_path)),
+      "last_event" => Map.get(running_entry, :last_codex_event)
+    }
+
+    with :ok <- File.mkdir_p(directory),
+         :ok <- File.write(temporary_path, Jason.encode_to_iodata!(receipt, pretty: true)),
+         :ok <- File.rename(temporary_path, path) do
+      path
+    else
+      {:error, receipt_reason} ->
+        File.rm(temporary_path)
+        Logger.warning("Unable to record interrupted attempt receipt for issue_identifier=#{identifier}: #{inspect(receipt_reason)}")
+        nil
+    end
+  rescue
+    error ->
+      Logger.warning("Unable to record interrupted attempt receipt: #{inspect(error)}")
+      nil
+  end
+
+  defp interrupted_receipt_directory(%{workspace_path: workspace_path})
+       when is_binary(workspace_path) and workspace_path != "" do
+    Path.join(workspace_path, ".symphony/attempt-receipts")
+  end
+
+  defp interrupted_receipt_directory(_running_entry) do
+    Path.join(Config.local_workspace_root(), ".symphony/interrupted-attempt-receipts")
+  end
+
+  defp cancellation_stats(running_entry) do
+    %{
+      "tokens" => %{
+        "input" => Map.get(running_entry, :codex_input_tokens, 0),
+        "output" => Map.get(running_entry, :codex_output_tokens, 0),
+        "total" => Map.get(running_entry, :codex_total_tokens, 0)
+      }
+    }
+  end
+
+  defp bounded_assistant_text(text) when is_binary(text) and byte_size(text) > @receipt_assistant_text_bytes do
+    binary_part(text, byte_size(text) - @receipt_assistant_text_bytes, @receipt_assistant_text_bytes)
+  end
+
+  defp bounded_assistant_text(text) when is_binary(text), do: text
+  defp bounded_assistant_text(_text), do: nil
+
+  defp receipt_stderr_tail(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, contents} when byte_size(contents) > @receipt_stderr_tail_bytes ->
+        binary_part(contents, byte_size(contents) - @receipt_stderr_tail_bytes, @receipt_stderr_tail_bytes)
+
+      {:ok, contents} ->
+        contents
+
+      {:error, reason} ->
+        "<stderr unavailable: #{inspect(reason)}>"
+    end
+  end
+
+  defp receipt_stderr_tail(_path), do: "<stderr unavailable>"
 
   defp issue_field(%Issue{} = issue, key), do: Map.get(issue, key)
   defp issue_field(_issue, _key), do: nil
@@ -1053,7 +1199,12 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            last_assistant_text: nil,
+            attempt_receipt_index: nil,
+            turn_receipt_index: nil,
             codex_app_server_pid: nil,
+            backend_command: nil,
+            stderr_path: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
@@ -1534,6 +1685,9 @@ defmodule SymphonyElixir.Orchestrator do
         |> maybe_put_runtime_value(:thinking_level, Map.get(metadata, :thinking_level))
         |> maybe_put_runtime_value(:session_file, Map.get(metadata, :session_file))
         |> maybe_put_runtime_value(:receipt_path, Map.get(metadata, :receipt_path))
+        |> maybe_put_runtime_value(:backend_command, Map.get(metadata, :backend_command))
+        |> maybe_put_runtime_value(:stderr_path, Map.get(metadata, :stderr_path))
+        |> maybe_put_runtime_value(:last_assistant_text, Map.get(metadata, :last_assistant_text))
       end)
 
     retrying =
@@ -1621,7 +1775,12 @@ defmodule SymphonyElixir.Orchestrator do
     model = Map.get(running_entry, :model)
     thinking_level = Map.get(running_entry, :thinking_level)
     session_file = Map.get(running_entry, :session_file)
-    receipt_path = Map.get(running_entry, :receipt_path)
+    receipt_path = receipt_path_for_update(Map.get(running_entry, :receipt_path), update)
+    backend_command = Map.get(running_entry, :backend_command)
+    stderr_path = Map.get(running_entry, :stderr_path)
+    attempt_receipt_index = Map.get(running_entry, :attempt_receipt_index)
+    turn_receipt_index = Map.get(running_entry, :turn_receipt_index)
+    last_assistant_text = assistant_text_for_update(Map.get(running_entry, :last_assistant_text), update)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
@@ -1639,7 +1798,12 @@ defmodule SymphonyElixir.Orchestrator do
         model: runtime_value_for_update(model, update, :model),
         thinking_level: runtime_value_for_update(thinking_level, update, :thinking_level),
         session_file: runtime_value_for_update(session_file, update, :session_file),
-        receipt_path: runtime_value_for_update(receipt_path, update, :receipt_path),
+        receipt_path: receipt_path,
+        backend_command: runtime_value_for_update(backend_command, update, :backend_command),
+        attempt_receipt_index: runtime_value_for_update(attempt_receipt_index, update, :attempt_receipt_index),
+        turn_receipt_index: runtime_value_for_update(turn_receipt_index, update, :turn_receipt_index),
+        stderr_path: runtime_value_for_update(stderr_path, update, :stderr_path),
+        last_assistant_text: last_assistant_text,
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
@@ -1679,6 +1843,25 @@ defmodule SymphonyElixir.Orchestrator do
       value -> value
     end
   end
+
+  defp receipt_path_for_update(_existing, %{event: :session_started} = update) do
+    Map.get(update, :receipt_path)
+  end
+
+  defp receipt_path_for_update(existing, update) do
+    runtime_value_for_update(existing, update, :receipt_path)
+  end
+
+  defp assistant_text_for_update(_existing, %{event: :session_started}), do: nil
+
+  defp assistant_text_for_update(_existing, %{assistant_text: text}) when is_binary(text),
+    do: bounded_assistant_text(text)
+
+  defp assistant_text_for_update(existing, %{assistant_text_delta: delta}) when is_binary(delta) do
+    bounded_assistant_text((existing || "") <> delta)
+  end
+
+  defp assistant_text_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1876,10 +2059,17 @@ defmodule SymphonyElixir.Orchestrator do
       update
     ]
 
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+    Enum.find_value(payloads, &direct_token_usage_from_payload/1) ||
+      Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
       %{}
   end
+
+  defp direct_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload
+  end
+
+  defp direct_token_usage_from_payload(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||

@@ -19,13 +19,20 @@ defmodule SymphonyElixir.Pi.BackendTest do
     write_fake_pi!(script)
 
     previous_secret = System.get_env("PI_TEST_SECRET")
+    previous_bitwarden_session = System.get_env("BW_SESSION")
     System.put_env("PI_TEST_SECRET", "secret-that-must-not-reach-pi")
-    on_exit(fn -> restore_env("PI_TEST_SECRET", previous_secret) end)
+    System.put_env("BW_SESSION", "bitwarden-session-that-must-not-reach-pi")
+
+    on_exit(fn ->
+      restore_env("PI_TEST_SECRET", previous_secret)
+      restore_env("BW_SESSION", previous_bitwarden_session)
+    end)
 
     write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
       agent_backend: "pi",
       pi_command: script,
       tracker_api_token: "$PI_TEST_SECRET",
+      tracker_api_key_command_secret_environment_names: ["BW_SESSION"],
       codex_turn_timeout_ms: 1_000
     )
 
@@ -67,6 +74,8 @@ defmodule SymphonyElixir.Pi.BackendTest do
                       event: :session_started,
                       session_id: "pi-session",
                       backend: :pi,
+                      attempt_receipt_index: 0,
+                      turn_receipt_index: 1,
                       model: %{"id" => "gpt-5.6"},
                       thinking_level: "xhigh",
                       backend_process_pid: backend_process_pid
@@ -181,6 +190,210 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.rm_rf!(test_root)
   end
 
+  test "persists completion before committing a staged tracker handoff" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-handoff-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    parent = self()
+
+    executor = fn _binding, target_state, issue ->
+      completion_receipts =
+        Path.wildcard(Path.join(workspace, ".symphony/attempt-receipts/attempt-0000-turn-0001-*.json"))
+        |> Enum.filter(fn path ->
+          path |> File.read!() |> Jason.decode!() |> Map.get("outcome") == "completed"
+        end)
+
+      send(parent, {:handoff_executor, completion_receipts, target_state, issue})
+      tracker_tool_result(true, %{"data" => %{"transition" => "applied"}})
+    end
+
+    binding = fixture_tracker_binding()
+
+    issue = %Issue{id: "issue-pi-handoff", identifier: "JARVIS-HANDOFF", title: "STAGE_HANDOFF"}
+    on_message = fn message -> send(self(), {:pi_message, message}) end
+
+    assert {:ok, session} =
+             Backend.start_session(workspace,
+               tracker_bridge_opts: [binding: binding, handoff_executor: executor]
+             )
+
+    assert {:ok, turn} =
+             Backend.run_turn(session, "stage_handoff", issue,
+               on_message: on_message,
+               turn_number: 1
+             )
+
+    assert File.regular?(turn.receipt_path)
+    assert File.regular?(turn.completion_receipt_path)
+    assert File.regular?(turn.handoff_receipt_path)
+
+    assert_receive {:handoff_executor, [completion_receipt_path], "Human Review", ^issue}
+
+    assert completion_receipt_path == turn.completion_receipt_path
+    assert completion_receipt_path == turn.receipt_path
+
+    handoff_receipt = turn.handoff_receipt_path |> File.read!() |> Jason.decode!()
+    assert handoff_receipt["outcome"] == "handoff_completed"
+    assert handoff_receipt["details"]["completion_receipt_path"] == completion_receipt_path
+    assert handoff_receipt["details"]["handoff"]["request"]["target_state"] == "Human Review"
+
+    assert_receive {:pi_message,
+                    %{
+                      event: :turn_completed,
+                      receipt_path: ^completion_receipt_path
+                    }}
+
+    assert_receive {:pi_message,
+                    %{
+                      event: :handoff_completed,
+                      receipt_path: handoff_receipt_path
+                    }}
+
+    assert handoff_receipt_path == turn.handoff_receipt_path
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "does not commit a staged handoff when completion receipt persistence fails" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-pi-receipt-failure-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    parent = self()
+
+    executor = fn _binding, _target_state, _issue ->
+      send(parent, :unexpected_handoff_commit)
+      tracker_tool_result(true, %{"data" => %{}})
+    end
+
+    issue = %Issue{id: "issue-receipt-failure", identifier: "JARVIS-RECEIPT", title: "FAIL_RECEIPT"}
+
+    assert {:ok, session} =
+             Backend.start_session(workspace,
+               tracker_bridge_opts: [
+                 binding: fixture_tracker_binding(),
+                 handoff_executor: executor
+               ]
+             )
+
+    receipt_root = Path.join(workspace, ".symphony/attempt-receipts")
+    File.mkdir_p!(Path.dirname(receipt_root))
+    File.write!(receipt_root, "not-a-directory")
+
+    assert {:error, {:receipt_write_failed, _reason}} =
+             Backend.run_turn(session, "stage_handoff", issue, turn_number: 1)
+
+    refute_receive :unexpected_handoff_commit
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "persists completion and handoff failure evidence when the staged provider call fails" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-pi-handoff-failure-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    parent = self()
+
+    executor = fn _binding, target_state, issue ->
+      send(parent, {:failed_handoff_executor, target_state, issue})
+      tracker_tool_result(false, %{"error" => %{"message" => "provider rejected transition"}})
+    end
+
+    issue = %Issue{id: "issue-handoff-failure", identifier: "JARVIS-FAIL", title: "FAIL_HANDOFF"}
+
+    assert {:ok, session} =
+             Backend.start_session(workspace,
+               tracker_bridge_opts: [
+                 binding: fixture_tracker_binding(),
+                 handoff_executor: executor
+               ]
+             )
+
+    assert {:error, {:tracker_handoff_failed, staged_handoff, failure}} =
+             Backend.run_turn(session, "stage_handoff", issue, turn_number: 1)
+
+    assert staged_handoff.target_state == "Human Review"
+    assert failure["success"] == false
+
+    assert_receive {:failed_handoff_executor, "Human Review", ^issue}
+
+    receipts =
+      Path.wildcard(Path.join(workspace, ".symphony/attempt-receipts/*.json"))
+      |> Map.new(fn path ->
+        receipt = path |> File.read!() |> Jason.decode!()
+        {receipt["outcome"], {path, receipt}}
+      end)
+
+    {completion_receipt_path, _completion_receipt} = Map.fetch!(receipts, "completed")
+    {handoff_receipt_path, handoff_receipt} = Map.fetch!(receipts, "handoff_failed")
+    assert File.regular?(handoff_receipt_path)
+    assert handoff_receipt["details"]["completion_receipt_path"] == completion_receipt_path
+    assert handoff_receipt["details"]["handoff"]["target_state"] == "Human Review"
+    assert handoff_receipt["details"]["tracker_result"]["success"] == false
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "fails closed before starting Pi when tracker bridge binding is invalid" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-pi-bridge-start-failure-#{System.unique_integer([:positive])}")
+
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.rm_rf!(test_root)
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    invalid_binding = %{
+      tool_specs: [
+        %{
+          "name" => "fixture_tracker",
+          "description" => "Fixture tracker tool",
+          "inputSchema" => %{"type" => "object"}
+        }
+      ]
+    }
+
+    assert {:error, :invalid_tracker_bridge_binding} =
+             Backend.start_session(workspace, tracker_bridge_opts: [binding: invalid_binding])
+
+    refute File.exists?(Path.join(workspace, ".symphony/pi-rpc.stderr.log"))
+    refute File.exists?(Path.join(workspace, ".symphony/pi-tracker-bridge.mjs"))
+    File.rm_rf!(test_root)
+  end
+
   test "aborts a timed-out Pi turn and returns a typed failure" do
     test_root = Path.join(System.tmp_dir!(), "symphony-pi-abort-#{System.unique_integer([:positive])}")
     workspace = Path.join(test_root, "workspace")
@@ -231,11 +444,43 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.rm_rf!(workspace)
   end
 
+  defp fixture_tracker_binding do
+    %{
+      adapter: :fixture,
+      tracker_settings: %{
+        kind: "linear",
+        active_states: ["Todo", "In Progress"],
+        terminal_states: ["Done"]
+      },
+      tool_specs: [
+        %{
+          "name" => "fixture_tracker",
+          "description" => "Fixture tracker tool",
+          "inputSchema" => %{
+            "type" => "object",
+            "additionalProperties" => true
+          }
+        }
+      ],
+      secret_environment_names: []
+    }
+  end
+
+  defp tracker_tool_result(success, payload) do
+    output = Jason.encode!(payload)
+
+    %{
+      "success" => success,
+      "output" => output,
+      "contentItems" => [%{"type" => "inputText", "text" => output}]
+    }
+  end
+
   defp write_fake_pi!(path) do
     File.write!(path, """
     #!/bin/sh
-    if [ -n "${PI_TEST_SECRET:-}" ]; then
-      printf '%s\\n' 'Pi received a tracker secret' >&2
+    if [ -n "${PI_TEST_SECRET:-}" ] || [ -n "${BW_SESSION:-}" ]; then
+      printf '%s\\n' 'Pi received a tracker or helper-auth secret' >&2
       exit 12
     fi
     printf '%s\\n' 'fake Pi stderr' >&2
@@ -259,6 +504,18 @@ defmodule SymphonyElixir.Pi.BackendTest do
           case "$line" in
             *'"message":"hang"'*)
               printf '%s\\n' '{"type":"agent_start"}'
+              ;;
+            *'"message":"stage_handoff"'*)
+              response=$(curl --silent --show-error --fail \
+                --header "authorization: Bearer $SYMPHONY_PI_TRACKER_BRIDGE_CAPABILITY" \
+                --header 'content-type: application/json' \
+                --data '{"tool":"symphony_handoff","arguments":{"target_state":"Human Review"}}' \
+                "$SYMPHONY_PI_TRACKER_BRIDGE_URL") || exit 14
+              printf '%s' "$response" | grep -q '"success":true' || exit 15
+              printf '%s\\n' '{"type":"agent_start"}'
+              printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"handoff ready"}]}}'
+              printf '%s\\n' '{"type":"agent_settled"}'
+              printf '{"type":"response","id":"%s","success":true}\\n' "$id"
               ;;
             *)
               printf '%s\\n' '{"type":"agent_start"}'

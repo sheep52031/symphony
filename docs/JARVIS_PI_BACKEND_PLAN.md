@@ -1,6 +1,7 @@
 # Jarvis thin Pi backend plan
 
-Status: candidate hardening implemented; live single-ticket acceptance is still pending
+Status: first live canary completed but exposed credential-boundary and handoff-evidence defects;
+remediations are implemented locally and require full validation plus a second authorized canary
 
 This fork stays close to `openai/symphony`. It adds a removable Pi execution path without replacing
 Symphony's tracker, workspace, polling, retry, reconciliation, concurrency, lifecycle, or
@@ -16,12 +17,16 @@ observability responsibilities.
 - Jarvis-specific tracker and prompt policy remains in the separate `jarvis-next` checkout. This
   fork's generic `elixir/WORKFLOW.md` must not acquire Jarvis-private project identifiers or
   credentials.
-- WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. The full upstream
-  suite on this branch reports `308 tests, 49 failures, 6 skipped`; a clean upstream baseline
-  reports `299 tests, 47 failures, 6 skipped`. The branch-only two failures are timing-sensitive
-  retry assertions in this WSL run; the remaining failures are the known WSL/Windows
-  fake-process, SSH, snapshot, and timing-fixture mismatch. All new Pi tests pass. This is not
-  treated as a green regression result or as live acceptance evidence.
+- WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. At pushed candidate
+  `e53c8e9f9b34f39047e2cea96acfd7a57f0ebb42`, the local branch reported `312 tests, 40 failures,
+  6 skipped`; a clean upstream baseline reported `299 tests, 47 failures, 6 skipped`. Exact-head
+  supported-host CI passed with `312 tests, 0 failures, 6 skipped`. The local failures remain the
+  known WSL/Windows fake-process, SSH, snapshot, and timing-fixture mismatch and are not described
+  as green CI. With the bridge/handoff/security changes, the latest local run reports `330 tests,
+  40 failures, 6 skipped`; the failure families remain the measured WSL/Windows baseline and no
+  new focused test fails. A source-equivalent candidate copied onto a Linux-native filesystem passes
+  `make all`: `330 tests, 0 failures, 6 skipped`, `100.00%` measured coverage, lint with no issues,
+  and Dialyzer with zero errors. Exact-head supported-host CI is still required after commit/push.
 
 ## Cross-device execution contract
 
@@ -61,25 +66,45 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
 - The orchestrator snapshots the selected backend into each new running attempt and passes that
   value to `AgentRunner`; an in-flight attempt does not follow a later workflow reload. Running,
   blocked, and retry snapshots preserve backend and receipt identity when available.
-- Pi turn completion, typed failure, timeout/abort, and orchestrator cancellation now write bounded
+- Pi turn completion, typed failure, timeout/abort, and orchestrator cancellation write bounded
   JSON receipts. Pi receipts include the native session, effective model and thinking level,
-  backend PID, final assistant text or failure, stats, and a bounded stderr tail.
-- `pi_rpc_test.exs` and `pi_backend_test.exs` use deterministic fake processes only. They do not
-  call an LLM, mutate Linear, install Pi extensions, or replace the Jarvis runtime.
-- Focused validation currently passes: `11 tests, 0 failures` for the Pi RPC/backend modules. The
-  targeted Pi plus orchestrator/cancellation receipt run passes `57 tests, 0 failures`.
+  backend PID, final/last assistant text, stats, and a bounded stderr tail. Reconciliation now links
+  an existing receipt or persists an `interrupted` partial attempt receipt before cancellation.
+- `SymphonyElixir.Pi.TrackerBridge` gives each Pi session a random bearer capability to a dedicated
+  `127.0.0.1` listener, binds one adapter/settings/tool-spec snapshot and normalized issue, and
+  executes adapter tools inside Symphony. The generated mode-`0600` Pi extension deletes bridge
+  bootstrap values from `process.env` immediately after registration.
+- `symphony_handoff` stages only a non-active, non-terminal target state name. For Linear,
+  Symphony resolves the target inside the bound issue's team, constructs the mutation host-side,
+  and requires the response to confirm the exact state. Pi completion is settled and written first;
+  the mutation is committed second; a separate `handoff_completed` or `handoff_failed` receipt is
+  written last. Detectable direct Linear `stateId` mutations are denied.
+- Linear may resolve `tracker.provider.api_key_command` host-side without shell parsing. The
+  included PowerShell helper reads one Bitwarden custom field; helper-auth environment names are
+  explicitly removed from coding-agent children. A locked vault fails closed.
+- Deterministic bridge/backend/RPC/secret/cancellation tests do not call an LLM or mutate Linear.
+  The latest focused checkpoint passes `74 tests, 0 failures` with unrelated tests excluded;
+  warnings-as-errors compilation and Dialyzer pass. The dependency lock was refreshed within the
+  declared constraints to patched Bandit/Plug/Phoenix/Req/Mint/LiveView/Decimal releases, and
+  `mix hex.audit` reports no retired or advisory packages. Full supported-host CI is still required.
 - A real no-prompt Pi smoke through `SymphonyElixir.Pi.Rpc` successfully completed `get_state` in
   WSL2 and on the authorized M2 Air; no LLM prompt was sent.
+- The first authorized live Pi ticket (JARVIS-868) produced one workspace/branch/PR and stopped at
+  Human Review. It also proved two blockers: Pi could discover a Windows User-scope Linear token via
+  PowerShell, and reconciliation cancelled the final turn before a per-ticket completion receipt
+  existed. The loopback bridge, deferred handoff, and interrupted receipt are direct remediations;
+  JARVIS-868 is failure evidence for those old paths, not acceptance evidence for the remediations.
 
 
 ## PR readiness
 
-This first slice remains a transparent draft PR until live acceptance completes. The clean upstream
-baseline has been measured separately; the full WSL2 suite still has the known fake-process, SSH,
-snapshot, and timing-fixture failures noted above. The cross-device no-prompt bootstrap, durable
-worker receipts, and orchestrator receipt propagation are proven by focused tests. A supported-host
-CI rerun for the hardened head plus a single-ticket LLM turn and acceptance/rollback evidence are
-still required before a non-draft merge candidate.
+This slice remains a transparent draft PR. The first single-ticket LLM canary completed its scoped
+code work but failed the security/lifecycle gate, so it did not make the backend production-ready.
+The bridge, secret-command, deferred-handoff, and interrupted-receipt remediations require full local
+validation, an exact-head supported-host CI run, and a second separately authorized one-ticket
+canary proving that Pi cannot read the Linear/Bitwarden credentials and that completion evidence is
+durable before Human Review reconciliation. Rollback to the official Codex runtime remains part of
+the gate.
 
 ## Fixed boundaries
 
@@ -132,24 +157,32 @@ The spike must use a fake Pi process for deterministic tests and one no-prompt r
 available. It must not make an LLM call, mutate Linear, install extensions, or write to shared user
 sessions.
 
-### 2. Backend integration — candidate hardening implemented
+### 2. Backend integration — security/lifecycle rework implemented locally
 
 The resolver, `agent.backend: codex|pi` validation, `AgentRunner` session/turn selection,
-Pi-to-existing-update mapping, durable Pi receipts, generic orchestrator cancellation receipts,
-and snapshot proof fields are now present. Remaining integration work is intentionally bounded:
+Pi-to-existing-update mapping, durable receipts, session-scoped host tracker bridge, deferred
+handoff, host secret command, and snapshot proof fields are present. Remaining work is bounded:
 
-- re-run supported-host CI for the hardened candidate head
-- decide the upstream-sync and release pin procedure before any live use
+- finish any remaining deterministic cancellation-race edge cases
+- run the full suite and `make all` on a supported LF-native host; this WSL/Windows checkout still
+  reports the measured baseline line-ending/fake-process/SSH/snapshot failures
+- push an exact reviewed commit and require supported-host CI
+- define an operator-approved non-interactive Bitwarden unlock/session provisioning policy; the
+  inspected Windows vault is currently locked and no unattended auth value is available
 
-### 3. Single-ticket acceptance
+### 3. Single-ticket acceptance — first canary rejected; second canary required
 
-Use one disposable, explicitly authorized Linear ticket and one worker only:
+Use one new disposable, explicitly authorized Linear ticket and one worker only:
 
 - exact issue/workspace/branch identity
 - no auto-merge and stop at Human Review
 - Codex baseline regression remains green
 - Pi worker proof includes event stream, session identity, final text, stats, stderr tail, and
   timeout/abort outcome
+- prove tracker operations traverse the loopback bridge, bridge/bootstrap/Bitwarden/Linear secrets
+  are absent from Pi and its shell descendants, and no ambient host credential fallback is usable
+- prove completion receipt persistence precedes the provider handoff, the handoff has a separate
+  receipt, and cancellation evidence links a non-null prior receipt
 - verify single-writer behavior and rollback to `agent.backend: codex`
 
 ## Non-goals

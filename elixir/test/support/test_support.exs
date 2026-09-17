@@ -94,6 +94,8 @@ defmodule SymphonyElixir.TestSupport do
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
+          tracker_api_key_command: nil,
+          tracker_api_key_command_secret_environment_names: [],
           tracker_project_slug: "project",
           tracker_assignee: nil,
           tracker_required_labels: [],
@@ -134,6 +136,11 @@ defmodule SymphonyElixir.TestSupport do
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
+    tracker_api_key_command = Keyword.get(config, :tracker_api_key_command)
+
+    tracker_api_key_command_secret_environment_names =
+      Keyword.get(config, :tracker_api_key_command_secret_environment_names)
+
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_required_labels = Keyword.get(config, :tracker_required_labels)
@@ -173,6 +180,10 @@ defmodule SymphonyElixir.TestSupport do
         "---",
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
+        tracker_provider_yaml(
+          tracker_api_key_command,
+          tracker_api_key_command_secret_environment_names
+        ),
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
@@ -233,6 +244,19 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp tracker_provider_yaml(nil, names) when names in [nil, []], do: nil
+
+  defp tracker_provider_yaml(api_key_command, secret_environment_names) do
+    [
+      "  provider:",
+      api_key_command && "    api_key_command: #{yaml_value(api_key_command)}",
+      secret_environment_names not in [nil, []] &&
+        "    api_key_command_secret_environment_names: #{yaml_value(secret_environment_names)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
 
   defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 

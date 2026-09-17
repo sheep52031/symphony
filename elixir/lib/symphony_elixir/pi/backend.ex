@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Pi.Backend do
 
   @behaviour SymphonyElixir.AgentBackend
 
-  alias SymphonyElixir.{Config, Pi.Rpc}
+  alias SymphonyElixir.{Config, Pi.Rpc, Pi.TrackerBridge}
 
   @receipt_schema_version 1
   @stderr_tail_bytes 8_192
@@ -17,7 +17,8 @@ defmodule SymphonyElixir.Pi.Backend do
   @type session :: %{
           rpc: Rpc.session(),
           session_id: String.t() | nil,
-          session_state: map()
+          session_state: map(),
+          tracker_bridge: TrackerBridge.session() | nil
         }
 
   @impl true
@@ -28,26 +29,37 @@ defmodule SymphonyElixir.Pi.Backend do
         {:error, {:unsupported_backend_worker_host, :pi, host}}
 
       _ ->
-        start_local_session(workspace)
+        start_local_session(workspace, opts)
     end
   end
 
-  defp start_local_session(workspace) do
+  defp start_local_session(workspace, opts) do
     config = Config.settings!()
     stderr_path = Path.join(workspace, ".symphony/pi-rpc.stderr.log")
+    bridge_opts = Keyword.get(opts, :tracker_bridge_opts, [])
 
-    case Rpc.start(
-           workspace,
-           config.pi.command,
-           stderr_path: stderr_path,
-           env: tracker_secret_port_env(config)
-         ) do
-      {:ok, rpc} -> initialize_session(rpc, config)
-      {:error, _reason} = error -> error
+    case TrackerBridge.start(workspace, bridge_opts) do
+      {:ok, tracker_bridge} ->
+        rpc_opts = [
+          stderr_path: stderr_path,
+          env: tracker_secret_port_env(config) ++ tracker_bridge_environment(tracker_bridge)
+        ]
+
+        case Rpc.start(workspace, pi_command(config.pi.command, tracker_bridge), rpc_opts) do
+          {:ok, rpc} ->
+            initialize_session(rpc, config, tracker_bridge)
+
+          {:error, _reason} = error ->
+            TrackerBridge.stop(tracker_bridge)
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp initialize_session(rpc, config) do
+  defp initialize_session(rpc, config, tracker_bridge) do
     case Rpc.request(rpc, "get_state", %{}, timeout_ms: config.codex.read_timeout_ms) do
       {:ok, response} ->
         case session_id_from_state(response) do
@@ -56,16 +68,19 @@ defmodule SymphonyElixir.Pi.Backend do
              %{
                rpc: rpc,
                session_id: session_id,
-               session_state: Map.get(response, "data", %{})
+               session_state: Map.get(response, "data", %{}),
+               tracker_bridge: tracker_bridge
              }}
 
           _ ->
             Rpc.close(rpc)
+            TrackerBridge.stop(tracker_bridge)
             {:error, {:invalid_session_state, :missing_session_id}}
         end
 
       {:error, reason} ->
         Rpc.close(rpc)
+        TrackerBridge.stop(tracker_bridge)
         {:error, reason}
     end
   end
@@ -73,7 +88,12 @@ defmodule SymphonyElixir.Pi.Backend do
   @impl true
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
-        %{rpc: rpc, session_id: session_id, session_state: session_state},
+        %{
+          rpc: rpc,
+          session_id: session_id,
+          session_state: session_state,
+          tracker_bridge: tracker_bridge
+        },
         prompt,
         issue,
         opts
@@ -93,31 +113,40 @@ defmodule SymphonyElixir.Pi.Backend do
       opts: opts,
       proof: proof,
       rpc: rpc,
-      started_at: DateTime.utc_now()
+      started_at: DateTime.utc_now(),
+      tracker_bridge: tracker_bridge
     }
 
-    on_message.(
-      proof_update(
-        %{
-          event: :session_started,
-          payload: proof,
-          session_id: session_id,
-          timestamp: context.started_at,
-          backend: :pi
-        },
-        proof
-      )
-    )
+    case TrackerBridge.bind_issue(tracker_bridge, issue) do
+      :ok ->
+        on_message.(
+          proof_update(
+            %{
+              event: :session_started,
+              payload: proof,
+              session_id: session_id,
+              attempt_receipt_index: normalized_receipt_index(opts[:attempt], 0),
+              turn_receipt_index: normalized_receipt_index(opts[:turn_number], 1),
+              timestamp: context.started_at,
+              backend: :pi
+            },
+            proof
+          )
+        )
 
-    case Rpc.request(
-           rpc,
-           "set_session_name",
-           %{"name" => session_name},
-           timeout_ms: config.codex.read_timeout_ms,
-           on_event: context.on_event
-         ) do
-      {:ok, _} -> run_prompt_turn(context, prompt, timeout_ms)
-      {:error, reason} -> fail_turn(context, reason, :set_session_name_failed)
+        case Rpc.request(
+               rpc,
+               "set_session_name",
+               %{"name" => session_name},
+               timeout_ms: config.codex.read_timeout_ms,
+               on_event: context.on_event
+             ) do
+          {:ok, _} -> run_prompt_turn(context, prompt, timeout_ms)
+          {:error, reason} -> fail_turn(context, reason, :set_session_name_failed)
+        end
+
+      {:error, reason} ->
+        fail_turn(context, reason, :tracker_bridge_bind_failed)
     end
   end
 
@@ -190,13 +219,93 @@ defmodule SymphonyElixir.Pi.Backend do
             )
           )
 
-          {:ok, Map.put(turn, :receipt_path, receipt_path)}
+          complete_handoff(context, Map.put(turn, :receipt_path, receipt_path), receipt_path)
 
         {:error, reason} ->
           fail_turn_without_receipt(context, reason)
       end
     else
       {:error, reason} -> fail_turn(context, reason, :completion_read_failed)
+    end
+  end
+
+  defp complete_handoff(context, turn, completion_receipt_path) do
+    case TrackerBridge.commit_handoff(context.tracker_bridge) do
+      {:ok, nil} ->
+        {:ok, turn}
+
+      {:ok, handoff} ->
+        receipt =
+          build_receipt(context, "handoff_completed", %{
+            "completion_receipt_path" => completion_receipt_path,
+            "handoff" => handoff
+          })
+
+        case persist_receipt(context, receipt) do
+          {:ok, receipt_path} ->
+            context.on_message.(
+              proof_update(
+                %{
+                  event: :handoff_completed,
+                  payload: Map.put(receipt, "receipt_path", receipt_path),
+                  session_id: context.proof.session_id,
+                  receipt_path: receipt_path,
+                  timestamp: DateTime.utc_now(),
+                  backend: :pi
+                },
+                context.proof
+              )
+            )
+
+            {:ok,
+             turn
+             |> Map.put(:completion_receipt_path, completion_receipt_path)
+             |> Map.put(:handoff_receipt_path, receipt_path)}
+
+          {:error, reason} ->
+            fail_turn_without_receipt(context, reason)
+        end
+
+      {:error, reason} ->
+        fail_handoff(context, reason, completion_receipt_path)
+    end
+  end
+
+  defp fail_handoff(context, reason, completion_receipt_path) do
+    {handoff, tracker_result} =
+      case reason do
+        {:tracker_handoff_failed, staged_handoff, result} -> {staged_handoff, result}
+        _ -> {nil, nil}
+      end
+
+    receipt =
+      build_receipt(context, "handoff_failed", %{
+        "completion_receipt_path" => completion_receipt_path,
+        "handoff" => handoff,
+        "tracker_result" => tracker_result,
+        "reason" => inspect(reason)
+      })
+
+    case persist_receipt(context, receipt) do
+      {:ok, receipt_path} ->
+        context.on_message.(
+          proof_update(
+            %{
+              event: :handoff_failed,
+              payload: Map.put(receipt, "receipt_path", receipt_path),
+              session_id: context.proof.session_id,
+              receipt_path: receipt_path,
+              timestamp: DateTime.utc_now(),
+              backend: :pi
+            },
+            context.proof
+          )
+        )
+
+        {:error, reason}
+
+      {:error, receipt_reason} ->
+        fail_turn_without_receipt(context, receipt_reason)
     end
   end
 
@@ -313,7 +422,17 @@ defmodule SymphonyElixir.Pi.Backend do
   defp model_summary(_model), do: nil
 
   defp proof_update(update, proof) do
-    Map.merge(update, Map.take(proof, [:backend_process_pid, :model, :session_file, :thinking_level]))
+    Map.merge(
+      update,
+      Map.take(proof, [
+        :backend_command,
+        :backend_process_pid,
+        :model,
+        :session_file,
+        :stderr_path,
+        :thinking_level
+      ])
+    )
   end
 
   defp build_receipt(context, outcome, details) do
@@ -386,11 +505,29 @@ defmodule SymphonyElixir.Pi.Backend do
 
   @impl true
   @spec stop_session(session()) :: :ok
-  def stop_session(%{rpc: rpc}), do: Rpc.close(rpc)
+  def stop_session(%{rpc: rpc, tracker_bridge: tracker_bridge}) do
+    Rpc.close(rpc)
+    TrackerBridge.stop(tracker_bridge)
+  end
+
+  defp pi_command(command, nil), do: command
+
+  defp pi_command(command, %{extension_path: extension_path}) do
+    command <> " --extension " <> shell_escape(extension_path)
+  end
+
+  defp tracker_bridge_environment(%{environment: environment}) when is_list(environment),
+    do: environment
+
+  defp tracker_bridge_environment(_tracker_bridge), do: []
 
   defp tracker_secret_port_env(%{tracker: %{secret_environment_names: names}})
        when is_list(names) do
-    Enum.map(names, &{String.to_charlist(&1), false})
+    names
+    |> Enum.filter(fn name ->
+      is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+    end)
+    |> Enum.map(&{String.to_charlist(&1), false})
   end
 
   defp tracker_secret_port_env(_config), do: []
@@ -405,14 +542,60 @@ defmodule SymphonyElixir.Pi.Backend do
   defp settled_event?(_event), do: false
 
   defp emit_event(on_message, event) when is_function(on_message, 1) and is_map(event) do
-    on_message.(%{
-      event: event_name(event),
-      payload: event,
-      raw: Jason.encode!(event),
-      timestamp: DateTime.utc_now(),
-      backend: :pi
-    })
+    update =
+      %{
+        event: event_name(event),
+        payload: event,
+        raw: Jason.encode!(event),
+        timestamp: DateTime.utc_now(),
+        backend: :pi
+      }
+      |> maybe_put_event_assistant_text(event)
+      |> maybe_put_event_usage(event)
+
+    on_message.(update)
   end
+
+  defp maybe_put_event_assistant_text(update, %{"type" => "message_end", "message" => message}) do
+    case assistant_message_text(message) do
+      text when is_binary(text) and text != "" -> Map.put(update, :assistant_text, text)
+      _ -> update
+    end
+  end
+
+  defp maybe_put_event_assistant_text(
+         update,
+         %{
+           "type" => "message_update",
+           "assistantMessageEvent" => %{"type" => "text_delta", "delta" => delta}
+         }
+       )
+       when is_binary(delta) do
+    Map.put(update, :assistant_text_delta, delta)
+  end
+
+  defp maybe_put_event_assistant_text(update, _event), do: update
+
+  defp assistant_message_text(%{"role" => "assistant", "content" => content}) when is_binary(content),
+    do: content
+
+  defp assistant_message_text(%{"role" => "assistant", "content" => content}) when is_list(content) do
+    content
+    |> Enum.flat_map(fn
+      %{"type" => "text", "text" => text} when is_binary(text) -> [text]
+      _ -> []
+    end)
+    |> Enum.join("")
+  end
+
+  defp assistant_message_text(_message), do: nil
+
+  defp maybe_put_event_usage(update, %{"usage" => usage}) when is_map(usage) do
+    normalized = normalize_usage(usage)
+    if map_size(normalized) > 0, do: Map.put(update, :usage, normalized), else: update
+  end
+
+  defp maybe_put_event_usage(update, _event), do: update
 
   defp emit_usage(on_message, %{"data" => %{"tokens" => tokens}})
        when is_function(on_message, 1) and is_map(tokens) do
@@ -436,6 +619,7 @@ defmodule SymphonyElixir.Pi.Backend do
     |> copy_integer(tokens, "input", "input_tokens")
     |> copy_integer(tokens, "output", "output_tokens")
     |> copy_integer(tokens, "total", "total_tokens")
+    |> copy_integer(tokens, "totalTokens", "total_tokens")
   end
 
   defp copy_integer(usage, tokens, source, target) do
@@ -450,13 +634,19 @@ defmodule SymphonyElixir.Pi.Backend do
   defp event_name(%{"type" => "agent_settled"}), do: :agent_settled
   defp event_name(%{"type" => "turn_start"}), do: :turn_started
   defp event_name(%{"type" => "turn_end"}), do: :turn_ended
+  defp event_name(%{"type" => "message_start"}), do: :message_started
   defp event_name(%{"type" => "message_update"}), do: :message_update
+  defp event_name(%{"type" => "message_end"}), do: :message_ended
   defp event_name(%{"type" => "tool_execution_start"}), do: :tool_execution_started
   defp event_name(%{"type" => "tool_execution_update"}), do: :tool_execution_updated
   defp event_name(%{"type" => "tool_execution_end"}), do: :tool_execution_ended
   defp event_name(%{"type" => "extension_ui_request"}), do: :extension_ui_request
   defp event_name(%{"type" => type}) when is_binary(type), do: :notification
   defp event_name(_event), do: :notification
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
 
   defp default_on_message(_message), do: :ok
 end

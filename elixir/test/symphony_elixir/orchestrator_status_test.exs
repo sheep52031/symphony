@@ -139,6 +139,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      last_assistant_text: "prior turn text",
+      receipt_path: "/tmp/MT-PI/.symphony/attempt-receipts/prior-turn.json",
+      attempt_receipt_index: 1,
+      turn_receipt_index: 2,
       codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
@@ -166,9 +170,38 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          session_id: "pi-session-live",
          backend: :pi,
          backend_process_pid: 42_424,
+         attempt_receipt_index: 2,
+         turn_receipt_index: 3,
+         backend_command: "/opt/pi --mode rpc",
+         stderr_path: "/tmp/MT-PI/.symphony/pi-rpc.stderr.log",
          model: %{"id" => "gpt-5.6", "provider" => "openai"},
          thinking_level: "xhigh",
          session_file: "/tmp/pi-session.jsonl",
+         timestamp: now
+       }}
+    )
+
+    assert %{running: [started_entry]} = GenServer.call(pid, :snapshot)
+    assert Map.get(started_entry, :receipt_path) == nil
+    assert Map.get(started_entry, :last_assistant_text) == nil
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :message_updated,
+         assistant_text_delta: "partial assistant ",
+         timestamp: now
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :message_ended,
+         assistant_text: "final assistant evidence",
+         usage: %{input_tokens: 31, output_tokens: 12, total_tokens: 43},
          timestamp: now
        }}
     )
@@ -193,6 +226,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.thinking_level == "xhigh"
     assert snapshot_entry.session_id == "pi-session-live"
     assert snapshot_entry.session_file == "/tmp/pi-session.jsonl"
+    assert snapshot_entry.backend_command == "/opt/pi --mode rpc"
+    assert snapshot_entry.stderr_path == "/tmp/MT-PI/.symphony/pi-rpc.stderr.log"
+    assert snapshot_entry.last_assistant_text == "final assistant evidence"
+    assert snapshot_entry.codex_input_tokens == 31
+    assert snapshot_entry.codex_output_tokens == 12
+    assert snapshot_entry.codex_total_tokens == 43
 
     assert snapshot_entry.receipt_path ==
              "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json"

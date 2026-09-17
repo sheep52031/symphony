@@ -89,7 +89,7 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
     with {:ok, backend} <- resolve_backend(opts),
-         {:ok, session} <- backend.start_session(workspace, worker_host: worker_host) do
+         {:ok, session} <- backend.start_session(workspace, worker_host: worker_host, issue: issue) do
       try do
         do_run_agent_turns(
           %{
