@@ -473,12 +473,13 @@ Fields:
   - The runtime launches this command via `bash -lc` in the issue workspace.
   - The launched process MUST speak Pi's strict JSONL RPC protocol on stdout; stderr is diagnostics.
   - The runtime MUST append Pi's supported `--session-dir`, `--no-extensions`, `--no-skills`,
-    `--no-themes`, `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls,
-    set `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` to workspace-owned `0700`
-    directories, and remove ambient credential-like environment names before launch. A generated
-    Symphony tracker extension MAY be loaded through an explicit `--extension` argument; ambient
-    extensions, packages, skills, themes, prompt templates, context files, and credentials MUST NOT
-    be used as a worker boundary.
+    `--no-themes`, `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls, set
+    `PI_CODING_AGENT_SESSION_DIR` to a workspace-owned `0700` directory, and remove ambient
+    credential-like environment names before launch. It MUST NOT override `PI_CODING_AGENT_DIR` or
+    append `--provider`, `--model`, or `--thinking`; the operator's Pi profile owns authentication,
+    default model, and default thinking level. A generated Symphony tracker extension MAY be loaded
+    through an explicit `--extension` argument; ambient extensions, packages, skills, themes,
+    prompt templates, and context files MUST NOT be used as a worker boundary.
   - In this fork's first slice, Pi is local-only. Configured SSH workers are rejected rather than
     silently treated as supported.
   - When the selected tracker advertises agent tools, the runtime MUST register them through a
@@ -488,6 +489,8 @@ Fields:
   - Bootstrap capability values MAY enter the Pi process environment only for extension startup.
     The extension MUST delete them before agent-authored shell commands can inherit them. Declared
     tracker and secret-command auth environment names MUST be removed at process launch.
+  - A settled assistant message with `stopReason` `error` or `aborted` MUST fail the attempt and
+    persist failure evidence; command acceptance and `agent_settled` alone do not prove success.
   - A final state handoff MAY be staged during a turn, but MUST NOT execute until the targeted Pi
     `agent_settled` event has arrived and the completion receipt is durable. `agent_end` with
     `willRetry: false` is not authoritative completion evidence. The handoff result MUST

@@ -137,21 +137,33 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert {:ok, turn} = Backend.run_turn(session, "retry_then_settled", issue, on_message: on_message)
 
     assert turn.result["success"]
-    assert_receive {:pi_message, %{event: :agent_ended, payload: %{"willRetry" => false}}}
+    assert_receive {:pi_message, %{event: :agent_ended, payload: %{"willRetry" => true}}}
     assert_receive {:pi_message, %{event: :notification, payload: %{"type" => "compaction_start"}}}
     assert_receive {:pi_message, %{event: :agent_started}}
     assert_receive {:pi_message, %{event: :agent_settled}}
     assert_receive {:pi_message, %{event: :turn_completed}}
+    refute_receive {:pi_message, %{event: :turn_ended_with_error}}
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(test_root)
   end
 
-  test "starts Pi inside an explicit extension, package, skill, credential, and session boundary" do
+  test "inherits the operator Pi profile and default model while isolating the worker session" do
     test_root = Path.join(System.tmp_dir!(), "symphony-pi-isolation-#{System.unique_integer([:positive])}")
     workspace = Path.join(test_root, "workspace")
     script = Path.join(test_root, "probe-pi")
-    ambient_agent_dir = Path.join(test_root, "ambient-agent")
+    ambient_agent_dir = Path.join(test_root, "operator-pi-agent")
     File.mkdir_p!(workspace)
+    File.mkdir_p!(ambient_agent_dir)
+
+    File.write!(
+      Path.join(ambient_agent_dir, "settings.json"),
+      Jason.encode!(%{
+        "defaultProvider" => "subscription-provider",
+        "defaultModel" => "operator-default-model",
+        "defaultThinkingLevel" => "high"
+      })
+    )
+
     write_isolation_probe_pi!(script)
 
     previous_api_key = System.get_env("OPENAI_API_KEY")
@@ -182,13 +194,21 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert command =~ "--no-approve"
     assert command =~ "--extension"
     assert command =~ session.tracker_bridge.extension_path
+    refute command =~ "--provider"
+    refute command =~ "--model"
+    refute command =~ "--thinking"
 
-    agent_dir = workspace |> Path.join(".symphony/pi-agent") |> Path.expand()
     session_dir = workspace |> Path.join(".symphony/pi-session") |> Path.expand()
-    assert File.read!(Path.join(workspace, ".symphony/pi-agent-dir")) == agent_dir
+    assert File.read!(Path.join(workspace, ".symphony/pi-agent-dir")) == ambient_agent_dir
     assert File.read!(Path.join(workspace, ".symphony/pi-session-dir")) == session_dir
-    refute File.exists?(ambient_agent_dir)
-    assert Bitwise.band(File.stat!(agent_dir).mode, 0o777) == 0o700
+
+    assert session.session_state["model"] == %{
+             "id" => "operator-default-model",
+             "provider" => "subscription-provider"
+           }
+
+    assert session.session_state["thinkingLevel"] == "high"
+    assert File.dir?(ambient_agent_dir)
     assert Bitwise.band(File.stat!(session_dir).mode, 0o777) == 0o700
 
     assert :ok = Backend.stop_session(session)
@@ -290,6 +310,48 @@ defmodule SymphonyElixir.Pi.BackendTest do
     receipt = receipt_path |> File.read!() |> Jason.decode!()
     assert receipt["outcome"] == "failed"
     assert receipt["details"]["stage"] == "set_session_name_failed"
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
+  test "fails a settled Pi turn when the authoritative assistant message reports an error" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-pi-provider-error-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    File.mkdir_p!(workspace)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Application.fetch_env!(:symphony_elixir, :workflow_file_path),
+      agent_backend: "pi",
+      pi_command: script
+    )
+
+    issue = %Issue{id: "issue-pi-provider-error", identifier: "JARVIS-QUOTA", title: "Quota failure"}
+    on_message = fn message -> send(self(), {:pi_message, message}) end
+    assert {:ok, session} = Backend.start_session(workspace)
+
+    assert {:error,
+            {:pi_assistant_failed,
+             %{
+               "stopReason" => "error",
+               "errorMessage" => "subscription quota exhausted",
+               "provider" => "openai-codex",
+               "model" => "gpt-default"
+             }}} = Backend.run_turn(session, "provider_error", issue, on_message: on_message)
+
+    assert_receive {:pi_message,
+                    %{
+                      event: :turn_ended_with_error,
+                      payload: %{
+                        "outcome" => "failed",
+                        "details" => %{"stage" => "provider_turn_failed"},
+                        "receipt_path" => receipt_path
+                      }
+                    }}
+
+    receipt = receipt_path |> File.read!() |> Jason.decode!()
+    assert receipt["outcome"] == "failed"
+    assert receipt["details"]["reason"] =~ "subscription quota exhausted"
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(test_root)
   end
@@ -616,11 +678,19 @@ defmodule SymphonyElixir.Pi.BackendTest do
               ;;
             *'"message":"retry_then_settled"'*)
               printf '%s\\n' '{"type":"agent_start"}'
-              printf '%s\\n' '{"type":"agent_end","willRetry":false}'
+              printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"transient overload","provider":"openai-codex","model":"gpt-default","content":[]}}'
+              printf '%s\\n' '{"type":"agent_end","willRetry":true}'
               printf '%s\\n' '{"type":"compaction_start"}'
               printf '%s\\n' '{"type":"agent_start"}'
+              printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","provider":"openai-codex","model":"gpt-default","content":[{"type":"text","text":"recovered"}]}}'
               printf '{"type":"response","id":"%s","success":true}\\n' "$id"
               printf '%s\\n' '{"type":"agent_settled"}'
+              ;;
+            *'"message":"provider_error"'*)
+              printf '%s\\n' '{"type":"agent_start"}'
+              printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"subscription quota exhausted","provider":"openai-codex","model":"gpt-default","content":[]}}'
+              printf '%s\\n' '{"type":"agent_settled"}'
+              printf '{"type":"response","id":"%s","success":true}\\n' "$id"
               ;;
             *'"message":"stage_handoff"'*)
               response=$(curl --silent --show-error --fail \
@@ -671,13 +741,16 @@ defmodule SymphonyElixir.Pi.BackendTest do
     if [ -n "${OPENAI_API_KEY:-}" ]; then
       exit 12
     fi
+    grep -q '"defaultProvider":"subscription-provider"' "$PI_CODING_AGENT_DIR/settings.json" || exit 14
+    grep -q '"defaultModel":"operator-default-model"' "$PI_CODING_AGENT_DIR/settings.json" || exit 15
+    grep -q '"defaultThinkingLevel":"high"' "$PI_CODING_AGENT_DIR/settings.json" || exit 16
     printf '%s' "${PI_CODING_AGENT_DIR:-}" > "$PWD/.symphony/pi-agent-dir"
     printf '%s' "${PI_CODING_AGENT_SESSION_DIR:-}" > "$PWD/.symphony/pi-session-dir"
     while IFS= read -r line; do
       id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
       case "$line" in
         *'"type":"get_state"'*)
-          printf '{"type":"response","id":"%s","success":true,"data":{"sessionId":"pi-isolation-session"}}\\n' "$id"
+          printf '{"type":"response","id":"%s","success":true,"data":{"sessionId":"pi-isolation-session","thinkingLevel":"high","model":{"id":"operator-default-model","provider":"subscription-provider"}}}\\n' "$id"
           ;;
         *) exit 9 ;;
       esac
