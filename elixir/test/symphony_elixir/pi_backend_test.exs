@@ -5,8 +5,9 @@ defmodule SymphonyElixir.Pi.BackendTest do
   alias SymphonyElixir.Pi.Backend
 
   test "resolves known backends and rejects invalid selectors" do
-    assert {:ok, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
-    assert {:ok, Backend} = AgentBackend.resolve(:pi)
+    assert MapSet.new(AgentBackend.supported_names()) == MapSet.new(["codex", "pi"])
+    assert {:ok, :codex, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
+    assert {:ok, :pi, Backend} = AgentBackend.resolve(:pi)
     assert {:error, {:unsupported_backend, "unknown"}} = AgentBackend.resolve("unknown")
     assert {:error, {:invalid_backend, 123}} = AgentBackend.resolve(123)
   end
@@ -216,8 +217,8 @@ defmodule SymphonyElixir.Pi.BackendTest do
   end
 
   test "resolves Codex by default and accepts Pi only as an explicit selector" do
-    assert {:ok, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
-    assert {:ok, SymphonyElixir.Pi.Backend} = AgentBackend.resolve(:pi)
+    assert {:ok, :codex, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
+    assert {:ok, :pi, SymphonyElixir.Pi.Backend} = AgentBackend.resolve(:pi)
     assert {:error, {:unsupported_backend, "claude"}} = AgentBackend.resolve("claude")
 
     assert {:ok, settings} = Schema.parse(%{})
