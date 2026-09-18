@@ -88,12 +88,13 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, backend} <- resolve_backend(opts),
+    with {:ok, backend_name, backend} <- resolve_backend(opts),
          {:ok, session} <- backend.start_session(workspace, worker_host: worker_host, issue: issue) do
       try do
         do_run_agent_turns(
           %{
             backend: backend,
+            backend_name: backend_name,
             app_session: session,
             workspace: workspace,
             issue: issue,
@@ -113,6 +114,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_agent_turns(
          %{
            backend: backend,
+           backend_name: backend_name,
            app_session: app_session,
            workspace: workspace,
            issue: issue,
@@ -130,7 +132,7 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: agent_message_handler(codex_update_recipient, issue, backend_name(backend)),
+             on_message: agent_message_handler(codex_update_recipient, issue, backend_name),
              attempt: Keyword.get(opts, :attempt),
              turn_number: turn_number
            ) do
@@ -164,16 +166,13 @@ defmodule SymphonyElixir.AgentRunner do
     AgentBackend.resolve(backend_name)
   end
 
-  defp backend_name(SymphonyElixir.Codex.AppServer), do: :codex
-  defp backend_name(SymphonyElixir.Pi.Backend), do: :pi
-
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+    - The previous agent turn completed normally, but the tracker work item is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
