@@ -1,8 +1,10 @@
 # Jarvis thin Pi backend plan
 
-Status: release candidate validated. The authorized JARVIS-877 single-ticket canary proved the
-isolated Pi worker, host-mediated tracker bridge, durable completion/handoff receipts, Human Review
-transition, and rollback to the Codex default on candidate `d11bbb780bc8ab1ed4a3aee222e6f709bf37e579`.
+Status: inherited-profile revision validated by deterministic tests and the full Linux quality gate.
+The authorized JARVIS-877 single-ticket canary remains historical evidence for the host-mediated
+tracker bridge, durable completion/handoff receipts, Human Review transition, and Codex rollback on
+candidate `d11bbb780bc8ab1ed4a3aee222e6f709bf37e579`; it used the superseded workspace-owned Pi profile
+boundary and does not validate the current operator-profile inheritance change.
 
 This fork stays close to `openai/symphony`. It adds a removable Pi execution path without replacing
 Symphony's tracker, workspace, polling, retry, reconciliation, concurrency, lifecycle, or
@@ -21,7 +23,7 @@ observability responsibilities.
   fork's generic `elixir/WORKFLOW.md` must not acquire Jarvis-private project identifiers or
   credentials.
 - WSL validation is available through `mise` with Elixir `1.19.5` / OTP `28`. The native Linux
-  export of the branch passes `334 tests, 0 failures, 6 skipped`; `make all` also passes with
+  export of the branch passes `335 tests, 0 failures, 6 skipped`; `make all` also passes with
   format/spec checks, Credo (no issues), `100.00%` measured coverage, and Dialyzer (zero errors).
   The v0.0.3/nightly baseline passes `299 tests` with `6 skipped` but has one intermittent timing
   failure in `CoreTest`'s active-state continuation retry assertion. On the Windows-mounted
@@ -77,12 +79,14 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
   `127.0.0.1` listener, binds one adapter/settings/tool-spec snapshot and normalized issue, and
   executes adapter tools inside Symphony. The generated mode-`0600` Pi extension deletes bridge
   bootstrap values from `process.env` immediately after registration.
-- Pi launch is an explicit supported isolation boundary: Symphony sets workspace-owned `0700`
-  `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR`, appends `--session-dir` and Pi's
-  `--no-extensions`, `--no-skills`, `--no-themes`, `--no-prompt-templates`, `--no-context-files`,
-  and `--no-approve` controls, scrubs credential-like inherited environment names, and explicitly
-  appends only the generated tracker bridge extension. The proof test rejects ambient credentials,
-  verifies all flags, and verifies the effective directories.
+- Pi launch deliberately inherits the operator-selected Pi profile and its saved default model;
+  Symphony does not maintain a second model catalog or append provider/model/thinking flags. It
+  keeps each worker session in a workspace-owned `0700` `PI_CODING_AGENT_SESSION_DIR`, appends
+  `--session-dir` plus Pi's `--no-extensions`, `--no-skills`, `--no-themes`,
+  `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls, scrubs ambient
+  credential-like environment names, and explicitly appends only the generated tracker bridge
+  extension. The proof test verifies profile inheritance, the absence of model overrides, secret
+  scrubbing, all isolation flags, and the effective session directory.
 - `symphony_handoff` stages only a non-active, non-terminal target state name. For Linear,
   Symphony resolves the target inside the bound issue's team, constructs the mutation host-side,
   and requires the response to confirm the exact state. Pi completion is settled and written first;
@@ -108,22 +112,24 @@ PiAgent use also include macOS. The backend therefore follows these host rules:
   the settled completion receipt before the host-side Linear mutation and then persisted the
   separate `handoff_completed` receipt. Stable copies and a manifest remain under
   `workspaces-pi-canary/.symphony/completion-receipts/JARVIS-877/`.
-- JARVIS-877's LLM-callable shell reported `LINEAR_API_KEY` and `BW_SESSION` absent. Pi loaded only
-  the generated tracker extension plus an isolated workspace-owned agent/session directory; the
-  extension removes its actual bridge URL, capability, and tool-spec bootstrap variables before
-  agent tools run, as covered by deterministic bridge tests. A separate negative-auth probe removed
+- Under the prior workspace-owned profile boundary, JARVIS-877's LLM-callable shell reported
+  `LINEAR_API_KEY` and `BW_SESSION` absent. Pi loaded only the generated tracker extension plus an
+  isolated workspace-owned agent/session directory; the extension removes its actual bridge URL,
+  capability, and tool-spec bootstrap variables before agent tools run, as covered by deterministic
+  bridge tests. A separate negative-auth probe removed
   ambient credential-like variables, failed closed without an isolated provider credential, and
   still reached authoritative `agent_settled`. The post-canary empty-selector launch restored
   `agent.backend: codex`, started no LLM worker, and left the product issue unchanged.
 
 ## PR readiness
 
-The release gate is satisfied for the bounded, opt-in, local-only Pi backend. Candidate `d11bbb7`
-passed the authorized JARVIS-877 tracker/security/lifecycle canary, durable receipt read-back,
-Human Review handoff, negative credential probe, and Codex-default rollback. The branch also passed
-fresh native-Linux `make all` and GitHub `make-all`. Pi remains disabled unless a workflow explicitly
-selects `agent.backend: pi`; SSH Pi workers remain unsupported, and Codex remains the default and
-rollback path.
+The inherited-profile revision has deterministic regression coverage and passes fresh native-Linux
+`make all`; it has not received a new live canary. Candidate `d11bbb7` previously passed the
+JARVIS-877 tracker/lifecycle canary, durable receipt read-back, Human Review handoff, negative
+credential probe, and Codex-default rollback under the superseded workspace-owned profile boundary.
+That evidence remains applicable only to unchanged lifecycle behavior. Pi remains disabled unless a
+workflow explicitly selects `agent.backend: pi`; SSH Pi workers remain unsupported, and Codex
+remains the default and rollback path.
 
 ## Fixed boundaries
 
@@ -204,7 +210,7 @@ worker only:
 ## Non-goals
 
 - no second scheduler, queue, control plane, tracker replica, or retry/reviewer controller
-- no provider model registry or credential broker
+- no provider model registry, concrete model routing policy, automatic model escalation, or credential broker
 - no automatic DeepSeek backend; DSH remains explicit single-ticket takeover only
 - no Eureka code or MemoryBank/Cognee code in this repository
 - no Pi-specific PR/merge/dashboard automation copied from `tmustier/pi-symphony`

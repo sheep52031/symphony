@@ -162,10 +162,14 @@ Notes:
 
 - If a value is missing, defaults are used.
 - `pi.command` defaults to `pi --mode rpc`. The command must resolve from non-interactive
-  `bash -lc`; Symphony appends Pi's supported isolation flags, creates `--session-dir` under
-  `.symphony/pi-session`, and sets `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` to
-  workspace-owned `0700` directories. Global extensions, skills, themes, prompt templates, and
+  `bash -lc`. Symphony does not pass `--provider`, `--model`, or `--thinking`: Pi inherits the
+  operator's active `PI_CODING_AGENT_DIR` (or Pi's normal user profile) and therefore uses the same
+  saved default model as an operator-opened Pi terminal. Symphony records the effective model and
+  thinking level returned by `get_state`, and keeps only the worker session in a workspace-owned
+  `0700` `.symphony/pi-session` directory. Global extensions, skills, themes, prompt templates, and
   context files are disabled; only Symphony's generated tracker extension is explicitly loaded.
+  The selected Pi profile contains Pi's own authentication; use a dedicated WSL2 user/profile and
+  do not store unrelated controller secrets in it.
 - Pi SSH workers are rejected in this first slice rather than being silently treated as supported.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
@@ -190,10 +194,6 @@ Notes:
 - `agent.backend` selects the execution adapter and defaults to `codex`. `pi` is an explicit,
   local-only opt-in in this fork; Pi workers configured with SSH hosts are rejected until a native
   remote Pi transport is added.
-- `pi.command` is the base local Pi RPC command and should use `--mode rpc`; stderr is captured
-  beside the workspace session proof. Symphony supplies the per-workspace session/config paths and
-  isolation flags, removes ambient credential-like environment names, and appends only its generated
-  tracker-bridge extension when the selected adapter advertises tools.
 - Pi tracker calls go to a capability-protected listener bound only to `127.0.0.1`. Provider tool
   specs and tracker settings are snapshotted per session; the raw provider token is never placed in
   the Pi child environment. Completion and handoff wait for Pi's authoritative `agent_settled`

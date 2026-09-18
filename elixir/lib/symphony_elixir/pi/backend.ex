@@ -186,19 +186,45 @@ defmodule SymphonyElixir.Pi.Backend do
   end
 
   defp run_prompt_turn(context, prompt, timeout_ms) do
-    case Rpc.request(
-           context.rpc,
-           "prompt",
-           %{"message" => prompt},
-           timeout_ms: timeout_ms,
-           on_event: context.on_event,
-           until: &settled_event?/1
-         ) do
-      {:ok, prompt_response} -> complete_turn(context, prompt_response)
-      {:error, :timeout} -> abort_after_timeout(context)
-      {:error, reason} -> fail_turn(context, reason, :prompt_failed)
+    failure_key = {__MODULE__, :turn_failure, make_ref()}
+
+    on_event = fn event ->
+      context.on_event.(event)
+
+      case assistant_outcome(event) do
+        :ignore -> :ok
+        :succeeded -> Process.delete(failure_key)
+        {:failed, reason} -> Process.put(failure_key, reason)
+      end
+    end
+
+    try do
+      context.rpc
+      |> Rpc.request(
+        "prompt",
+        %{"message" => prompt},
+        timeout_ms: timeout_ms,
+        on_event: on_event,
+        until: &settled_event?/1
+      )
+      |> handle_prompt_result(context, failure_key)
+    after
+      Process.delete(failure_key)
     end
   end
+
+  defp handle_prompt_result({:ok, prompt_response}, context, failure_key) do
+    case Process.get(failure_key) do
+      nil -> complete_turn(context, prompt_response)
+      reason -> fail_turn(context, reason, :provider_turn_failed)
+    end
+  end
+
+  defp handle_prompt_result({:error, :timeout}, context, _failure_key),
+    do: abort_after_timeout(context)
+
+  defp handle_prompt_result({:error, reason}, context, _failure_key),
+    do: fail_turn(context, reason, :prompt_failed)
 
   defp complete_turn(context, prompt_response) do
     with {:ok, assistant_response} <-
@@ -546,24 +572,18 @@ defmodule SymphonyElixir.Pi.Backend do
   end
 
   defp prepare_pi_isolation(workspace) when is_binary(workspace) do
-    agent_dir = Path.join(workspace, ".symphony/pi-agent")
     session_dir = Path.join(workspace, ".symphony/pi-session")
 
-    with :ok <- File.mkdir_p(agent_dir),
-         :ok <- File.mkdir_p(session_dir),
-         :ok <- File.chmod(agent_dir, 0o700),
+    with :ok <- File.mkdir_p(session_dir),
          :ok <- File.chmod(session_dir, 0o700) do
-      {:ok, %{agent_dir: agent_dir, session_dir: session_dir}}
+      {:ok, %{session_dir: session_dir}}
     end
   rescue
     error in [ArgumentError, File.Error] -> {:error, error}
   end
 
-  defp pi_isolation_environment(%{agent_dir: agent_dir, session_dir: session_dir}) do
-    [
-      {~c"PI_CODING_AGENT_DIR", String.to_charlist(agent_dir)},
-      {~c"PI_CODING_AGENT_SESSION_DIR", String.to_charlist(session_dir)}
-    ]
+  defp pi_isolation_environment(%{session_dir: session_dir}) do
+    [{~c"PI_CODING_AGENT_SESSION_DIR", String.to_charlist(session_dir)}]
   end
 
   defp pi_secret_port_env do
@@ -610,6 +630,20 @@ defmodule SymphonyElixir.Pi.Backend do
 
   defp settled_event?(%{"type" => "agent_settled"}), do: true
   defp settled_event?(_event), do: false
+
+  defp assistant_outcome(%{"type" => type, "message" => message})
+       when type in ["message_end", "turn_end"] and is_map(message),
+       do: assistant_message_outcome(message)
+
+  defp assistant_outcome(_event), do: :ignore
+
+  defp assistant_message_outcome(%{"role" => "assistant", "stopReason" => stop_reason} = message)
+       when stop_reason in ["error", "aborted"] do
+    {:failed, {:pi_assistant_failed, Map.take(message, ["stopReason", "errorMessage", "provider", "model"])}}
+  end
+
+  defp assistant_message_outcome(%{"role" => "assistant"}), do: :succeeded
+  defp assistant_message_outcome(_message), do: :ignore
 
   defp emit_event(on_message, event) when is_function(on_message, 1) and is_map(event) do
     update =
