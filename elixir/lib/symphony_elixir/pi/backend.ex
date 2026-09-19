@@ -44,13 +44,26 @@ defmodule SymphonyElixir.Pi.Backend do
            Rpc.start(workspace, pi_command(config.pi.command, isolation),
              stderr_path: stderr_path,
              env: pi_secret_port_env() ++ tracker_secret_port_env(config) ++ pi_isolation_environment(isolation)
-           ),
-         {:ok, response} <- Rpc.request(rpc, "get_state", %{}, timeout_ms: config.codex.read_timeout_ms),
-         session_id when is_binary(session_id) <- session_id_from_state(response) do
-      {:ok, %{rpc: rpc, session_id: session_id, session_state: Map.get(response, "data", %{})}}
-    else
-      nil -> {:error, {:invalid_session_state, :missing_session_id}}
-      {:error, _reason} = error -> error
+           ) do
+      initialize_session(rpc, config)
+    end
+  end
+
+  defp initialize_session(rpc, config) do
+    case Rpc.request(rpc, "get_state", %{}, timeout_ms: config.codex.read_timeout_ms) do
+      {:ok, response} ->
+        case session_id_from_state(response) do
+          session_id when is_binary(session_id) ->
+            {:ok, %{rpc: rpc, session_id: session_id, session_state: Map.get(response, "data", %{})}}
+
+          _ ->
+            Rpc.close(rpc)
+            {:error, {:invalid_session_state, :missing_session_id}}
+        end
+
+      {:error, reason} ->
+        Rpc.close(rpc)
+        {:error, reason}
     end
   end
 

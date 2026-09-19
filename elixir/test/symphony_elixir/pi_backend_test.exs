@@ -12,6 +12,40 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert {:error, {:invalid_backend, 123}} = AgentBackend.resolve(123)
   end
 
+  test "closes the Pi child when get_state fails or omits the session id" do
+    for {name, response} <- [
+          {"failure", ~s("success":false,"error":"fixture startup rejection")},
+          {"missing-session", ~s("success":true,"data":{})}
+        ] do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-pi-startup-#{name}-#{System.unique_integer([:positive])}"
+        )
+
+      workspace = Path.join(root, "workspace")
+      script = Path.join(root, "fake-pi")
+      exit_marker = Path.join(workspace, ".symphony/pi-exited")
+      File.mkdir_p!(workspace)
+      write_startup_pi!(script, response)
+
+      write_workflow_file!(Workflow.workflow_file_path(), agent_backend: "pi", pi_command: script)
+
+      case name do
+        "failure" ->
+          assert {:error, {:command_failed, %{"error" => "fixture startup rejection"}}} =
+                   Backend.start_session(workspace)
+
+        "missing-session" ->
+          assert {:error, {:invalid_session_state, :missing_session_id}} =
+                   Backend.start_session(workspace)
+      end
+
+      assert_eventually!(fn -> File.exists?(exit_marker) end)
+      File.rm_rf!(root)
+    end
+  end
+
   test "runs a native Pi turn, scrubs tracker secrets, and emits lifecycle evidence" do
     {root, workspace, script} = setup_fake_pi!()
     previous_secret = System.get_env("PI_TEST_SECRET")
@@ -154,13 +188,17 @@ defmodule SymphonyElixir.Pi.BackendTest do
       agent: %Schema.Agent{backend: "pi"},
       worker: %Schema.Worker{ssh_hosts: ["worker-01"]}
     }
+
     assert {:error, {:unsupported_backend_worker_hosts, :pi}} = Config.validate_settings(settings)
 
     workspace =
       Path.join(System.tmp_dir!(), "symphony-pi-remote-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(workspace)
+
     assert {:error, {:unsupported_backend_worker_host, :pi, "worker-01"}} =
              Backend.start_session(workspace, worker_host: "worker-01")
+
     File.rm_rf!(workspace)
   end
 
@@ -176,6 +214,7 @@ defmodule SymphonyElixir.Pi.BackendTest do
       pi_command: script,
       workspace_root: workspace_root
     )
+
     issue = %Issue{id: "issue-pi-runner", identifier: "JARVIS-863", title: "Pi runner opt-in"}
 
     assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: fn _ -> {:ok, []} end)
@@ -192,10 +231,24 @@ defmodule SymphonyElixir.Pi.BackendTest do
 
     assert {:error, {:turn_timeout, :abort_acknowledged}} =
              Backend.run_turn(session, "hang", issue, timeout_ms: 30, on_message: on_message)
+
     assert_receive {:pi_message, %{event: :turn_aborted, session_id: "pi-session", backend: :pi}}
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
   end
+
+  defp assert_eventually!(predicate, attempts \\ 50)
+
+  defp assert_eventually!(predicate, attempts) when attempts > 0 do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(10)
+      assert_eventually!(predicate, attempts - 1)
+    end
+  end
+
+  defp assert_eventually!(_predicate, 0), do: flunk("timed out waiting for Pi child to exit")
 
   defp setup_fake_pi! do
     root = Path.join(System.tmp_dir!(), "symphony-pi-backend-#{System.unique_integer([:positive])}")
@@ -204,6 +257,22 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.mkdir_p!(workspace)
     write_fake_pi!(script)
     {root, workspace, script}
+  end
+
+  defp write_startup_pi!(path, response) do
+    File.write!(path, """
+    #!/bin/sh
+    trap 'printf exited > "$PWD/.symphony/pi-exited"' EXIT
+    while IFS= read -r line; do
+      id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+      case "$line" in
+        *'"type":"get_state"'*) printf '{"type":"response","id":"%s",#{response}}\\n' "$id" ;;
+        *) exit 9 ;;
+      esac
+    done
+    """)
+
+    File.chmod!(path, 0o755)
   end
 
   defp write_fake_pi!(path) do
