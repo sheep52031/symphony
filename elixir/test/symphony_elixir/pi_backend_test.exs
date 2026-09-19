@@ -61,7 +61,11 @@ defmodule SymphonyElixir.Pi.BackendTest do
     )
 
     issue = %Issue{id: "issue-pi", identifier: "JARVIS-862", title: "Pi backend spike"}
-    on_message = fn message -> send(self(), {:pi_message, message}) end
+
+    on_message = fn message ->
+      assert :ok = AgentBackend.validate_update(message)
+      send(self(), {:pi_message, message})
+    end
 
     assert {:ok, session} = Backend.start_session(workspace)
     assert session.session_id == "pi-session"
@@ -95,7 +99,7 @@ defmodule SymphonyElixir.Pi.BackendTest do
 
     assert {:ok, session} = Backend.start_session(workspace)
 
-    assert {:error, {:turn_timeout, :abort_acknowledged}} =
+    assert {:error, {:turn_timeout, {:absolute_turn_deadline, :abort_acknowledged}}} =
              Backend.run_turn(session, "agent_end_only", issue, timeout_ms: 40, on_message: on_message)
 
     assert_receive {:pi_message, %{event: :agent_ended, payload: %{"willRetry" => false}}}
@@ -229,10 +233,74 @@ defmodule SymphonyElixir.Pi.BackendTest do
     on_message = fn message -> send(self(), {:pi_message, message}) end
     assert {:ok, session} = Backend.start_session(workspace)
 
-    assert {:error, {:turn_timeout, :abort_acknowledged}} =
+    assert {:error, {:turn_timeout, {:absolute_turn_deadline, :abort_acknowledged}}} =
              Backend.run_turn(session, "hang", issue, timeout_ms: 30, on_message: on_message)
 
     assert_receive {:pi_message, %{event: :turn_aborted, session_id: "pi-session", backend: :pi}}
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
+  test "protocol chatter cannot extend the Pi absolute turn deadline" do
+    {root, workspace, script} = setup_fake_pi!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "pi",
+      pi_command: script,
+      pi_request_timeout_ms: 1_000,
+      pi_first_event_timeout_ms: 200,
+      pi_turn_timeout_ms: 70
+    )
+
+    issue = %Issue{id: "issue-pi-chatter", identifier: "JARVIS-CHATTER", title: "Pi chatter"}
+    assert {:ok, session} = Backend.start_session(workspace)
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:error, {:turn_timeout, {:absolute_turn_deadline, :abort_acknowledged}}} =
+             Backend.run_turn(session, "chatter", issue, [])
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    assert elapsed_ms < 750
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
+  test "classifies the Pi first-event deadline and performs bounded abort" do
+    {root, workspace, script} = setup_fake_pi!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "pi",
+      pi_command: script,
+      pi_request_timeout_ms: 500,
+      pi_first_event_timeout_ms: 30,
+      pi_turn_timeout_ms: 1_000
+    )
+
+    issue = %Issue{id: "issue-pi-silent", identifier: "JARVIS-SILENT", title: "Pi silent"}
+    assert {:ok, session} = Backend.start_session(workspace)
+
+    assert {:error, {:turn_timeout, {:first_event, :abort_acknowledged}}} =
+             Backend.run_turn(session, "silent_first_event", issue, [])
+
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
+  test "post-result reads share one absolute Pi deadline" do
+    {root, workspace, script} = setup_fake_pi!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "pi",
+      pi_command: script,
+      pi_post_result_timeout_ms: 40
+    )
+
+    issue = %Issue{id: "issue-pi-post-result", identifier: "JARVIS-POST", title: "Pi post result"}
+    assert {:ok, session} = Backend.start_session(workspace)
+
+    assert {:error, {:post_result_timeout, :assistant_text}} =
+             Backend.run_turn(session, "slow_post_result", issue, [])
+
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
   end
@@ -262,7 +330,8 @@ defmodule SymphonyElixir.Pi.BackendTest do
   defp write_startup_pi!(path, response) do
     File.write!(path, """
     #!/bin/sh
-    trap 'printf exited > "$PWD/.symphony/pi-exited"' EXIT
+    cleanup() { trap - EXIT TERM INT; printf exited > "$PWD/.symphony/pi-exited"; exit 0; }
+    trap cleanup EXIT TERM INT
     while IFS= read -r line; do
       id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
       case "$line" in
@@ -283,6 +352,7 @@ defmodule SymphonyElixir.Pi.BackendTest do
       exit 12
     fi
     printf '%s\\n' 'fake Pi stderr' >&2
+    slow_post_result=0
     while IFS= read -r line; do
       id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
       case "$line" in
@@ -294,10 +364,13 @@ defmodule SymphonyElixir.Pi.BackendTest do
             *'"message":"agent_end_only"'*) printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"agent_end","willRetry":false}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
             *'"message":"retry_then_settled"'*) printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error"}}'; printf '%s\\n' '{"type":"agent_end","willRetry":true}'; printf '%s\\n' '{"type":"compaction_start"}'; printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"recovered"}]}}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id"; printf '%s\\n' '{"type":"agent_settled"}' ;;
             *'"message":"provider_error"'*) printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"subscription quota exhausted"}}'; printf '%s\\n' '{"type":"agent_settled"}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
+            *'"message":"chatter"'*) i=0; while [ "$i" -lt 25 ]; do printf '%s\\n' '{"type":"heartbeat"}'; sleep 0.01; i=$((i + 1)); done; printf '%s\\n' '{"type":"agent_settled"}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
+            *'"message":"silent_first_event"'*) sleep 0.15 ;;
+            *'"message":"slow_post_result"'*) slow_post_result=1; printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"agent_settled"}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
             *) printf '%s\\n' '{"type":"agent_start"}'; printf '%s\\n' '{"type":"message_update","message":{"text":"working"}}'; printf '%s\\n' '{"type":"agent_settled"}'; printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
           esac ;;
         *'"type":"abort"'*) printf '{"type":"response","id":"%s","success":true}\\n' "$id" ;;
-        *'"type":"get_last_assistant_text"'*) printf '{"type":"response","id":"%s","success":true,"data":{"text":"done"}}\\n' "$id" ;;
+        *'"type":"get_last_assistant_text"'*) if [ "$slow_post_result" -eq 1 ]; then sleep 1; else printf '{"type":"response","id":"%s","success":true,"data":{"text":"done"}}\\n' "$id"; fi ;;
         *'"type":"get_session_stats"'*) printf '{"type":"response","id":"%s","success":true,"data":{"tokens":{"input":12,"output":7,"total":19}}}\\n' "$id" ;;
         *) exit 9 ;;
       esac

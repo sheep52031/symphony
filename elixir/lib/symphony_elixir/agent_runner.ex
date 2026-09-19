@@ -56,7 +56,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp agent_message_handler(recipient, issue, backend_name) do
     fn message ->
-      send_codex_update(recipient, issue, Map.put_new(message, :backend, backend_name))
+      case AgentBackend.validate_update(message) do
+        :ok ->
+          send_codex_update(recipient, issue, Map.put_new(message, :backend, backend_name))
+
+        {:error, reason} ->
+          throw({:backend_contract_violation, backend_name, reason})
+      end
     end
   end
 
@@ -89,7 +95,9 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
     with {:ok, backend_name, backend} <- resolve_backend(opts),
-         {:ok, session} <- backend.start_session(workspace, worker_host: worker_host, issue: issue) do
+         {:ok, session} <-
+           backend.start_session(workspace, worker_host: worker_host, issue: issue)
+           |> AgentBackend.validate_start_result() do
       try do
         do_run_agent_turns(
           %{
@@ -106,7 +114,10 @@ defmodule SymphonyElixir.AgentRunner do
           1
         )
       after
-        backend.stop_session(session)
+        case backend.stop_session(session) |> AgentBackend.validate_stop_result() do
+          :ok -> :ok
+          {:error, reason} -> raise RuntimeError, "Backend stop contract failed: #{inspect(reason)}"
+        end
       end
     end
   end
@@ -128,7 +139,9 @@ defmodule SymphonyElixir.AgentRunner do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           backend.run_turn(
+           run_backend_turn(
+             backend,
+             backend_name,
              app_session,
              prompt,
              issue,
@@ -136,7 +149,7 @@ defmodule SymphonyElixir.AgentRunner do
              attempt: Keyword.get(opts, :attempt),
              turn_number: turn_number
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session.session_id} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -159,6 +172,27 @@ defmodule SymphonyElixir.AgentRunner do
           {:error, reason}
       end
     end
+  end
+
+  defp run_backend_turn(backend, backend_name, session, prompt, issue, opts) do
+    result = backend.run_turn(session, prompt, issue, opts)
+
+    case result do
+      {:ok, turn_result} ->
+        case AgentBackend.validate_turn_result(turn_result) do
+          :ok -> {:ok, turn_result}
+          {:error, reason} -> {:error, {:backend_contract_violation, backend_name, reason}}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      other ->
+        {:error, {:backend_contract_violation, backend_name, {:invalid_backend_turn_result, other}}}
+    end
+  catch
+    :throw, {:backend_contract_violation, ^backend_name, reason} ->
+      {:error, {:backend_contract_violation, backend_name, reason}}
   end
 
   defp resolve_backend(opts) do

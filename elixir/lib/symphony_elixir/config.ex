@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.{Config.Schema, Tracker}
+  alias SymphonyElixir.{AgentBackend, Config.Schema, Tracker}
   alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
@@ -54,6 +54,12 @@ defmodule SymphonyElixir.Config do
   end
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
+
+  @spec agent_stall_timeout_ms() :: non_neg_integer()
+  def agent_stall_timeout_ms do
+    config = settings!()
+    config.agent.stall_timeout_ms || config.codex.stall_timeout_ms
+  end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
@@ -116,23 +122,14 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.agent.backend == "pi" and non_empty_hosts?(settings.worker.ssh_hosts) ->
-        {:error, {:unsupported_backend_worker_hosts, :pi}}
-
-      true ->
+    if is_nil(settings.tracker.kind) do
+      {:error, :missing_tracker_kind}
+    else
+      with :ok <- AgentBackend.validate_config(settings.agent.backend, settings) do
         Tracker.validate_config(settings.tracker)
+      end
     end
   end
-
-  defp non_empty_hosts?(hosts) when is_list(hosts) do
-    Enum.any?(hosts, fn host -> is_binary(host) and String.trim(host) != "" end)
-  end
-
-  defp non_empty_hosts?(_hosts), do: false
 
   defp format_config_error(reason) do
     case reason do

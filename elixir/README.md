@@ -146,8 +146,13 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  stall_timeout_ms: 300000
 pi:
   command: pi --mode rpc
+  request_timeout_ms: 5000
+  first_event_timeout_ms: 5000
+  turn_timeout_ms: 3600000
+  post_result_timeout_ms: 5000
 codex:
   command: codex app-server
 ---
@@ -169,6 +174,14 @@ Notes:
   context files are disabled. The selected Pi profile contains Pi's own authentication; use a dedicated WSL2 user/profile and
   do not store unrelated controller secrets in it.
 - Pi SSH workers are rejected in this first slice rather than being silently treated as supported.
+- Pi lifecycle deadlines are absolute, not reset by protocol chatter:
+  - `pi.request_timeout_ms` bounds ordinary RPC requests and abort acknowledgement.
+  - `pi.first_event_timeout_ms` bounds the first valid response or event after a request is sent.
+  - `pi.turn_timeout_ms` bounds the entire provider turn through authoritative `agent_settled`.
+  - `pi.post_result_timeout_ms` is one shared budget for assistant-text and usage reads after settlement.
+  On timeout Symphony sends a bounded native abort. On hosts with `setsid`, session shutdown then
+  terminates the dedicated Pi process group, including descendants; other hosts retain bounded
+  direct-child shutdown. The Pi fields fall back to the compatible Codex read/turn defaults when omitted.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -179,6 +192,9 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- `agent.stall_timeout_ms` is the provider-neutral watchdog used by the orchestrator. When omitted,
+  it falls back to the legacy `codex.stall_timeout_ms`; `0` disables the watchdog. This is separate
+  from each adapter's own request and turn deadlines.
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.

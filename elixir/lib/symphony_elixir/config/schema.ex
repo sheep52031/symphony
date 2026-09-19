@@ -154,6 +154,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:stall_timeout_ms, :integer)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -161,13 +162,21 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:backend, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :backend,
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :stall_timeout_ms
+        ],
         empty_values: []
       )
       |> validate_inclusion(:backend, AgentBackend.supported_names())
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -181,12 +190,26 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "pi --mode rpc")
+      field(:request_timeout_ms, :integer)
+      field(:first_event_timeout_ms, :integer)
+      field(:turn_timeout_ms, :integer)
+      field(:post_result_timeout_ms, :integer)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:command], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :command,
+          :request_timeout_ms,
+          :first_event_timeout_ms,
+          :turn_timeout_ms,
+          :post_result_timeout_ms
+        ],
+        empty_values: []
+      )
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
         if String.trim(command) == "" do
@@ -195,6 +218,10 @@ defmodule SymphonyElixir.Config.Schema do
           []
         end
       end)
+      |> validate_number(:request_timeout_ms, greater_than: 0)
+      |> validate_number(:first_event_timeout_ms, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:post_result_timeout_ms, greater_than: 0)
     end
   end
 
