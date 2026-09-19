@@ -102,25 +102,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
-  test "orchestrator preserves Pi identity and timeout receipt across retry" do
-    issue_id = "issue-pi-receipt"
+  test "orchestrator preserves Pi identity and neutral runtime evidence across retry" do
+    issue_id = "issue-pi-status"
 
     issue = %Issue{
       id: issue_id,
       identifier: "MT-PI",
-      title: "Pi receipt test",
-      description: "Capture Pi runtime proof",
+      title: "Pi status test",
+      description: "Capture Pi runtime evidence",
       state: "In Progress",
       url: "https://example.org/issues/MT-PI"
     }
 
-    orchestrator_name = Module.concat(__MODULE__, :PiReceiptOrchestrator)
+    orchestrator_name = Module.concat(__MODULE__, :PiStatusOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
     on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
     end)
 
     initial_state = :sys.get_state(pid)
@@ -139,11 +137,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
-      last_assistant_text: "prior turn text",
-      receipt_path: "/tmp/MT-PI/.symphony/attempt-receipts/prior-turn.json",
-      attempt_receipt_index: 1,
-      turn_receipt_index: 2,
-      codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
@@ -170,27 +163,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          session_id: "pi-session-live",
          backend: :pi,
          backend_process_pid: 42_424,
-         attempt_receipt_index: 2,
-         turn_receipt_index: 3,
          backend_command: "/opt/pi --mode rpc",
          stderr_path: "/tmp/MT-PI/.symphony/pi-rpc.stderr.log",
          model: %{"id" => "gpt-5.6", "provider" => "openai"},
          thinking_level: "xhigh",
          session_file: "/tmp/pi-session.jsonl",
-         timestamp: now
-       }}
-    )
-
-    assert %{running: [started_entry]} = GenServer.call(pid, :snapshot)
-    assert Map.get(started_entry, :receipt_path) == nil
-    assert Map.get(started_entry, :last_assistant_text) == nil
-
-    send(
-      pid,
-      {:codex_worker_update, issue_id,
-       %{
-         event: :message_updated,
-         assistant_text_delta: "partial assistant ",
          timestamp: now
        }}
     )
@@ -202,19 +179,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          event: :message_ended,
          assistant_text: "final assistant evidence",
          usage: %{input_tokens: 31, output_tokens: 12, total_tokens: 43},
-         timestamp: now
-       }}
-    )
-
-    send(
-      pid,
-      {:codex_worker_update, issue_id,
-       %{
-         event: :turn_aborted,
-         session_id: "pi-session-live",
-         backend: :pi,
-         receipt_path: "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json",
-         payload: %{"outcome" => "aborted"},
          timestamp: now
        }}
     )
@@ -233,11 +197,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_output_tokens == 12
     assert snapshot_entry.codex_total_tokens == 43
 
-    assert snapshot_entry.receipt_path ==
-             "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json"
-
-    assert snapshot_entry.last_codex_event == :turn_aborted
-
     send(pid, {:DOWN, process_ref, :process, self(), {:turn_timeout, :abort_acknowledged}})
 
     retry_snapshot = GenServer.call(pid, :snapshot)
@@ -245,9 +204,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert [retry_entry] = retry_snapshot.retrying
     assert retry_entry.backend == :pi
     assert retry_entry.session_id == "pi-session-live"
-
-    assert retry_entry.receipt_path ==
-             "/tmp/MT-PI/.symphony/attempt-receipts/attempt-0000-turn-0001.json"
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

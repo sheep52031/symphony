@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   import Ecto.Changeset
 
-  alias SymphonyElixir.{PathSafety, SecretCommand}
+  alias SymphonyElixir.PathSafety
 
   @primary_key false
   @linear_endpoint "https://api.linear.app/graphql"
@@ -476,41 +476,20 @@ defmodule SymphonyElixir.Config.Schema do
       |> Map.put_new("project_slug", settings.tracker.project_slug)
       |> Map.put_new("assignee", settings.tracker.assignee)
 
-    with {:ok, resolved_api_key} <- resolve_linear_api_key(linear_provider),
-         {:ok, secret_command_environment_names} <-
-           secret_command_environment_names(linear_provider) do
-      resolved_assignee =
-        resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+    resolved_api_key = resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+    resolved_assignee = resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
 
-      {:ok,
-       {
-         resolved_api_key,
-         resolved_assignee,
-         linear_provider,
-         [
-           "LINEAR_API_KEY"
-           | env_reference_names([linear_provider["api_key"]]) ++
-               secret_command_environment_names
-         ]
-       }}
-    end
+    {:ok,
+     {
+       resolved_api_key,
+       resolved_assignee,
+       linear_provider,
+       ["LINEAR_API_KEY" | env_reference_names([linear_provider["api_key"]])]
+     }}
   end
 
   defp finalize_tracker_credentials(settings, provider) do
     {:ok, {settings.tracker.api_key, settings.tracker.assignee, provider, []}}
-  end
-
-  defp resolve_linear_api_key(provider) do
-    case Map.get(provider, "api_key_command") do
-      nil ->
-        {:ok, resolve_secret_setting(provider["api_key"], System.get_env("LINEAR_API_KEY"))}
-
-      command ->
-        case SecretCommand.resolve(command) do
-          {:ok, secret} -> {:ok, secret}
-          {:error, reason} -> {:error, {:tracker_secret_command_failed, reason}}
-        end
-    end
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -602,19 +581,6 @@ defmodule SymphonyElixir.Config.Schema do
         :error -> []
       end
     end)
-  end
-
-  defp secret_command_environment_names(provider) do
-    names = Map.get(provider, "api_key_command_secret_environment_names", [])
-
-    if is_list(names) and
-         Enum.all?(names, fn name ->
-           is_binary(name) and String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
-         end) do
-      {:ok, names}
-    else
-      {:error, {:invalid_secret_command_environment_names, names}}
-    end
   end
 
   defp resolve_env_token(env_name) do
