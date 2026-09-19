@@ -31,10 +31,9 @@ the Codex child, so the agent does not need a second tracker login.
 local worker. The Pi backend is local-worker-only and runs its command through non-interactive
 `bash -lc`; on Windows, run Symphony and Pi inside the same WSL2 environment. On macOS, prefer a
 host-specific absolute Pi launcher when interactive shell PATH entries are not inherited. For Pi,
-Symphony exposes the selected adapter tools through a per-session loopback bridge. The bridge keeps
-the provider token in BEAM, gives the Pi extension only a short-lived capability, binds execution to
-the current issue context, and removes both tracker-secret and bridge-bootstrap environment values
-from agent-launched commands.
+Symphony uses Pi's native RPC/session lifecycle only: it does not inject tracker tools, a loopback
+bridge, or a host-side handoff into Pi. Configured tracker credential environment names are removed
+from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.

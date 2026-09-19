@@ -18,7 +18,17 @@ explicit, local-only opt-in backend.
 - Symphony alone owns polling, claims, workspaces, retries, reconciliation, status projection, and
   cleanup. Backends own process/session/protocol behavior only.
 
-## Retained Pi capability
+## Capability preservation matrix
+
+| Classification | JARVIS-910 result |
+| --- | --- |
+| `preserved` | Codex remains the default/rollback backend. Pi remains an explicit local opt-in with native RPC, one session across continuation turns, `agent_settled` completion, profile/model inheritance, isolation flags, credential-environment scrubbing, abort, typed failures, neutral runtime evidence, and bounded startup cleanup. |
+| `added` | No new production capability. The change adds this thin-baseline record and deterministic regression coverage that proves failed Pi initialization closes the child. |
+| `unchanged` | `AgentBackend` remains a closed `codex`/`pi` mapping; backend choice is fixed per attempt; Symphony keeps scheduler/tracker/workspace/retry/reconciliation/settlement/cleanup ownership; `mix.lock` and dependency versions are unchanged. |
+| `out-of-scope` | Pi absolute deadline/chatter/process-tree hardening and the three-worker acceptance belong to JARVIS-909; AntiGravity belongs to JARVIS-901/JARVIS-907; dependency advisories belong to JARVIS-911; DeepSeek remains an optional owner-facing feasibility path. |
+| `explicitly removed` | Pi tracker bridge/generated extension, Linear handoff, attempt/cancellation/interrupted receipts, command-based secret resolution, Bitwarden scripts, and their focused tests/docs/runtime fields. Pi itself is not removed. |
+
+### Retained Pi capability
 
 `SymphonyElixir.Pi.Rpc` is the strict JSONL transport for a local Pi process. It correlates
 responses, retains stderr separately, forwards native events, cancels unattended dialog UI
@@ -39,7 +49,7 @@ flags, so the operator's Pi profile supplies authentication and default model/th
 Credential-like variables and configured tracker credential environment names are removed from the
 child environment. Pi SSH workers fail closed because no remote Pi transport is implemented.
 
-## Explicitly removed from the thin baseline
+### Explicitly removed from the thin baseline
 
 JARVIS-910 removes the Pi tracker bridge and generated extension, Linear handoff automation,
 per-attempt and cancellation receipt stores/copies/recovery truth, command-based secret resolution,

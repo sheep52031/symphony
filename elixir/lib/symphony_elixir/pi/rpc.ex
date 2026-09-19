@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Pi.Rpc do
   @moduledoc """
-  Small Pi-native RPC transport used by the first feasibility spike.
+  Pi-native RPC transport for the local thin execution adapter.
 
   Pi RPC is a strict JSONL protocol on stdout. The client deliberately keeps stderr in a
   separate file and does not try to normalize Pi messages into the Codex protocol.
