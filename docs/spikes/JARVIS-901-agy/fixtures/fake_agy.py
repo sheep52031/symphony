@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Deterministic fake process for the JARVIS-901 probe; it never contacts a provider."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+CONVERSATION_ID = "fixture-conversation-001"
+USAGE = {
+    "input_tokens": 10,
+    "output_tokens": 2,
+    "thinking_tokens": 1,
+    "cache_read_tokens": 0,
+    "total_tokens": 13,
+}
+
+
+def emit(value: object, *, fragment: bool = False, crlf: bool = False) -> None:
+    data = json.dumps(value, separators=(",", ":")).encode() + (b"\r\n" if crlf else b"\n")
+    if fragment:
+        midpoint = len(data) // 2
+        sys.stdout.buffer.write(data[:midpoint])
+        sys.stdout.buffer.flush()
+        time.sleep(0.02)
+        sys.stdout.buffer.write(data[midpoint:])
+    else:
+        sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def init() -> dict[str, object]:
+    return {
+        "event": "init",
+        "conversation_id": CONVERSATION_ID,
+        "init": {"cwd": str(Path.cwd()), "permission_mode": "request-review"},
+    }
+
+
+def result(status: str, *, turns: int, response: str = "", error: str | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "conversation_id": CONVERSATION_ID,
+        "status": status,
+        "response": response,
+        "duration_seconds": 0.02,
+        "num_turns": turns,
+        "usage": USAGE,
+    }
+    if error is not None:
+        payload["error"] = error
+    return {"event": "result", "result": payload}
+
+
+def canceled(_signum: int, _frame: object) -> None:
+    emit(result("CANCELED", turns=1, error="fixture interrupted"))
+    raise SystemExit(130)
+
+
+def main(scenario: str) -> int:
+    if scenario == "partial-crlf":
+        emit(init(), fragment=True, crlf=True)
+        sys.stdout.buffer.write(b'{"event":\r\n')
+        sys.stdout.buffer.flush()
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": CONVERSATION_ID,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "hel",
+                },
+            },
+            fragment=True,
+        )
+        emit(result("SUCCESS", turns=1, response="hello"), crlf=True)
+        sys.stderr.buffer.write(b"fixture diagnostic\r\n")
+        sys.stderr.buffer.flush()
+        return 0
+
+    if scenario == "nonzero-error":
+        emit(init())
+        emit(result("ERROR", turns=1, error="fixture failure"))
+        sys.stderr.buffer.write(b"fixture error diagnostic\n")
+        sys.stderr.buffer.flush()
+        return 2
+
+    if scenario == "two-result-transcript":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="first"))
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": CONVERSATION_ID,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "second",
+                    "usage": USAGE,
+                },
+            }
+        )
+        emit(result("SUCCESS", turns=2, response="second"))
+        return 0
+
+    if scenario == "permission-waiting":
+        emit(init())
+        emit(result("WAITING", turns=1, error="permission requires input"))
+        sys.stderr.buffer.write(b"permission notice: request review\n")
+        sys.stderr.buffer.flush()
+        return 0
+
+    if scenario == "chatter":
+        emit(init())
+        while True:
+            sys.stdout.write("progress chatter\n")
+            sys.stdout.flush()
+            time.sleep(0.02)
+
+    if scenario == "first-token-stall":
+        emit(init())
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": CONVERSATION_ID,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "one token",
+                },
+            }
+        )
+        while True:
+            time.sleep(0.02)
+
+    if scenario == "cancel-race":
+        signal.signal(signal.SIGINT, canceled)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, canceled)
+        emit(init())
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": CONVERSATION_ID,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "started",
+                },
+            }
+        )
+        while True:
+            time.sleep(0.02)
+
+    if scenario == "result-then-hang":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="complete"))
+        while True:
+            time.sleep(0.02)
+
+    if scenario == "exited-parent-pipe-holder":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="parent exited"))
+        subprocess.Popen(
+            [sys.executable, __file__, "pipe-holder"],
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            close_fds=False,
+        )
+        return 0
+
+    if scenario == "pipe-holder":
+        while True:
+            time.sleep(0.02)
+
+    if scenario == "high-volume":
+        emit(init())
+        for index in range(24):
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": CONVERSATION_ID,
+                        "state": "ACTIVE",
+                        "step_type": "agent_response",
+                        "text_delta": str(index),
+                    },
+                }
+            )
+            sys.stdout.write("malformed chatter\n")
+            sys.stdout.flush()
+            sys.stderr.buffer.write(b"stderr chatter\n")
+        sys.stderr.buffer.flush()
+        emit(result("SUCCESS", turns=1, response="complete"))
+        return 0
+
+    if scenario == "oversized-output":
+        emit(init())
+        sys.stdout.buffer.write(b"x" * 4096 + b"\n")
+        sys.stderr.buffer.write(b"y" * 4096 + b"\n")
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.flush()
+        emit(result("SUCCESS", turns=1, response="after oversized frames"))
+        return 0
+
+    if scenario == "process-loss":
+        emit(init())
+        sys.stdout.flush()
+        os._exit(17)
+
+    if scenario == "cwd":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="cwd"))
+        return 0
+
+    raise SystemExit(f"unknown fixture scenario: {scenario}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1]))
