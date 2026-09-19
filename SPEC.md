@@ -445,10 +445,6 @@ Fields:
 
 Fields:
 
-- `backend` (string)
-  - Default: `codex`.
-  - Supported values in this fork: `codex` and `pi`.
-  - Selects only the execution backend for new attempts; an in-flight attempt keeps its selected backend.
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -464,45 +460,7 @@ Fields:
   - State keys are normalized (`trim + lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `pi` (object)
-
-Fields:
-
-- `command` (string shell command)
-  - Default: `pi --mode rpc`.
-  - The runtime launches this command via `bash -lc` in the issue workspace.
-  - The launched process MUST speak Pi's strict JSONL RPC protocol on stdout; stderr is diagnostics.
-  - The runtime MUST append Pi's supported `--session-dir`, `--no-extensions`, `--no-skills`,
-    `--no-themes`, `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls, set
-    `PI_CODING_AGENT_SESSION_DIR` to a workspace-owned `0700` directory, and remove ambient
-    credential-like environment names before launch. It MUST NOT override `PI_CODING_AGENT_DIR` or
-    append `--provider`, `--model`, or `--thinking`; the operator's Pi profile owns authentication,
-    default model, and default thinking level. A generated Symphony tracker extension MAY be loaded
-    through an explicit `--extension` argument; ambient extensions, packages, skills, themes,
-    prompt templates, and context files MUST NOT be used as a worker boundary.
-  - In this fork's first slice, Pi is local-only. Configured SSH workers are rejected rather than
-    silently treated as supported.
-  - When the selected tracker advertises agent tools, the runtime MUST register them through a
-    generated Pi extension backed by a per-session listener bound only to loopback. The capability,
-    tool-spec snapshot, tracker-settings snapshot, and normalized issue context MUST be scoped to
-    that session; the Pi child MUST NOT receive the provider credential.
-  - Bootstrap capability values MAY enter the Pi process environment only for extension startup.
-    The extension MUST delete them before agent-authored shell commands can inherit them. Declared
-    tracker and secret-command auth environment names MUST be removed at process launch.
-  - A settled assistant message with `stopReason` `error` or `aborted` MUST fail the attempt and
-    persist failure evidence; command acceptance and `agent_settled` alone do not prove success.
-  - A final state handoff MAY be staged during a turn, but MUST NOT execute until the targeted Pi
-    `agent_settled` event has arrived and the completion receipt is durable. `agent_end` with
-    `willRetry: false` is not authoritative completion evidence. The handoff result MUST
-    have its own durable receipt. Direct provider calls that observably bypass this ordering SHOULD
-    be rejected. A host-owned handoff MUST bind the current issue internally and SHOULD accept only
-    a target state name, resolve it within the bound provider scope, and construct the mutation
-    host-side rather than trusting an agent-supplied issue ID, state ID, or mutation document.
-  - If reconciliation cancels an in-flight Pi worker before normal completion evidence exists, the
-    runtime MUST persist an interrupted attempt receipt from available session/PID/model/usage/text
-    and stderr evidence before process teardown, and link it from the cancellation receipt.
-
-#### 5.3.7 `codex` (object)
+#### 5.3.6 `codex` (object)
 
 Fields:
 
@@ -583,11 +541,7 @@ Configuration is resolved in this order:
 3. Apply built-in defaults for missing OPTIONAL fields.
 4. Resolve `$VAR_NAME` indirection for config values that explicitly contain `$VAR_NAME`, plus any
    adapter-owned fallback environment names documented for omitted provider fields.
-5. Resolve any adapter-owned host secret command configured as an argv list. Execute it directly
-   without shell parsing, require exactly one non-empty output line, do not include output in error
-   values/logs, and fail startup or retain the last known good config on command failure. A provider
-   MUST declare helper-auth environment names so they can be removed from coding-agent children.
-6. Coerce and validate typed values.
+5. Coerce and validate typed values.
 
 Environment variables do not globally override YAML values. They are used only when a config value
 explicitly references them, or when an adapter profile documents a host-side fallback for an
@@ -646,8 +600,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty when `agent.backend` is `codex`.
-- `pi.command` is present and non-empty when `agent.backend` is `pi`.
+- `codex.command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -656,9 +609,7 @@ Extension fields are documented in the extension section that defines them. Core
 not require recognizing or validating extension fields unless that extension is implemented.
 
 - `tracker.kind`: string, REQUIRED, selects one supported adapter
-- `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings; the Linear
-  profile in this fork accepts `api_key_command` as a non-shell argv list and
-  `api_key_command_secret_environment_names` as helper-auth names to remove from children
+- `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings
 - `tracker.required_labels`: list of strings, default `[]`
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
@@ -669,12 +620,10 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
-- `agent.backend`: string, default `codex`, supported values `codex` and `pi`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `pi.command`: shell command string, default `pi --mode rpc`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -1156,22 +1105,11 @@ Optional provider-native agent tool extension:
   The adapter MAY use `issue.id` and `issue.native_ref` to preserve provider-specific richness
   without teaching the orchestrator provider semantics.
 - Tracker credentials SHOULD NOT be inherited by the coding-agent child process. An adapter that
-  resolves credentials from environment variables or a host secret command MUST declare
-  authentication-related environment names for removal from local and remote child environments.
-  Implementations SHOULD consult current provider and client documentation when identifying
-  credential names and aliases, as these can change over time. Literal credentials in a repo-owned
-  `WORKFLOW.md` remain readable to a child with workspace access and SHOULD NOT be used when this
-  isolation matters.
-- A backend without native dynamic-tool transport MAY use a scoped loopback capability bridge when
-  it preserves the same host-side execution boundary. Such a bridge MUST bind only to loopback,
-  authenticate every request with an unguessable per-session capability, enforce body/field limits,
-  advertise only the bound adapter's tool specs, reject issue rebinding, and stop with the session.
-- If a tool stages an external handoff that can make reconciliation cancel the active turn, the
-  runtime MUST first settle the turn and durably record completion evidence, then resolve and
-  execute the host-owned provider mutation, and finally record a separate handoff outcome. Repeated
-  commit attempts MUST NOT repeat a successful provider mutation. The handoff target MUST be checked
-  against the session snapshot's active/terminal states, and the provider response MUST confirm the
-  bound issue reached the exact requested state.
+  resolves credentials from environment variables MUST declare authentication-related environment
+  names for removal from local and remote child environments. Implementations SHOULD consult current
+  provider and client documentation when identifying credential names and aliases, as these can
+  change over time. Literal credentials in a repo-owned `WORKFLOW.md` remain readable to a child
+  with workspace access and SHOULD NOT be used when this isolation matters.
 - Unsupported tool names MUST return a structured failure result using the targeted protocol and
   continue the session.
 - Each adapter that ships tools MUST document:

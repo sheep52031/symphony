@@ -27,15 +27,6 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
-`agent.backend` defaults to `codex`. Set it to `pi` only when PiAgent is installed on the same
-local worker. The Pi backend is local-worker-only and runs its command through non-interactive
-`bash -lc`; on Windows, run Symphony and Pi inside the same WSL2 environment. On macOS, prefer a
-host-specific absolute Pi launcher when interactive shell PATH entries are not inherited. For Pi,
-Symphony exposes the selected adapter tools through a per-session loopback bridge. The bridge keeps
-the provider token in BEAM, gives the Pi extension only a short-lived capability, binds execution to
-the current issue context, and removes both tracker-secret and bridge-bootstrap environment values
-from agent-launched commands.
-
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -144,11 +135,8 @@ hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
 agent:
-  backend: codex
   max_concurrent_agents: 10
   max_turns: 20
-pi:
-  command: pi --mode rpc
 codex:
   command: codex app-server
 ---
@@ -161,16 +149,6 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
-- `pi.command` defaults to `pi --mode rpc`. The command must resolve from non-interactive
-  `bash -lc`. Symphony does not pass `--provider`, `--model`, or `--thinking`: Pi inherits the
-  operator's active `PI_CODING_AGENT_DIR` (or Pi's normal user profile) and therefore uses the same
-  saved default model as an operator-opened Pi terminal. Symphony records the effective model and
-  thinking level returned by `get_state`, and keeps only the worker session in a workspace-owned
-  `0700` `.symphony/pi-session` directory. Global extensions, skills, themes, prompt templates, and
-  context files are disabled; only Symphony's generated tracker extension is explicitly loaded.
-  The selected Pi profile contains Pi's own authentication; use a dedicated WSL2 user/profile and
-  do not store unrelated controller secrets in it.
-- Pi SSH workers are rejected in this first slice rather than being silently treated as supported.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -191,21 +169,6 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` is an explicit,
-  local-only opt-in in this fork; Pi workers configured with SSH hosts are rejected until a native
-  remote Pi transport is added.
-- Pi tracker calls go to a capability-protected listener bound only to `127.0.0.1`. Provider tool
-  specs and tracker settings are snapshotted per session; the raw provider token is never placed in
-  the Pi child environment. Completion and handoff wait for Pi's authoritative `agent_settled`
-  event; `agent_end` with `willRetry: false` is not treated as final evidence.
-- With the Linear adapter, Pi also receives `symphony_handoff`. Use it for the final transition to a non-active,
-  non-terminal state such as `Human Review`. The agent supplies only the target state name;
-  Symphony resolves that name inside the bound Linear issue's team and constructs the mutation
-  host-side. Symphony waits for `agent_settled`, captures final text/stats, persists the completion
-  receipt, and only then applies the transition. Detectable direct Linear `issueUpdate` state
-  mutations are rejected.
-  If external reconciliation still interrupts a worker, Symphony writes a partial attempt receipt
-  with the last available assistant text, usage, model, PID, session, and stderr before teardown.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
@@ -216,15 +179,9 @@ Notes:
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
   when value is `$LINEAR_API_KEY`. The legacy flat `tracker.api_key` alias behaves the same way.
-- `tracker.provider.api_key_command` may instead be an argv list. Symphony executes it directly
-  without a shell when loading the workflow, requires one non-empty output line, and keeps that
-  value host-side. A configured command takes precedence over `api_key` and `LINEAR_API_KEY`.
-  List helper-auth environment names in
-  `tracker.provider.api_key_command_secret_environment_names`; Symphony removes them from both
-  Codex and Pi children together with the tracker token aliases.
-- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if an agent can read that
-  workspace. Use `$VAR` or `api_key_command` so Symphony can keep the token out of the child
-  environment.
+- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if Codex can read that
+  workspace. Use `$VAR`/host-side secret references so Symphony can keep the token out of the
+  child environment.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -242,41 +199,6 @@ hooks:
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
 ```
-
-For a Windows-hosted Bitwarden CLI and a WSL2 Symphony runtime, the included helper reads one
-custom field and prints only its value. Keep the item identifier and field name in trusted workflow
-configuration, not the secret itself:
-
-```yaml
-tracker:
-  kind: linear
-  provider:
-    project_slug: your-project-slug
-    api_key_command:
-      - /bin/bash
-      - /mnt/d/Developer/Projects/symphony/elixir/scripts/resolve-bitwarden-field-wsl.sh
-      - -Item
-      - your-bitwarden-item-id
-      - -Field
-      - LINEAR_API_KEY
-      - -BitwardenCli
-      - D:\Developer\Tools\node-v22.23.2-win-x64\bw.cmd
-    api_key_command_secret_environment_names: [BW_SESSION, BW_PASSWORD]
-```
-
-The WSL wrapper is required because launching a Windows npm shim or `powershell.exe` directly from
-an Erlang port does not reliably preserve argv on this host. The PowerShell helper never prompts:
-it uses a process-scoped `BW_SESSION`, or runs `bw unlock --passwordenv BW_PASSWORD --raw` when a
-process-scoped password is deliberately provisioned. A locked/logged-out vault therefore fails
-startup instead of falling back to ambient user secrets. The helper also refuses to run while
-`LINEAR_API_KEY` exists in Windows User or Machine scope, because a same-user Pi shell could query
-that store even when the key is absent from the Pi process environment. For WSL-to-Windows
-environment propagation, include the selected auth names in `WSLENV` (for example,
-`BW_SESSION:BW_PASSWORD`); do not store `LINEAR_API_KEY`, `BW_SESSION`, or `BW_PASSWORD` in Windows
-User-scope environment variables.
-This removes direct child inheritance, but it is not an OS sandbox: run untrusted agents under a
-separate OS account/container if they must be unable to inspect same-user host processes or invoke
-host credential tools.
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
@@ -307,12 +229,8 @@ host credential tools.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
   object with nonblank `query` and optional object `variables`. Symphony executes it host-side
   with the session-bound endpoint/token and strips declared token environment variables from the
-  coding-agent child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
+  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
   whatever the configured Linear token can access.
-- Pi handoff: `symphony_handoff` accepts only `target_state`. Symphony queries the bound issue's
-  team states, resolves exactly one case-insensitive name match, constructs `issueUpdate` with the
-  bound issue ID and resolved state ID, and requires Linear's response to confirm the exact state.
-  The mutation is not sent until Pi completion evidence is durable.
 - Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
   rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
   failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,

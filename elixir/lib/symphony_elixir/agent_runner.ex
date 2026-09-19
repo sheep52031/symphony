@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single tracker work item in its workspace with the configured execution backend.
+  Executes a single tracker work item in its workspace with the configured backend.
   """
 
   require Logger
@@ -37,26 +37,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with {:ok, backend} <- resolve_backend(),
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          run_agent_turns(backend, workspace, issue, codex_update_recipient, opts, worker_host)
         end
-
-      {:error, reason} ->
-        {:error, reason}
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
     end
   end
 
-  defp agent_message_handler(recipient, issue, backend_name) do
+  defp codex_message_handler(recipient, issue) do
     fn message ->
-      send_codex_update(recipient, issue, Map.put_new(message, :backend, backend_name))
+      send_codex_update(recipient, issue, message)
     end
   end
 
@@ -84,25 +81,23 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_agent_turns(backend, workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, backend_name, backend} <- resolve_backend(opts),
-         {:ok, session} <- backend.start_session(workspace, worker_host: worker_host, issue: issue) do
+    with {:ok, session} <- backend.start_session(workspace, worker_host: worker_host) do
       try do
         do_run_agent_turns(
           %{
             backend: backend,
-            backend_name: backend_name,
             app_session: session,
             workspace: workspace,
-            issue: issue,
-            recipient: codex_update_recipient,
+            codex_update_recipient: codex_update_recipient,
             opts: opts,
             issue_state_fetcher: issue_state_fetcher,
             max_turns: max_turns
           },
+          issue,
           1
         )
       after
@@ -114,15 +109,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_agent_turns(
          %{
            backend: backend,
-           backend_name: backend_name,
            app_session: app_session,
            workspace: workspace,
-           issue: issue,
-           recipient: codex_update_recipient,
+           codex_update_recipient: codex_update_recipient,
            opts: opts,
            issue_state_fetcher: issue_state_fetcher,
            max_turns: max_turns
          } = context,
+         issue,
          turn_number
        ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
@@ -132,9 +126,7 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
-             on_message: agent_message_handler(codex_update_recipient, issue, backend_name),
-             attempt: Keyword.get(opts, :attempt),
-             turn_number: turn_number
+             on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -142,10 +134,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_agent_turns(
-            %{context | issue: refreshed_issue},
-            turn_number + 1
-          )
+          do_run_agent_turns(context, refreshed_issue, turn_number + 1)
 
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
@@ -161,9 +150,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp resolve_backend(opts) do
-    backend_name = Keyword.get(opts, :backend, Config.settings!().agent.backend)
-    AgentBackend.resolve(backend_name)
+  defp resolve_backend do
+    AgentBackend.resolve(Config.settings!().agent.backend)
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
@@ -172,7 +160,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous agent turn completed normally, but the tracker work item is still in an active state.
+    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
