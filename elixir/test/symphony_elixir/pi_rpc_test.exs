@@ -292,7 +292,7 @@ defmodule SymphonyElixir.Pi.RpcTest do
         Process.sleep(:infinity)
       end)
 
-    assert_receive {:rpc_session, session}, 1_000
+    assert_receive {:rpc_session, session}, 3_000
     child_pid = eventually_read_pid!(child_pid_path)
     assert process_alive?(session.os_pid)
     assert process_alive?(child_pid)

@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Pi.Rpc do
   @default_timeout_ms 5_000
   @graceful_close_ms 250
   @forced_close_ms 250
+  @process_group_detection_attempts 400
   @dialog_ui_methods ["select", "confirm", "input", "editor"]
   @fire_and_forget_ui_methods ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]
 
@@ -369,7 +370,9 @@ defmodule SymphonyElixir.Pi.Rpc do
     ArgumentError -> {:error, :port_closed}
   end
 
-  defp read_process_group_id(path), do: read_process_group_id(path, 20)
+  defp read_process_group_id(path),
+    do: read_process_group_id(path, @process_group_detection_attempts)
+
   defp read_process_group_id(_path, 0), do: nil
 
   defp read_process_group_id(path, attempts) do
