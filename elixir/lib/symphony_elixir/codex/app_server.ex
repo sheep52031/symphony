@@ -27,6 +27,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           dynamic_tool_binding: map()
         }
 
+  @impl true
+  @spec validate_config(SymphonyElixir.Config.Schema.t()) :: :ok
+  def validate_config(_settings), do: :ok
+
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do

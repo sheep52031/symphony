@@ -27,6 +27,18 @@ defmodule SymphonyElixir.Pi.Backend do
         }
 
   @impl true
+  @spec validate_config(SymphonyElixir.Config.Schema.t()) :: :ok | {:error, term()}
+  def validate_config(%{worker: %{ssh_hosts: hosts}}) when is_list(hosts) do
+    if Enum.any?(hosts, &(is_binary(&1) and String.trim(&1) != "")) do
+      {:error, {:unsupported_backend_worker_hosts, :pi}}
+    else
+      :ok
+    end
+  end
+
+  def validate_config(_settings), do: :ok
+
+  @impl true
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) when is_binary(workspace) do
     case Keyword.get(opts, :worker_host) do
@@ -50,7 +62,7 @@ defmodule SymphonyElixir.Pi.Backend do
   end
 
   defp initialize_session(rpc, config) do
-    case Rpc.request(rpc, "get_state", %{}, timeout_ms: config.codex.read_timeout_ms) do
+    case Rpc.request(rpc, "get_state", %{}, timeout_ms: timeout_ms(config, :request)) do
       {:ok, response} ->
         case session_id_from_state(response) do
           session_id when is_binary(session_id) ->
@@ -73,7 +85,7 @@ defmodule SymphonyElixir.Pi.Backend do
       when is_binary(prompt) and is_map(issue) do
     config = Config.settings!()
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
-    timeout_ms = Keyword.get(opts, :timeout_ms, config.codex.turn_timeout_ms)
+    turn_timeout_ms = Keyword.get(opts, :timeout_ms, timeout_ms(config, :turn))
     session_name = "#{issue.identifier}: #{issue.title}"
     proof = session_proof(rpc, session_id, session_state, session_name)
 
@@ -82,7 +94,13 @@ defmodule SymphonyElixir.Pi.Backend do
       on_event: fn event -> emit_event(on_message, event) end,
       on_message: on_message,
       proof: proof,
-      rpc: rpc
+      rpc: rpc,
+      timeouts: %{
+        first_event: timeout_ms(config, :first_event),
+        post_result: timeout_ms(config, :post_result),
+        request: timeout_ms(config, :request),
+        turn: turn_timeout_ms
+      }
     }
 
     on_message.(
@@ -99,15 +117,15 @@ defmodule SymphonyElixir.Pi.Backend do
     )
 
     case Rpc.request(rpc, "set_session_name", %{"name" => session_name},
-           timeout_ms: config.codex.read_timeout_ms,
+           timeout_ms: context.timeouts.request,
            on_event: context.on_event
          ) do
-      {:ok, _} -> run_prompt_turn(context, prompt, timeout_ms)
+      {:ok, _} -> run_prompt_turn(context, prompt)
       {:error, reason} -> fail_turn(context, reason, :set_session_name_failed)
     end
   end
 
-  defp run_prompt_turn(context, prompt, timeout_ms) do
+  defp run_prompt_turn(context, prompt) do
     failure_key = {__MODULE__, :turn_failure, make_ref()}
 
     on_event = fn event ->
@@ -123,7 +141,8 @@ defmodule SymphonyElixir.Pi.Backend do
     try do
       context.rpc
       |> Rpc.request("prompt", %{"message" => prompt},
-        timeout_ms: timeout_ms,
+        timeout_ms: context.timeouts.turn,
+        first_event_timeout_ms: context.timeouts.first_event,
         on_event: on_event,
         until: &settled_event?/1
       )
@@ -140,20 +159,22 @@ defmodule SymphonyElixir.Pi.Backend do
     end
   end
 
-  defp handle_prompt_result({:error, :timeout}, context, _failure_key), do: abort_after_timeout(context)
-  defp handle_prompt_result({:error, reason}, context, _failure_key), do: fail_turn(context, reason, :prompt_failed)
+  defp handle_prompt_result({:error, {:timeout, :first_event}}, context, _failure_key),
+    do: abort_after_timeout(context, :first_event)
+
+  defp handle_prompt_result({:error, :timeout}, context, _failure_key),
+    do: abort_after_timeout(context, :absolute_turn_deadline)
+
+  defp handle_prompt_result({:error, reason}, context, _failure_key),
+    do: fail_turn(context, reason, :prompt_failed)
 
   defp complete_turn(context, prompt_response) do
+    deadline_ms = monotonic_ms() + context.timeouts.post_result
+
     with {:ok, assistant_response} <-
-           Rpc.request(context.rpc, "get_last_assistant_text", %{},
-             timeout_ms: context.config.codex.read_timeout_ms,
-             on_event: context.on_event
-           ),
+           completion_request(context, "get_last_assistant_text", :assistant_text, deadline_ms),
          {:ok, stats_response} <-
-           Rpc.request(context.rpc, "get_session_stats", %{},
-             timeout_ms: context.config.codex.read_timeout_ms,
-             on_event: context.on_event
-           ) do
+           completion_request(context, "get_session_stats", :session_stats, deadline_ms) do
       turn = %{
         result: assistant_response,
         session_id: context.proof.session_id,
@@ -183,14 +204,29 @@ defmodule SymphonyElixir.Pi.Backend do
 
       {:ok, turn}
     else
-      {:error, reason} -> fail_turn(context, reason, :completion_read_failed)
+      {:error, {:post_result_timeout, _phase} = reason} ->
+        fail_turn(context, reason, :post_result_timeout)
+
+      {:error, reason} ->
+        fail_turn(context, reason, :completion_read_failed)
     end
   end
 
-  defp abort_after_timeout(context) do
+  defp completion_request(context, type, phase, deadline_ms) do
+    case Rpc.request(context.rpc, type, %{},
+           timeout_ms: context.timeouts.post_result,
+           deadline_ms: deadline_ms,
+           on_event: context.on_event
+         ) do
+      {:error, :timeout} -> {:error, {:post_result_timeout, phase}}
+      result -> result
+    end
+  end
+
+  defp abort_after_timeout(context, timeout_stage) do
     outcome =
       case Rpc.request(context.rpc, "abort", %{},
-             timeout_ms: context.config.codex.read_timeout_ms,
+             timeout_ms: context.timeouts.request,
              on_event: context.on_event
            ) do
         {:ok, _response} -> :acknowledged
@@ -199,8 +235,8 @@ defmodule SymphonyElixir.Pi.Backend do
 
     reason =
       case outcome do
-        :acknowledged -> {:turn_timeout, :abort_acknowledged}
-        {:failed, abort_reason} -> {:turn_timeout, {:abort_failed, abort_reason}}
+        :acknowledged -> {:turn_timeout, {timeout_stage, :abort_acknowledged}}
+        {:failed, abort_reason} -> {:turn_timeout, {timeout_stage, {:abort_failed, abort_reason}}}
       end
 
     context.on_message.(
@@ -291,6 +327,20 @@ defmodule SymphonyElixir.Pi.Backend do
   end
 
   defp tracker_secret_port_env(_config), do: []
+
+  defp timeout_ms(config, :request),
+    do: config.pi.request_timeout_ms || config.codex.read_timeout_ms
+
+  defp timeout_ms(config, :first_event),
+    do: config.pi.first_event_timeout_ms || timeout_ms(config, :request)
+
+  defp timeout_ms(config, :turn),
+    do: config.pi.turn_timeout_ms || config.codex.turn_timeout_ms
+
+  defp timeout_ms(config, :post_result),
+    do: config.pi.post_result_timeout_ms || timeout_ms(config, :request)
+
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   defp session_id_from_state(%{"data" => %{"sessionId" => session_id}}) when is_binary(session_id), do: session_id
   defp session_id_from_state(_response), do: nil
