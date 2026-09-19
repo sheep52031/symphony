@@ -91,11 +91,6 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
-- When the `symphony_handoff` tool is available, use it for the final transition to `Human Review`
-  (or another non-active handoff state) instead of sending a direct provider state mutation. Supply
-  only the target state after implementation, tests, push, and PR evidence are complete; Symphony
-  resolves and constructs the provider mutation host-side. Then finish the response so Symphony
-  can persist completion evidence before it applies the transition.
 - When meaningful out-of-scope improvements are discovered during execution,
   file a separate Linear issue instead of expanding scope. The follow-up issue
   must include a clear title, description, and acceptance criteria, be placed in
@@ -245,10 +240,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
 12. Only then hand the issue to `Human Review`.
-    - When `symphony_handoff` is available, stage the target state with it; do not directly mutate
-      tracker state or supply provider mutation arguments. Symphony resolves the target host-side,
-      and the transition executes only after the completion receipt is durable.
-    - Otherwise use the tracker tool's normal provider-native transition.
+    - Use the tracker tool's normal provider-native transition.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape
       hatch, use the same handoff path with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
