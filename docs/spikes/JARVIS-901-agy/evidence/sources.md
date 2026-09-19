@@ -1,0 +1,12 @@
+# Immutable source pins
+
+| Subject | Committed capture | Source |
+| --- | --- | --- |
+| JARVIS-908 parity contract | [`jarvis-908-antigravity-parity.md`](jarvis-908-antigravity-parity.md), SHA-256 `e479143aa701baad4ceb446fbad7ab36373f663b8b88938805010bd21c95949b` | [commit `94baec2`](https://github.com/sheep52031/symphony-engine-docs/commit/94baec212ba6e31821d1059fdd4565b9e3184f22), [source file](https://github.com/sheep52031/symphony-engine-docs/blob/94baec212ba6e31821d1059fdd4565b9e3184f22/docs/overlays/sheep52031-symphony/safe-change/antigravity-parity.md), [PR #1](https://github.com/sheep52031/symphony-engine-docs/pull/1) |
+| Official Symphony authority | — | <https://github.com/openai/symphony/tree/be10a1b79df723d6d7612b5651c8522704dafb2e> |
+| Measured fork baseline | — | <https://github.com/sheep52031/symphony/tree/da5fcf7b1d083b723ec08cae942563fc16b783d3> |
+| Official AntiGravity headless reference | [`official-headless-reference-full.md`](official-headless-reference-full.md), SHA-256 `836ee2dcb9078f214f68859cc862c1d7faaa1225df7a068178d30dc4e8a5807a` | <https://www.antigravity.google/docs/cli/headless/> |
+
+The committed captures make the exact reviewed content available even when a repository is
+private or a live documentation URL later changes. The local static capture omits executable
+paths, settings, credentials, and authentication material.
