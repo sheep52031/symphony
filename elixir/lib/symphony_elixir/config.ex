@@ -69,6 +69,9 @@ defmodule SymphonyElixir.Config do
   @spec hold_after_normal_completion?() :: boolean()
   def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
 
+  @spec max_attempts_per_issue() :: pos_integer() | nil
+  def max_attempts_per_issue, do: settings!().agent.max_attempts_per_issue
+
   @spec agent_stall_timeout_ms() :: non_neg_integer()
   def agent_stall_timeout_ms do
     config = settings!()

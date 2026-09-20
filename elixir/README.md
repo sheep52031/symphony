@@ -146,9 +146,10 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
-  # Optional canary controls; omit both to preserve current scheduler behavior.
+  # Optional canary controls; omit all three to preserve current scheduler behavior.
   allowed_issue_identifiers: ["JARVIS-917"]
   hold_after_normal_completion: true
+  max_attempts_per_issue: 1
   stall_timeout_ms: 300000
 pi:
   command: pi --mode rpc
@@ -219,16 +220,27 @@ Notes:
 - `agent.allowed_issue_identifiers` is an optional exact, case-sensitive issue-identifier allowlist.
   When omitted, all otherwise eligible issues remain eligible exactly as before. When present it must
   be a nonempty, unique list with no blank or whitespace-padded values; invalid configuration is
-  rejected. The scheduler checks it at candidate selection, dispatch refresh, retry/slot reacquisition,
-  and in-run continuation; AgentRunner also checks before starting a backend process.
+  rejected. Explicit `null` is rejected: omit the key to use the compatible default. The scheduler
+  checks it at candidate selection, dispatch refresh, retry/slot reacquisition, continuation, and
+  running reconciliation; revocation stops the live task through the existing bounded termination path.
 - `agent.hold_after_normal_completion` defaults to `false`. When `true`, a normal AgentRunner exit
-  keeps an active issue claimed and visible in the existing blocked status payload with a hold reason
-  instead of scheduling the one-second continuation retry. Failures and stalls still follow their
-  existing retry behavior; input-required exits remain blocked; routing/label revocation, non-active
-  states (including Human Review), cancellation, and terminal states release the claim. Terminal
-  states retain their existing workspace cleanup. Holds are in-memory: restarting Symphony clears
-  them, so an otherwise active allowed issue may dispatch again after restart. Roll back by removing
-  both settings (or setting `hold_after_normal_completion: false`).
+  keeps an active issue claimed as a `normal_completion_hold` instead of scheduling the one-second
+  continuation retry. Explicit `null` is rejected. Input-required work remains `input_required`;
+  holds are reported as `held` with a typed disposition and reason in the API/dashboard, not as errors.
+- `agent.max_attempts_per_issue` is an optional positive total AgentRunner/session budget per claimed
+  issue; omit it for unlimited compatible behavior. An attempt is reserved immediately before Symphony
+  starts an AgentRunner, including a failed start, so the counter is conservative. Before initial
+  dispatch and every continuation, failure, stall, retry-poll, refresh, and no-slot retry path,
+  exhausted work becomes an `attempt_limit_hold` and no further backend attempt is started. Set `1`
+  for at most one AgentRunner/backend session in one runtime. Explicit `null` and non-positive values
+  are rejected.
+- Failures and stalls continue to retry while budget remains; routing/label revocation, non-active
+  states, and cancellation release claims. Human Review is non-terminal unless a workflow explicitly
+  includes it in `tracker.terminal_states`; when explicitly terminal, its held workspace is cleaned up.
+  Reducing neither setting releases holds; removing the normal-completion hold or removing/increasing
+  the attempt budget releases only the affected holds. Holds and counters are in-memory: a fresh runtime
+  resets both and requires fresh owner authorization before reuse. Roll back by removing the controls
+  (or setting `hold_after_normal_completion: false`); no durable store is created.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -268,10 +280,10 @@ codex:
 
 | Category | Behavior |
 | --- | --- |
-| Preserved | Unset controls retain the existing Codex-default, Pi-supported scheduler and normal one-second continuation retry. |
-| Added | Exact opt-in admission and scheduler-owned normal-completion hold, both provider-neutral. |
-| Unchanged | Failure/stall retry, input-required blocking, routing/label reconciliation, cancellation, and terminal workspace cleanup. |
-| Out of scope | Tracker bridges, callback daemons, new schedulers, receipt stores, credential/quota changes, dependency upgrades, and remote Pi. |
+| Preserved | Omitted controls retain the Codex-default, Pi-supported scheduler and normal continuation retry. |
+| Added | Exact admission, typed held dispositions, and opt-in per-issue AgentRunner/session budget. |
+| Unchanged | Failure/stall retry below budget, input-required blocking, routing/state cleanup, and default Human Review behavior. |
+| Out of scope | Tracker bridges, daemons, durable stores, new schedulers, credentials, quotas, dependency upgrades, and remote Pi. |
 | Explicitly removed | None; no backend or existing scheduling path was removed. |
 
 ### Linear adapter profile

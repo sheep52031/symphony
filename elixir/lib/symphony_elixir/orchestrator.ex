@@ -40,6 +40,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -213,7 +214,14 @@ defmodule SymphonyElixir.Orchestrator do
 
       Config.hold_after_normal_completion?() ->
         Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; holding active issue after normal completion")
-        block_issue_from_entry(state, issue_id, running_entry, "normal completion held by agent.hold_after_normal_completion")
+
+        block_issue_from_entry(
+          state,
+          issue_id,
+          running_entry,
+          "normal completion held by agent.hold_after_normal_completion",
+          :normal_completion_hold
+        )
 
       true ->
         Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
@@ -393,6 +401,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec schedule_retry_for_test(term(), String.t(), map()) :: term()
+  def schedule_retry_for_test(%State{} = state, issue_id, metadata)
+      when is_binary(issue_id) and is_map(metadata) do
+    schedule_issue_retry(state, issue_id, 1, metadata)
+  end
+
+  @doc false
+  @spec reserve_issue_attempt_for_test(Issue.t(), term()) :: {:ok | :exhausted, term()}
+  def reserve_issue_attempt_for_test(%Issue{} = issue, %State{} = state) do
+    case reserve_issue_attempt(state, issue) do
+      {:ok, state} -> {:ok, state}
+      {:exhausted, state} -> {:exhausted, state}
+    end
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -440,6 +464,11 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false, "routing_revoked")
+
+      !issue_identifier_allowed?(issue.identifier) ->
+        Logger.info("Issue identifier is no longer allowed: #{issue_context(issue)}; stopping active agent")
+
+        terminate_running_issue(state, issue.id, false, "identifier_revoked")
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -570,7 +599,7 @@ defmodule SymphonyElixir.Orchestrator do
          %State{} = state,
          issue_id,
          cleanup_workspace,
-         _cancellation_reason
+         cancellation_reason
        ) do
     case Map.get(state.running, issue_id) do
       nil ->
@@ -589,7 +618,12 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            attempts:
+              if(cancellation_reason == "stall_timeout",
+                do: state.attempts,
+                else: Map.delete(state.attempts, issue_id)
+              )
         }
 
       _ ->
@@ -775,7 +809,13 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+  defp block_issue_from_entry(
+         %State{} = state,
+         issue_id,
+         running_entry,
+         reason,
+         disposition \\ :input_required
+       ) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
@@ -784,7 +824,9 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       backend: Map.get(running_entry, :backend),
-      error: error,
+      disposition: disposition,
+      reason: reason,
+      error: if(disposition == :input_required, do: reason),
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
@@ -795,6 +837,35 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id),
+        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
+  defp block_issue_from_retry(%State{} = state, issue_id, metadata, :attempt_limit_hold) do
+    count = issue_attempt_count(state, issue_id)
+    limit = Config.max_attempts_per_issue()
+
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(metadata, :identifier, issue_id),
+      issue: Map.get(metadata, :issue),
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      backend: Map.get(metadata, :backend),
+      disposition: :attempt_limit_hold,
+      reason: "attempt limit reached (#{count}/#{limit})",
+      error: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
@@ -985,6 +1056,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case reserve_issue_attempt(state, issue) do
+      {:ok, state} ->
+        spawn_reserved_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+
+      {:exhausted, state} ->
+        block_issue_from_retry(state, issue.id, %{issue: issue, identifier: issue.identifier}, :attempt_limit_hold)
+    end
+  end
+
+  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     backend_name = Config.settings!().agent.backend
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
@@ -1069,6 +1150,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp reserve_issue_attempt(%State{} = state, %Issue{id: issue_id}) when is_binary(issue_id) do
+    if attempt_budget_exhausted?(state, issue_id) do
+      {:exhausted, state}
+    else
+      {:ok, %{state | attempts: Map.update(state.attempts, issue_id, 1, &(&1 + 1))}}
+    end
+  end
+
+  defp attempt_budget_exhausted?(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Config.max_attempts_per_issue() do
+      limit when is_integer(limit) -> issue_attempt_count(state, issue_id) >= limit
+      nil -> false
+    end
+  end
+
+  defp issue_attempt_count(%State{} = state, issue_id) do
+    Map.get(state.attempts, issue_id, 0)
+  end
+
   defp complete_issue(%State{} = state, issue_id) do
     %{
       state
@@ -1079,6 +1179,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    if attempt_budget_exhausted?(state, issue_id) do
+      block_issue_from_retry(state, issue_id, metadata, :attempt_limit_hold)
+    else
+      schedule_unlimited_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp schedule_unlimited_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -1277,7 +1385,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        attempts: Map.delete(state.attempts, issue_id)
     }
   end
 
@@ -1527,6 +1636,8 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
+          disposition: Map.get(metadata, :disposition, :input_required),
+          reason: Map.get(metadata, :reason),
           error: Map.get(metadata, :error),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
@@ -1742,12 +1853,36 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
 
-    %{
+    state = %{
       state
       | poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
+
+    release_config_revoked_holds(state)
   end
+
+  defp release_config_revoked_holds(%State{} = state) do
+    state.blocked
+    |> Enum.reduce(state, fn {issue_id, blocked_entry}, state_acc ->
+      if hold_released_by_config?(state_acc, issue_id, blocked_entry) do
+        Logger.info("Releasing hold after config change: issue_id=#{issue_id}")
+        release_issue_claim(state_acc, issue_id)
+      else
+        state_acc
+      end
+    end)
+  end
+
+  defp hold_released_by_config?(_state, _issue_id, %{disposition: :normal_completion_hold}) do
+    not Config.hold_after_normal_completion?()
+  end
+
+  defp hold_released_by_config?(state, issue_id, %{disposition: :attempt_limit_hold}) do
+    not attempt_budget_exhausted?(state, issue_id)
+  end
+
+  defp hold_released_by_config?(_state, _issue_id, _blocked_entry), do: false
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states)

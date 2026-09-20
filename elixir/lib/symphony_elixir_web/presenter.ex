@@ -16,7 +16,8 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: Enum.count(Map.get(snapshot, :blocked, []), &(not held_entry?(&1))),
+            held: Enum.count(Map.get(snapshot, :blocked, []), &held_entry?/1)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
@@ -83,7 +84,8 @@ defmodule SymphonyElixirWeb.Presenter do
         codex_session_logs: []
       },
       recent_events: recent_events_payload(running || blocked),
-      last_error: (blocked && blocked.error) || (retry && retry.error),
+      last_error: (blocked && Map.get(blocked, :error)) || (retry && retry.error),
+      hold_reason: blocked && Map.get(blocked, :reason),
       tracked: %{}
     }
   end
@@ -97,6 +99,11 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
+
+  defp issue_status(nil, nil, %{disposition: disposition})
+       when disposition in [:normal_completion_hold, :attempt_limit_hold],
+       do: "held"
+
   defp issue_status(nil, nil, _blocked), do: "blocked"
 
   defp running_entry_payload(entry) do
@@ -140,7 +147,9 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
-      error: entry.error,
+      disposition: Map.get(entry, :disposition, :input_required),
+      reason: Map.get(entry, :reason, Map.get(entry, :error)),
+      error: Map.get(entry, :error),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -180,17 +189,25 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp held_entry?(%{disposition: disposition})
+       when disposition in [:normal_completion_hold, :attempt_limit_hold],
+       do: true
+
+  defp held_entry?(_entry), do: false
+
   defp blocked_issue_payload(blocked) do
     %{
       worker_host: Map.get(blocked, :worker_host),
       workspace_path: Map.get(blocked, :workspace_path),
-      session_id: blocked.session_id,
-      state: blocked.state,
-      error: blocked.error,
-      blocked_at: iso8601(blocked.blocked_at),
-      last_event: blocked.last_codex_event,
-      last_message: summarize_message(blocked.last_codex_message),
-      last_event_at: iso8601(blocked.last_codex_timestamp)
+      session_id: Map.get(blocked, :session_id),
+      state: Map.get(blocked, :state),
+      disposition: Map.get(blocked, :disposition, :input_required),
+      reason: Map.get(blocked, :reason, Map.get(blocked, :error)),
+      error: Map.get(blocked, :error),
+      blocked_at: iso8601(Map.get(blocked, :blocked_at)),
+      last_event: Map.get(blocked, :last_codex_event),
+      last_message: summarize_message(Map.get(blocked, :last_codex_message)),
+      last_event_at: iso8601(Map.get(blocked, :last_codex_timestamp))
     }
   end
 
