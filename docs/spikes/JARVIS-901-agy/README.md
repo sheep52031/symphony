@@ -25,7 +25,68 @@ Windows build was exercised directly in disposable no-tool workspaces; the sanit
 | Deterministic fixture evidence | This artifact's bounded parser/lifecycle policy handles partial bytes, LF framing with CRLF tolerance, malformed stdout, separate stderr, nonzero exit, a scripted two-result transcript, `WAITING`, no-progress chatter, first-token/turn deadlines, post-result exit grace, interrupt race, process loss, cwd containment, and host mismatch. | Native behavior not listed in the authorized observation. The child is explicitly fake and never invokes `agy` or a provider. |
 
 No host-absolute path, exact shared/global permission rule, token, credential, account identifier,
-auth material, or settings-file content is committed.
+auth material, settings-file content, raw envelope, or live prompt is committed.
+
+## Reproducible Linux capture runner (offline by default)
+
+[`capture_runner.py`](capture_runner.py) is a checked-in native-Linux capture helper, not an
+adapter. Its default `fake` mode runs only `fixtures/fake_agy.py`; it does not discover, launch, or
+contact `agy`. Each bounded capture writes ignored local files for raw stdin/stdout/stderr envelope
+bytes (base64-wrapped JSONL with UTC capture timestamps), an exact-command/version raw manifest,
+and a redacted summary. The summary records sanitized argv and version, timestamps, root PID/process group, every escalation signal,
+process-group-empty outcome, return status, terminal statuses, hashed session identities, malformed
+and stderr counts, workspace sentinel result, and whether `init.cwd` was exposed.
+
+The runner starts a POSIX process group and closes stdin after the final accepted turn. If it does
+not exit within the configured grace, it sends bounded `SIGINT`, `SIGTERM`, then `SIGKILL`, recording
+the sequence and checking the owned group is gone. It removes known API-key/base-URL names from the
+child environment without reading their values. It does not inspect profile, keyring, settings, or
+credential stores. A raw capture may contain provider output or prompts, so it is accepted only
+outside the repository or below the root [`.agy-captures/`](../../../.gitignore) ignored subtree;
+raw files have no import command and must never be force-added.
+
+The generated `redacted-summary.json` deliberately excludes raw prompt/response text, absolute
+paths, and raw conversation IDs. Identities use a deterministic truncated SHA-256 label solely to
+check equality. Schema and redaction invariants reject owner paths and the fixture prompt strings;
+the deterministic tests also assert summary output has neither the temporary workspace path nor
+prompt text. The raw capture is bounded per stream (`1 MiB` default), and retained versus observed
+bytes are explicit in the summary.
+
+Run the offline capture only:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py --mode fake
+```
+
+### Future live command — requires fresh owner authorization
+
+**Do not execute this command under this task.** A future owner-authorized run must create a new
+ignored directory and owner-reviewed `prompts.ndjson` locally; prompt text is intentionally not
+specified or checked in. The explicit authorization value is a guardrail, not a credential and is
+required separately from `--mode live`:
+
+```bash
+run_dir="$(mktemp -d "$PWD/.agy-captures/live-XXXXXX")"
+chmod 700 "$run_dir"
+# Owner creates "$run_dir/prompts.ndjson" as LF-delimited {"event":"user",...} envelopes.
+PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py \
+  --mode live \
+  --live-authorization JARVIS-901-OWNER-AUTHORIZED \
+  --profile acc1 \
+  --prompts-file "$run_dir/prompts.ndjson" \
+  --capture-dir "$run_dir/capture" \
+  --workspace "$run_dir/workspace"
+```
+
+Live mode invokes only the supplied profile launcher with `--mode plan`, stream-json input/output,
+and a 60-second CLI print timeout; it never adds the dangerous permission-bypass flag. It performs
+only a static `agy --version` check before that invocation. Before manually importing any result,
+the owner must inspect the ignored files locally, retain only a reviewed redacted summary/report,
+and confirm that no prompt, raw envelope, path, auth material, or opaque identity was copied.
+A runner result alone does not close any native gate: the actual observed envelopes must meet the
+matrix below. Native `agy` does not document a machine-readable permission-request event, a
+process-tree listing, profile/keyring isolation signal, or proof that `--add-dir`/symlinks cannot
+escape; the runner labels only its own observable lifecycle and `init.cwd` fields.
 
 ## Native protocol characterization
 
@@ -71,10 +132,11 @@ lifecycle policy is inspectable:
 6. Stderr remains diagnostics. A terminal error or `WAITING` result is retained even when the process exits nonzero or emits a permission notice. Exit without a terminal envelope is distinct process loss.
 
 The fake-process scenarios exercise partial lines/CRLF/malformed JSON, stderr chatter,
-nonzero error, a **scripted two-result transcript parser check** (not stdin interaction or
-resume), permission/input waiting, chatter and stall deadlines, post-result hang, cancellation
-race, process loss, high-volume bounded evidence, oversized-frame resynchronization, workspace
-cwd, and cross-host rejection.
+nonzero error, an actual stdin-driven two-turn same-session identity check, a scripted two-result
+transcript parser check, permission/input waiting, chatter and stall deadlines, post-result hang,
+cancellation race, bounded `SIGINT`/`SIGTERM`/`SIGKILL` escalation, inherited-pipe process-tree
+cleanup, process loss, high-volume bounded evidence, oversized-frame resynchronization, workspace
+cwd, and cross-host rejection. These are fixture properties, not claims about the native CLI.
 
 Run only the deterministic suite:
 
@@ -87,12 +149,12 @@ python -m unittest discover -s docs/spikes/JARVIS-901-agy/tests -p '*_test.py' -
 | Contract row | Native-Linux evidence | Status | Remaining gate |
 | --- | --- | --- | --- |
 | Executable placement and process-level catalog invocation | Official Linux `agy` is executable at the approved launcher path and reported `1.2.7`; a fresh-D-Bus `acc3 models` invocation exited `0`, with diagnostics and catalog output deliberately unread. | **PARTIAL GO** | The exit code does not prove authentication or catalog correctness. A supported same-host Symphony runtime and profile/keyring restart isolation are still unproven. |
-| JSON/NDJSON framing | An ephemeral runner reported one `acc1` NDJSON `init` + `SUCCESS` result, but neither the runner nor raw envelopes were retained. | **HOLD — operator report only** | Produce a sanitized, reproducible runner and machine-auditable summary before counting native framing as acceptance evidence. |
+| JSON/NDJSON framing | An ephemeral runner reported one `acc1` NDJSON `init` + `SUCCESS` result, but neither runner nor raw envelopes were retained. The new runner is reproducible only in offline fake mode. | **HOLD — operator report only** | Fresh owner authorization must run the runner and retain a manually reviewed, sanitized native summary/envelope-derived report. |
 | Multi-turn identity and cumulative counters | The same operator report says prompt 2 was submitted after turn 1 and produced no terminal result within a 70-second absolute deadline. | **HOLD** | Reproduce with a retained sanitized runner; prove one init/two results, stable identity, clean close, cumulative counters, and a bounded failure policy. |
 | Native cwd/workspace containment | The Linux report names a disposable cwd and sentinel, but does not retain `init.cwd`, sentinel verification, symlink behavior, or `--add-dir` boundary evidence. | **HOLD** | Prove the native child observes the exact contained workspace, cannot escape through symlinks or extra directories, and leaves the sentinel/workspace unchanged unless explicitly authorized. |
 | Same-slot cross-process resume | Planned explicit `acc1 --conversation` check was not submitted. | **HOLD** | Re-authorize/run only after the stream failure is understood. |
 | Cross-slot resume fail-closed | Planned explicit `acc2 --conversation` check was not submitted. | **HOLD** | Prove that an `acc1` conversation cannot be recovered by another isolated slot. |
-| Cancellation/process cleanup | The ephemeral runner reported process-group termination and a zero-process leak check, but the runner/transcript were not retained. | **HOLD — operator report only** | Reproduce with a retained sanitized runner; prove native terminal cancellation, descendant-tree cleanup, and neutral adapter mapping. |
+| Cancellation/process cleanup | The new fake runner proves its POSIX group escalation and cleanup accounting; the old native result remains an unretained operator report. | **HOLD — no native acceptance** | Fresh authorization must observe native terminal cancellation and owned descendant cleanup; native process-tree details are not protocol envelopes. |
 | Scoped permission/input-required | No permission-seeking prompt or bypass flag was used. | **HOLD** | Observe a real scoped soft-denial/input-required outcome without auto-answer or raw credential inheritance. |
 | Fresh-session profile isolation | Fresh D-Bus catalog invocation exited `0`, but diagnostics and catalog contents were intentionally not inspected. | **HOLD** | Prove clean D-Bus/keyring restart/refresh behavior and cross-slot isolation. |
 | Vendor authorization and production dispatch | No production dispatch or authorization change was attempted. | **HOLD** | Owner/vendor authorization remains external to this spike. |

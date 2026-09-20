@@ -63,6 +63,38 @@ def canceled(_signum: int, _frame: object) -> None:
 
 
 def main(scenario: str) -> int:
+    if scenario == "interactive-multi-turn":
+        turns = 0
+        for line in sys.stdin.buffer:
+            message = json.loads(line)
+            if message.get("event") != "user":
+                emit(result("ERROR", turns=turns, error="fixture expected user envelope"))
+                return 2
+            if turns == 0:
+                emit(init(), fragment=True)
+            turns += 1
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": CONVERSATION_ID,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": f"fixture turn {turns}",
+                    },
+                },
+                fragment=True,
+            )
+            emit(result("SUCCESS", turns=turns, response=f"fixture turn {turns}"))
+        return 0
+
+    if scenario == "ignore-signals":
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        emit(init())
+        while True:
+            time.sleep(0.02)
+
     if scenario == "partial-crlf":
         emit(init(), fragment=True, crlf=True)
         sys.stdout.buffer.write(b'{"event":\r\n')
