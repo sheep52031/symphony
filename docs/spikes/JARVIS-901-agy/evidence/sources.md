@@ -9,7 +9,11 @@
 | Official AntiGravity headless reference | [`official-headless-reference-full.md`](official-headless-reference-full.md), SHA-256 `836ee2dcb9078f214f68859cc862c1d7faaa1225df7a068178d30dc4e8a5807a` | <https://www.antigravity.google/docs/cli/headless/> |
 | Official AntiGravity install/auth reference | [`official-install-auth-reference-full.md`](official-install-auth-reference-full.md), SHA-256 `49aa5ea907061a7c0cb1a05b60fb30ee45314d5ba91d67b7658e1c495ca0e51f` | <https://antigravity.google/docs/cli/install/> |
 | Authorized native Windows capture | [`native-live-windows-2026-09-19-capture.md`](native-live-windows-2026-09-19-capture.md), SHA-256 `7081aa73a0147d10f100e62f8864beb3c097d7412c19ae9f45b13edd837bfa1c` (repository-normalized LF bytes) | local owner-authorized execution summarized in [`native-live-windows-2026-09-19.md`](native-live-windows-2026-09-19.md) |
+| Authorized native Linux follow-up | [`native-live-linux-2026-09-20.md`](native-live-linux-2026-09-20.md) | local owner-authorized native-Linux execution; only sanitized lifecycle summary is retained, with no raw live capture or digest of sensitive output |
 
-The committed captures make the exact reviewed content available even when a repository is
-private or a live documentation URL later changes. The local static capture omits executable
-paths, settings, credentials, and authentication material.
+The committed official-reference and Windows capture files make their exact reviewed content
+available even when a repository is private or a live documentation URL later changes. The Linux
+follow-up is intentionally different: it preserves only a sanitized, non-gating operator report;
+no runner, raw transcript, or digest exists, so it must not be treated as exact machine-auditable
+execution evidence. The local static captures omit executable paths, settings, credentials, and
+authentication material.
