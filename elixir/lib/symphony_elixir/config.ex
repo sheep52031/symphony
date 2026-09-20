@@ -55,6 +55,23 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec issue_identifier_allowed?(term()) :: boolean()
+  def issue_identifier_allowed?(identifier) when is_binary(identifier) do
+    case settings!().agent.allowed_issue_identifiers do
+      nil -> true
+      identifiers when is_list(identifiers) -> identifier in identifiers
+      _ -> false
+    end
+  end
+
+  def issue_identifier_allowed?(_identifier), do: false
+
+  @spec hold_after_normal_completion?() :: boolean()
+  def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
+
+  @spec max_attempts_per_issue() :: pos_integer() | nil
+  def max_attempts_per_issue, do: settings!().agent.max_attempts_per_issue
+
   @spec agent_stall_timeout_ms() :: non_neg_integer()
   def agent_stall_timeout_ms do
     config = settings!()

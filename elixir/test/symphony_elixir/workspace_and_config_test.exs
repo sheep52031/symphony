@@ -1166,6 +1166,107 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "exact issue admission is opt-in and rejects ambiguous allowlists" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.agent.allowed_issue_identifiers == nil
+    refute settings.agent.hold_after_normal_completion
+    assert settings.agent.max_attempts_per_issue == nil
+
+    for key <- [:allowed_issue_identifiers, :hold_after_normal_completion, :max_attempts_per_issue] do
+      assert {:error, {:invalid_workflow_config, message}} =
+               Schema.parse(%{agent: %{key => nil}})
+
+      assert message =~ Atom.to_string(key)
+      assert message =~ "must not be null"
+    end
+
+    assert {:error, {:invalid_workflow_config, empty_message}} =
+             Schema.parse(%{agent: %{allowed_issue_identifiers: []}})
+
+    assert empty_message =~ "allowed_issue_identifiers"
+
+    for identifiers <- [[" JARVIS-917"], ["JARVIS-917", "JARVIS-917"], [" "]] do
+      assert {:error, {:invalid_workflow_config, message}} =
+               Schema.parse(%{agent: %{allowed_issue_identifiers: identifiers}})
+
+      assert message =~ "allowed_issue_identifiers"
+    end
+
+    assert {:error, {:invalid_workflow_config, max_attempts_message}} =
+             Schema.parse(%{agent: %{max_attempts_per_issue: 0}})
+
+    assert max_attempts_message =~ "max_attempts_per_issue"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      allowed_issue_identifiers: ["JARVIS-917"],
+      hold_after_normal_completion: true,
+      max_attempts_per_issue: 1
+    )
+
+    assert Config.issue_identifier_allowed?("JARVIS-917")
+    refute Config.issue_identifier_allowed?("jarvis-917")
+    assert Config.hold_after_normal_completion?()
+    assert Config.max_attempts_per_issue() == 1
+  end
+
+  test "exact issue admission applies to selection, dispatch refresh, retry, and continuation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      allowed_issue_identifiers: ["JARVIS-917"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    allowed = %Issue{
+      id: "issue-allowed",
+      identifier: "JARVIS-917",
+      title: "Allowed",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    denied = %{allowed | id: "issue-denied", identifier: "JARVIS-918"}
+
+    assert Orchestrator.should_dispatch_issue_for_test(allowed, state)
+    refute Orchestrator.should_dispatch_issue_for_test(denied, state)
+
+    assert {:skip, ^denied} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(allowed, fn ["issue-allowed"] ->
+               {:ok, [denied]}
+             end)
+
+    retry_state = %{state | claimed: MapSet.put(state.claimed, denied.id)}
+
+    updated_retry_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(denied, retry_state, denied.id, 1, %{})
+
+    refute MapSet.member?(updated_retry_state.claimed, denied.id)
+    assert updated_retry_state.retry_attempts == %{}
+
+    assert {:continue, ^allowed} =
+             AgentRunner.continue_with_issue_for_test(allowed, fn [_issue_id] -> {:ok, [allowed]} end)
+
+    assert {:done, ^denied} =
+             AgentRunner.continue_with_issue_for_test(allowed, fn [_issue_id] -> {:ok, [denied]} end)
+  end
+
+  test "attempt budget reserves initial sessions conservatively" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_attempts_per_issue: 1)
+
+    issue = %Issue{id: "attempt-budget", identifier: "JARVIS-917", title: "Budget", state: "In Progress"}
+    state = %Orchestrator.State{attempts: %{}}
+
+    assert {:ok, reserved_state} = Orchestrator.reserve_issue_attempt_for_test(issue, state)
+    assert reserved_state.attempts == %{issue.id => 1}
+    assert {:exhausted, ^reserved_state} = Orchestrator.reserve_issue_attempt_for_test(issue, reserved_state)
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

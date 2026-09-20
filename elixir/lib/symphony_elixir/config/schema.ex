@@ -154,6 +154,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:allowed_issue_identifiers, {:array, :string})
+      field(:hold_after_normal_completion, :boolean, default: false)
+      field(:max_attempts_per_issue, :integer)
       field(:stall_timeout_ms, :integer)
     end
 
@@ -168,6 +171,9 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
+          :allowed_issue_identifiers,
+          :hold_after_normal_completion,
+          :max_attempts_per_issue,
           :stall_timeout_ms
         ],
         empty_values: []
@@ -177,8 +183,31 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:max_attempts_per_issue, greater_than: 0)
+      |> validate_allowed_issue_identifiers()
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+
+    defp validate_allowed_issue_identifiers(changeset) do
+      validate_change(changeset, :allowed_issue_identifiers, fn :allowed_issue_identifiers, identifiers ->
+        cond do
+          identifiers == [] ->
+            [allowed_issue_identifiers: "must contain at least one exact issue identifier when configured"]
+
+          Enum.any?(identifiers, &(not is_binary(&1) or String.trim(&1) == "")) ->
+            [allowed_issue_identifiers: "must contain only nonblank issue identifiers"]
+
+          Enum.any?(identifiers, &(String.trim(&1) != &1)) ->
+            [allowed_issue_identifiers: "identifiers must not include surrounding whitespace"]
+
+          length(identifiers) != length(Enum.uniq(identifiers)) ->
+            [allowed_issue_identifiers: "must not contain duplicate identifiers"]
+
+          true ->
+            []
+        end
+      end)
     end
   end
 
@@ -358,17 +387,24 @@ defmodule SymphonyElixir.Config.Schema do
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
   def parse(config) when is_map(config) do
-    config
-    |> normalize_keys()
-    |> drop_nil_values()
-    |> changeset()
-    |> apply_action(:validate)
-    |> case do
-      {:ok, settings} ->
-        finalize_settings(settings)
+    config = normalize_keys(config)
 
-      {:error, changeset} ->
-        {:error, {:invalid_workflow_config, format_errors(changeset)}}
+    case validate_safety_settings_not_nil(config) do
+      :ok ->
+        config
+        |> drop_nil_values()
+        |> changeset()
+        |> apply_action(:validate)
+        |> case do
+          {:ok, settings} ->
+            finalize_settings(settings)
+
+          {:error, changeset} ->
+            {:error, {:invalid_workflow_config, format_errors(changeset)}}
+        end
+
+      {:error, message} ->
+        {:error, {:invalid_workflow_config, message}}
     end
   end
 
@@ -518,6 +554,22 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_tracker_credentials(settings, provider) do
     {:ok, {settings.tracker.api_key, settings.tracker.assignee, provider, []}}
   end
+
+  defp validate_safety_settings_not_nil(%{"agent" => agent}) when is_map(agent) do
+    Enum.reduce_while(
+      ["allowed_issue_identifiers", "hold_after_normal_completion", "max_attempts_per_issue"],
+      :ok,
+      fn key, :ok ->
+        if Map.has_key?(agent, key) and is_nil(Map.get(agent, key)) do
+          {:halt, {:error, "agent.#{key} must not be null; omit it to use the default"}}
+        else
+          {:cont, :ok}
+        end
+      end
+    )
+  end
+
+  defp validate_safety_settings_not_nil(_config), do: :ok
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

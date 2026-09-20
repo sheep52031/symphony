@@ -262,7 +262,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "held" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -298,6 +298,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_identifier" => "MT-BLOCKED",
                  "issue_url" => "https://example.org/issues/MT-BLOCKED",
                  "state" => "In Progress",
+                 "disposition" => "input_required",
+                 "reason" => "codex turn requires operator input",
                  "error" => "codex turn requires operator input",
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
@@ -306,6 +308,24 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event" => "turn_input_required",
                  "last_message" => "turn blocked: waiting for user input",
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
+               }
+             ],
+             "held" => [
+               %{
+                 "issue_id" => "issue-held",
+                 "issue_identifier" => "MT-HELD",
+                 "issue_url" => "https://example.org/issues/MT-HELD",
+                 "state" => "In Progress",
+                 "disposition" => "normal_completion_hold",
+                 "reason" => "normal completion held by agent.hold_after_normal_completion",
+                 "error" => nil,
+                 "worker_host" => nil,
+                 "workspace_path" => nil,
+                 "session_id" => nil,
+                 "blocked_at" => state_payload["held"] |> List.first() |> Map.fetch!("blocked_at"),
+                 "last_event" => nil,
+                 "last_message" => nil,
+                 "last_event_at" => nil
                }
              ],
              "codex_totals" => %{
@@ -343,9 +363,11 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "retry" => nil,
              "blocked" => nil,
+             "held" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
+             "hold_reason" => nil,
              "tracked" => %{}
            }
 
@@ -362,7 +384,21 @@ defmodule SymphonyElixir.ExtensionsTest do
              "blocked" => %{
                "session_id" => "thread-blocked",
                "state" => "In Progress",
+               "disposition" => "input_required",
+               "reason" => "codex turn requires operator input",
                "error" => "codex turn requires operator input"
+             }
+           } = json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-HELD")
+
+    assert %{
+             "status" => "held",
+             "hold_reason" => "normal completion held by agent.hold_after_normal_completion",
+             "blocked" => nil,
+             "held" => %{
+               "disposition" => "normal_completion_hold",
+               "reason" => "normal completion held by agent.hold_after_normal_completion"
              }
            } = json_response(conn, 200)
 
@@ -503,6 +539,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
+    assert html =~ "MT-HELD"
+    assert html =~ "Held issues"
+    assert html =~ "Held"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
@@ -610,7 +649,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "held" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -700,6 +739,22 @@ defmodule SymphonyElixir.ExtensionsTest do
             timestamp: DateTime.utc_now()
           },
           last_codex_timestamp: DateTime.utc_now()
+        },
+        %{
+          issue_id: "issue-held",
+          identifier: "MT-HELD",
+          issue_url: "https://example.org/issues/MT-HELD",
+          state: "In Progress",
+          disposition: :normal_completion_hold,
+          reason: "normal completion held by agent.hold_after_normal_completion",
+          error: nil,
+          worker_host: nil,
+          workspace_path: nil,
+          session_id: nil,
+          blocked_at: DateTime.utc_now(),
+          last_codex_event: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

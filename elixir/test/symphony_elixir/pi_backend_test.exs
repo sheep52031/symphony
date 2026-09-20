@@ -206,6 +206,27 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.rm_rf!(workspace)
   end
 
+  test "AgentRunner never starts Pi for an identifier outside the configured allowlist" do
+    root = Path.join(System.tmp_dir!(), "symphony-pi-allowlist-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    script = Path.join(root, "fake-pi")
+    File.mkdir_p!(root)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "pi",
+      pi_command: script,
+      workspace_root: workspace_root,
+      allowed_issue_identifiers: ["JARVIS-917"]
+    )
+
+    denied = %Issue{id: "issue-pi-denied", identifier: "JARVIS-918", title: "Denied Pi run"}
+
+    assert :ok = AgentRunner.run(denied)
+    refute File.exists?(Path.join(workspace_root, "JARVIS-918"))
+    File.rm_rf!(root)
+  end
+
   test "AgentRunner selects Pi only when the workflow opts in" do
     root = Path.join(System.tmp_dir!(), "symphony-pi-runner-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(root, "workspaces")

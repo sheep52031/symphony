@@ -1274,6 +1274,441 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = state.blocked[issue_id]
   end
 
+  test "normal completion retains the existing continuation retry by default" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-default-continuation"
+    orchestrator_name = Module.concat(__MODULE__, :DefaultContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+    issue = %Issue{id: issue_id, identifier: "JARVIS-DEFAULT", state: "In Progress", dispatchable: true}
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        issue_id => %{
+          pid: self(),
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          session_id: "default-session",
+          started_at: DateTime.utc_now()
+        }
+      })
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    assert %{attempt: 1} = state.retry_attempts[issue_id]
+  end
+
+  test "normal completion hold keeps an active issue claimed and visible without redispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: true
+    )
+
+    assert Config.hold_after_normal_completion?()
+    issue_id = "issue-normal-hold"
+    orchestrator_name = Module.concat(__MODULE__, :NormalCompletionHoldOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      state: "In Progress",
+      url: "https://example.org/issues/JARVIS-917",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        issue_id => %{
+          pid: self(),
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          backend: "pi",
+          session_id: "pi-session",
+          started_at: DateTime.utc_now()
+        }
+      })
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    assert %{blocked: [blocked]} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert blocked.identifier == "JARVIS-917"
+    assert blocked.disposition == :normal_completion_hold
+    assert blocked.reason == "normal completion held by agent.hold_after_normal_completion"
+    assert blocked.error == nil
+    assert blocked.backend == "pi"
+
+    presentation = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 1_000)
+    assert presentation.counts.held == 1
+    assert presentation.counts.blocked == 0
+    assert presentation.blocked == []
+    assert [presented_hold] = presentation.held
+    assert presented_hold.disposition == :normal_completion_hold
+    assert presented_hold.reason == blocked.reason
+
+    assert {:ok, issue_presentation} =
+             SymphonyElixirWeb.Presenter.issue_payload("JARVIS-917", orchestrator_name, 1_000)
+
+    assert issue_presentation.status == "held"
+    assert issue_presentation.hold_reason == blocked.reason
+    assert issue_presentation.last_error == nil
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert MapSet.member?(state.claimed, issue_id)
+    assert Map.has_key?(state.blocked, issue_id)
+  end
+
+  test "held issues release claims on routing, non-active, cancellation, and terminal transitions" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony"]
+    )
+
+    issue_id = "issue-held-reconciliation"
+
+    base_issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      state: "In Progress",
+      labels: ["symphony"],
+      dispatchable: true
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      blocked: %{issue_id => %{issue: base_issue, identifier: base_issue.identifier}},
+      retry_attempts: %{}
+    }
+
+    for revoked_issue <- [
+          %{base_issue | labels: []},
+          %{base_issue | state: "Human Review"},
+          %{base_issue | state: "Canceled"},
+          %{base_issue | state: "Done"}
+        ] do
+      reconciled = Orchestrator.reconcile_blocked_issue_states_for_test([revoked_issue], state)
+      refute MapSet.member?(reconciled.claimed, issue_id)
+      refute Map.has_key?(reconciled.blocked, issue_id)
+    end
+
+    assert %Orchestrator.State{blocked: blocked} = %Orchestrator.State{}
+    assert blocked == %{}
+  end
+
+  test "attempt budget holds normal continuation and every retry scheduling path" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_attempts_per_issue: 1
+    )
+
+    issue_id = "issue-attempt-budget"
+    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "In Progress", dispatchable: true}
+
+    state = %Orchestrator.State{
+      attempts: %{issue_id => 1},
+      claimed: MapSet.new([issue_id]),
+      running: %{},
+      blocked: %{},
+      retry_attempts: %{}
+    }
+
+    for source <- [:failure, :stall, :retry_poll, :refresh, :no_slot] do
+      held =
+        Orchestrator.schedule_retry_for_test(state, issue_id, %{
+          issue: issue,
+          identifier: issue.identifier,
+          source: source
+        })
+
+      assert held.blocked[issue_id].disposition == :attempt_limit_hold
+      assert held.blocked[issue_id].reason == "attempt limit reached (1/1)"
+      assert held.blocked[issue_id].error == nil
+      assert held.retry_attempts == %{}
+    end
+  end
+
+  test "attempt budget holds a normal AgentRunner completion instead of scheduling continuation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_attempts_per_issue: 1
+    )
+
+    assert Config.max_attempts_per_issue() == 1
+    issue_id = "issue-attempt-continuation"
+    orchestrator_name = Module.concat(__MODULE__, :AttemptContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    ref = make_ref()
+    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "In Progress", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        state
+        | attempts: %{issue_id => 1},
+          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+          claimed: MapSet.new([issue_id]),
+          running: %{
+            issue_id => %{
+              pid: self(),
+              ref: ref,
+              identifier: issue.identifier,
+              issue: issue,
+              started_at: DateTime.utc_now()
+            }
+          },
+          blocked: %{},
+          retry_attempts: %{}
+      }
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    held = :sys.get_state(pid)
+    assert held.blocked[issue_id].disposition == :attempt_limit_hold
+    assert held.retry_attempts == %{}
+  end
+
+  test "attempt budget holds a stalled AgentRunner instead of restarting it" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000,
+      max_attempts_per_issue: 1
+    )
+
+    issue_id = "issue-attempt-stall"
+    orchestrator_name = Module.concat(__MODULE__, :AttemptStallOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    worker = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+    stale_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "In Progress", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        state
+        | attempts: %{issue_id => 1},
+          claimed: MapSet.new([issue_id]),
+          running: %{
+            issue_id => %{
+              pid: worker,
+              ref: make_ref(),
+              identifier: issue.identifier,
+              issue: issue,
+              started_at: stale_at,
+              last_codex_timestamp: stale_at
+            }
+          },
+          blocked: %{},
+          retry_attempts: %{}
+      }
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    held = :sys.get_state(pid)
+    refute Process.alive?(worker)
+    assert held.blocked[issue_id].disposition == :attempt_limit_hold
+    assert held.retry_attempts == %{}
+  end
+
+  test "hold mode does not suppress failure retries" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: true
+    )
+
+    issue_id = "issue-hold-failure"
+    orchestrator_name = Module.concat(__MODULE__, :HoldFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    ref = make_ref()
+    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "In Progress", dispatchable: true}
+    state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{state | claimed: MapSet.new([issue_id]), running: %{issue_id => %{pid: self(), ref: ref, identifier: issue.identifier, issue: issue, started_at: DateTime.utc_now()}}}
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(50)
+    retried = :sys.get_state(pid)
+    assert %{attempt: 1} = retried.retry_attempts[issue_id]
+    assert retried.blocked == %{}
+  end
+
+  test "running allowlist revocation terminates and releases the active task" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      allowed_issue_identifiers: ["JARVIS-917"]
+    )
+
+    issue_id = "issue-running-revocation"
+    worker = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+
+    revoked_issue = %Issue{id: issue_id, identifier: "JARVIS-918", state: "In Progress", dispatchable: true}
+
+    state = %Orchestrator.State{
+      task_supervisor: SymphonyElixir.TaskSupervisor,
+      attempts: %{issue_id => 1},
+      claimed: MapSet.new([issue_id]),
+      running: %{
+        issue_id => %{
+          pid: worker,
+          ref: make_ref(),
+          identifier: revoked_issue.identifier,
+          issue: revoked_issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      blocked: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    reconciled = Orchestrator.reconcile_issue_states_for_test([revoked_issue], state)
+    refute Process.alive?(worker)
+    refute MapSet.member?(reconciled.claimed, issue_id)
+    assert reconciled.running == %{}
+    assert reconciled.attempts == %{}
+  end
+
+  test "config hold release preserves attempts and permits only a raised budget's additional attempt" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: true,
+      max_attempts_per_issue: 1
+    )
+
+    issue_id = "issue-config-rollback"
+    orchestrator_name = Module.concat(__MODULE__, :ConfigRollbackOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      title: "Config rollback attempt budget",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        state
+        | attempts: %{issue_id => 1},
+          claimed: MapSet.new([issue_id]),
+          blocked: %{
+            issue_id => %{issue: issue, identifier: issue.identifier, disposition: :normal_completion_hold}
+          }
+      }
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: false,
+      max_attempts_per_issue: 1
+    )
+
+    assert %{blocked: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    released = :sys.get_state(pid)
+    assert released.attempts[issue_id] == 1
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    reheld = :sys.get_state(pid)
+    assert reheld.running == %{}
+    assert reheld.attempts[issue_id] == 1
+    assert reheld.blocked[issue_id].disposition == :attempt_limit_hold
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: false,
+      max_attempts_per_issue: 2
+    )
+
+    assert %{blocked: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    increased = :sys.get_state(pid)
+    assert increased.attempts[issue_id] == 1
+
+    assert {:ok, after_second_start} = Orchestrator.reserve_issue_attempt_for_test(issue, increased)
+    assert after_second_start.attempts[issue_id] == 2
+    assert {:exhausted, exhausted} = Orchestrator.reserve_issue_attempt_for_test(issue, after_second_start)
+    assert exhausted.attempts[issue_id] == 2
+  end
+
+  test "explicit Human Review terminal state cleans held workspace and releases its claim" do
+    workspace_root = Path.join(System.tmp_dir!(), "symphony-human-review-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf(workspace_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      tracker_terminal_states: ["Done", "Human Review"]
+    )
+
+    issue_id = "issue-human-review-terminal"
+    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "Human Review", dispatchable: true}
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      blocked: %{issue_id => %{issue: issue, identifier: issue.identifier, disposition: :normal_completion_hold}},
+      retry_attempts: %{},
+      attempts: %{issue_id => 1}
+    }
+
+    reconciled = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+    refute File.exists?(workspace)
+    refute MapSet.member?(reconciled.claimed, issue_id)
+    assert reconciled.blocked == %{}
+    assert reconciled.attempts == %{}
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
@@ -1365,6 +1800,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     checking_rendered = StatusDashboard.format_snapshot_content_for_test(checking_snapshot, 0.0)
     assert checking_rendered =~ "checking now…"
+  end
+
+  test "status dashboard reports held issues separately from retry failures" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         blocked: [
+           %{disposition: :normal_completion_hold},
+           %{disposition: :attempt_limit_hold},
+           %{disposition: :input_required}
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    assert StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0) =~ "Holds:"
+    assert StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0) =~ "2"
   end
 
   test "status dashboard adds a spacer line before backoff queue when no agents are active" do

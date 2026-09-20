@@ -22,15 +22,20 @@ defmodule SymphonyElixir.AgentRunner do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    if Config.issue_identifier_allowed?(issue.identifier) do
+      Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
-        :ok
+      case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+        :ok ->
+          :ok
 
-      {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        {:error, reason} ->
+          Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+      end
+    else
+      Logger.warning("Skipping agent run; issue identifier is not allowed: #{issue_context(issue)}")
+      :ok
     end
   end
 
@@ -217,7 +222,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) and
+             Config.issue_identifier_allowed?(refreshed_issue.identifier) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}

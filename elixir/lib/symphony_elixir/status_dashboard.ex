@@ -315,6 +315,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             blocked: Map.get(snapshot, :blocked, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -341,6 +342,7 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
+        held_count = held_count(Map.get(snapshot, :blocked, []))
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
@@ -353,6 +355,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
+           colorize("│ Holds: ", @ansi_bold) <> colorize("#{held_count}", @ansi_magenta),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -561,6 +564,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             blocked: Map.get(snapshot, :blocked, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -573,6 +577,15 @@ defmodule SymphonyElixir.StatusDashboard do
       :error
     end
   end
+
+  defp held_count(blocked) when is_list(blocked) do
+    Enum.count(blocked, fn
+      %{disposition: disposition} when disposition in [:normal_completion_hold, :attempt_limit_hold] -> true
+      _ -> false
+    end)
+  end
+
+  defp held_count(_blocked), do: 0
 
   defp format_running_rows(running, running_event_width) do
     if running == [] do
