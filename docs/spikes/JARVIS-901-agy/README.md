@@ -56,7 +56,7 @@ bytes are explicit in the summary. Provenance binds `capture_runner.py`, `probe.
 fixture when used, the committed safe wrapper bytes, the absolute `$REAL_HOME/.local/bin/agy`
 target hash, and the clean git HEAD/tree before and after capture. Live children receive the fixed
 trusted PATH `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`; operator PATH entries
-are not used. The committed wrapper is executed directly; no host wrapper is required or modified.
+are not used. The committed wrapper is executed directly; no external launcher is required or modified.
 Its profile and keyring contents remain external, and it projects no unrelated operator `.ssh` or
 `.gitconfig` configuration.
 
