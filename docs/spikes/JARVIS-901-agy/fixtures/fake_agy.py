@@ -103,6 +103,63 @@ def main(scenario: str) -> int:
             emit(result("SUCCESS", turns=turns, response=f"fixture turn {turns}"))
         return 0
 
+    if scenario == "preinit-step":
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": CONVERSATION_ID,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "before init",
+                },
+            }
+        )
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="after invalid event"))
+        return 0
+
+    if scenario == "preinit-result":
+        emit(result("SUCCESS", turns=1, response="before init"))
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="after invalid event"))
+        return 0
+
+    if scenario == "identityless-init":
+        emit({"event": "init", "init": {"cwd": str(Path.cwd())}})
+        emit(result("SUCCESS", turns=1, response="identity missing"))
+        return 0
+
+    if scenario == "duplicate-init":
+        emit(init())
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="duplicate init"))
+        return 0
+
+    if scenario == "identity-mismatch":
+        emit(init())
+        emit(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "other-conversation",
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "wrong identity",
+                },
+            }
+        )
+        emit(
+            {
+                "event": "result",
+                "result": {
+                    **result("SUCCESS", turns=1)["result"],
+                    "conversation_id": "other-conversation",
+                },
+            }
+        )
+        return 0
+
     if scenario == "ignore-signals":
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

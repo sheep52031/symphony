@@ -22,11 +22,11 @@ from probe import RunResult, TERMINAL_STATUSES, USAGE_FIELDS, run_fixture
 SPIKE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SPIKE_ROOT.parents[2]
 LIVE_AUTHORIZATION = "JARVIS-901-OWNER-AUTHORIZED"
-SUMMARY_SCHEMA = "jarvis-901-agy-capture-summary-v3"
-APPROVED_LAUNCHER = Path.home() / ".local" / "bin" / "agy-profile"
-APPROVED_WRAPPER_FIXTURE = SPIKE_ROOT / "fixtures" / "agy-profile"
-APPROVED_WRAPPER_SOURCE_SHA256 = "fa97fd8100d3bea32f80bc72d7ccc2e7618480a22041b8b7175f10f737cfb250"
-APPROVED_LAUNCHER_SHA256 = APPROVED_WRAPPER_SOURCE_SHA256
+SUMMARY_SCHEMA = "jarvis-901-agy-capture-summary-v4"
+RAW_MANIFEST_SCHEMA = "jarvis-901-agy-raw-manifest-v2"
+APPROVED_WRAPPER = SPIKE_ROOT / "fixtures" / "agy-profile"
+APPROVED_WRAPPER_SOURCE_SHA256 = "6f51a53038fe98f434bb483a6288ac747f8d76b1984fd695910644b3668627bb"
+APPROVED_AGY_TARGET = Path.home() / ".local" / "bin" / "agy"
 TRUSTED_SYSTEM_PATH = (
     r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
     if os.name == "nt"
@@ -124,7 +124,7 @@ def _code_provenance() -> dict[str, str]:
         "capture_runner_sha256": sha256(Path(__file__)),
         "probe_sha256": sha256(SPIKE_ROOT / "probe.py"),
         "fake_fixture_sha256": sha256(SPIKE_ROOT / "fixtures" / "fake_agy.py"),
-        "wrapper_fixture_sha256": sha256(APPROVED_WRAPPER_FIXTURE),
+        "safe_wrapper_sha256": sha256(APPROVED_WRAPPER),
     }
 
 
@@ -179,13 +179,13 @@ def _regular_executable(path: Path, *, label: str) -> None:
         raise CaptureError(f"{label} is not an executable regular file")
 
 
-def _static_underlying_path(launcher: Path, text: str) -> Path:
+def _static_underlying_path(wrapper: Path, text: str) -> Path:
     if 'exec "$REAL_HOME/.local/bin/agy" "$@"' in text:
-        return launcher.parent / "agy"
+        return APPROVED_AGY_TARGET
     match = ABSOLUTE_EXEC_RE.search(text)
     if match:
         return Path(match.group(1))
-    raise CaptureError("launcher does not bind an absolute underlying agy executable")
+    raise CaptureError("safe wrapper does not bind an absolute underlying agy executable")
 
 
 def _validate_profile_contract(text: str) -> None:
@@ -196,7 +196,7 @@ def _validate_profile_contract(text: str) -> None:
         "exec",
     )
     if any(fragment not in text for fragment in required):
-        raise CaptureError("launcher profile-root contract is not approved")
+        raise CaptureError("safe wrapper profile-root contract is not approved")
 
 
 def _version(binary: Path, environment: Mapping[str, str], cwd: Path) -> str:
@@ -222,64 +222,61 @@ def _version(binary: Path, environment: Mapping[str, str], cwd: Path) -> str:
     return match.group(0)
 
 
-def launcher_provenance(
-    launcher: Path = APPROVED_LAUNCHER,
+def wrapper_provenance(
+    wrapper: Path = APPROVED_WRAPPER,
     *,
     profile: str = "acc1",
     environment: Mapping[str, str] | None = None,
     cwd: Path | None = None,
-    expected_launcher_sha256: str | None = None,
+    expected_wrapper_sha256: str | None = None,
     capture_version: bool = False,
 ) -> dict[str, Any]:
-    """Inspect the approved wrapper and pin its exact underlying executable without path output."""
-    launcher = launcher.expanduser()
-    if not launcher.is_absolute():
-        raise CaptureError("launcher must be an approved absolute path")
+    """Pin the committed safe wrapper and its absolute external agy target."""
+    wrapper = wrapper.expanduser().resolve()
+    if wrapper != APPROVED_WRAPPER.resolve():
+        raise CaptureError("live mode requires the committed safe wrapper")
     if not SLOT_RE.fullmatch(profile):
         raise CaptureError("profile slot is invalid")
-    _regular_executable(launcher, label="launcher")
-    mode = stat.S_IMODE(launcher.stat().st_mode)
-    if mode != 0o700:
-        raise CaptureError("launcher mode must be 0700")
-    _regular_executable(APPROVED_WRAPPER_FIXTURE, label="committed wrapper fixture")
-    fixture_bytes = APPROVED_WRAPPER_FIXTURE.read_bytes()
-    fixture_hash = sha256(APPROVED_WRAPPER_FIXTURE)
+    _regular_executable(wrapper, label="committed safe wrapper")
+    mode = stat.S_IMODE(wrapper.stat().st_mode)
+    _regular_executable(APPROVED_WRAPPER, label="committed safe wrapper")
+    fixture_bytes = APPROVED_WRAPPER.read_bytes()
+    fixture_hash = sha256(APPROVED_WRAPPER)
     if fixture_hash != APPROVED_WRAPPER_SOURCE_SHA256:
-        raise CaptureError("committed wrapper fixture hash changed")
-    launcher_bytes = launcher.read_bytes()
-    launcher_hash = sha256(launcher)
-    if expected_launcher_sha256 is None and launcher == APPROVED_LAUNCHER:
-        expected_launcher_sha256 = APPROVED_LAUNCHER_SHA256
-    if launcher == APPROVED_LAUNCHER and launcher_bytes != fixture_bytes:
-        raise CaptureError("host wrapper does not match committed approved source")
-    if launcher != APPROVED_LAUNCHER and expected_launcher_sha256 is None:
-        raise CaptureError("non-approved launcher requires an explicit pinned hash")
-    if expected_launcher_sha256 is not None and launcher_hash != expected_launcher_sha256:
-        raise CaptureError("approved launcher hash changed")
+        raise CaptureError("committed safe wrapper hash changed")
+    wrapper_bytes = wrapper.read_bytes()
+    wrapper_hash = sha256(wrapper)
+    if expected_wrapper_sha256 is None:
+        expected_wrapper_sha256 = APPROVED_WRAPPER_SOURCE_SHA256
+    if wrapper_bytes != fixture_bytes or wrapper_hash != expected_wrapper_sha256:
+        raise CaptureError("committed safe wrapper changed")
     try:
-        text = launcher.read_text(encoding="utf-8")
+        text = wrapper.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        raise CaptureError("launcher text cannot be inspected") from error
+        raise CaptureError("committed safe wrapper cannot be inspected") from error
     _validate_profile_contract(text)
-    binary = _static_underlying_path(launcher, text).resolve()
-    _regular_executable(binary, label="underlying agy executable")
+    binary = _static_underlying_path(wrapper, text).resolve()
+    _regular_executable(binary, label="absolute agy target")
     binary_hash = sha256(binary)
     environment = minimal_environment()[0] if environment is None else dict(environment)
-    version = _version(binary, environment, cwd or launcher.parent) if capture_version else None
-    if sha256(launcher) != launcher_hash or sha256(binary) != binary_hash:
-        raise CaptureError("launcher or underlying agy changed during provenance inspection")
+    version = _version(binary, environment, cwd or wrapper.parent) if capture_version else None
+    if sha256(wrapper) != wrapper_hash or sha256(binary) != binary_hash:
+        raise CaptureError("committed safe wrapper or absolute agy target changed")
     result: dict[str, Any] = {
-        "launcher_name": launcher.name,
-        "launcher_mode": format(mode, "04o"),
-        "launcher_sha256": launcher_hash,
-        "wrapper_fixture_name": APPROVED_WRAPPER_FIXTURE.name,
-        "wrapper_fixture_sha256": fixture_hash,
+        "wrapper_name": wrapper.name,
+        "wrapper_mode": format(mode, "04o"),
+        "wrapper_sha256": wrapper_hash,
+        "safe_wrapper_source_sha256": fixture_hash,
         "underlying_name": binary.name,
         "underlying_sha256": binary_hash,
         "executable_name": binary.name,
         "executable_sha256": binary_hash,
+        "underlying_target_contract": "$REAL_HOME/.local/bin/agy",
+        "underlying_target_is_absolute": binary.is_absolute(),
         "profile_root_contract": "REAL_HOME/.agy-profiles/<slot>",
         "profile_slot": profile,
+        "profile_and_keyring_external": True,
+        "projects_operator_ssh_git_config": False,
     }
     if version is not None:
         result["version"] = version
@@ -385,6 +382,16 @@ def _summary(
     }
     summary = {
         "schema": SUMMARY_SCHEMA,
+        "protocol_policy": {
+            "first_event": "init",
+            "init_identity": "nonempty",
+            "identity": "stable",
+        },
+        "cleanup_policy": {
+            "absolute_deadline_after_final_escalation": True,
+            "bounded_reader_join": True,
+            "group_survival_is_failure": True,
+        },
         "mode": mode,
         "started_at": started,
         "finished_at": now(),
@@ -462,16 +469,16 @@ def capture_exit_code(summary: Mapping[str, Any]) -> int:
 def _safe_command_label(mode: str, profile: str) -> list[str]:
     if mode == "fake":
         return ["<fixture>/fake_agy.py", "interactive-multi-turn"]
-    return ["<approved-launcher>", profile, "--mode", "plan", "--input-format", "stream-json", "--output-format", "stream-json", "--print-timeout", "60s"]
+    return ["<committed-safe-wrapper>", profile, "--mode", "plan", "--input-format", "stream-json", "--output-format", "stream-json", "--print-timeout", "60s"]
 
 
-def _check_pin(provenance: Mapping[str, Any], launcher: Path, binary: Path) -> None:
-    if sha256(APPROVED_WRAPPER_FIXTURE) != APPROVED_WRAPPER_SOURCE_SHA256:
-        raise CaptureError("committed wrapper fixture changed before or during capture")
-    if launcher.read_bytes() != APPROVED_WRAPPER_FIXTURE.read_bytes():
-        raise CaptureError("host wrapper changed before or during capture")
-    if sha256(launcher) != provenance["launcher_sha256"] or sha256(binary) != provenance["underlying_sha256"]:
-        raise CaptureError("launcher or underlying agy changed before or during capture")
+def _check_pin(provenance: Mapping[str, Any], wrapper: Path, binary: Path) -> None:
+    if sha256(APPROVED_WRAPPER) != APPROVED_WRAPPER_SOURCE_SHA256:
+        raise CaptureError("committed safe wrapper changed before or during capture")
+    if wrapper.read_bytes() != APPROVED_WRAPPER.read_bytes():
+        raise CaptureError("committed safe wrapper changed before or during capture")
+    if sha256(wrapper) != provenance["wrapper_sha256"] or sha256(binary) != provenance["underlying_sha256"]:
+        raise CaptureError("committed safe wrapper or absolute agy target changed before or during capture")
 
 
 def run_capture(
@@ -483,7 +490,7 @@ def run_capture(
     workspace: Path | None = None,
     repository_root: Path = REPOSITORY_ROOT,
     profile: str = "acc1",
-    launcher: Path = APPROVED_LAUNCHER,
+    wrapper: Path = APPROVED_WRAPPER,
     first_token_timeout: float | None = None,
     turn_timeout: float | None = None,
     post_result_exit_grace: float | None = None,
@@ -520,30 +527,30 @@ def run_capture(
     environment, environment_names = minimal_environment()
     started = now()
     pin: dict[str, Any] | None = None
-    launcher_path: Path | None = None
+    wrapper_path: Path | None = None
     binary_path: Path | None = None
     try:
         if mode == "live":
-            if launcher.expanduser().resolve() != APPROVED_LAUNCHER:
-                raise CaptureError("live mode requires the approved absolute launcher")
+            if wrapper.expanduser().resolve() != APPROVED_WRAPPER.resolve():
+                raise CaptureError("live mode requires the committed safe wrapper")
             bounded_first = LIVE_FIRST_TOKEN_DEFAULT if first_token_timeout is None else first_token_timeout
             bounded_turn = LIVE_TURN_DEFAULT if turn_timeout is None else turn_timeout
             bounded_exit = LIVE_EXIT_GRACE_DEFAULT if post_result_exit_grace is None else post_result_exit_grace
             for value, name in ((bounded_first, "first-token"), (bounded_turn, "turn"), (bounded_exit, "exit-grace")):
                 if not MIN_LIVE_DEADLINE <= value <= MAX_LIVE_DEADLINE:
                     raise CaptureError(f"live {name} deadline is outside safe bounds")
-            launcher_path = launcher.expanduser().resolve()
-            pin = launcher_provenance(
-                launcher_path,
+            wrapper_path = wrapper.expanduser().resolve()
+            pin = wrapper_provenance(
+                wrapper_path,
                 profile=profile,
                 environment=environment,
                 cwd=workspace,
                 capture_version=True,
             )
-            binary_path = _static_underlying_path(launcher_path, launcher_path.read_text(encoding="utf-8")).resolve()
-            _check_pin(pin, launcher_path, binary_path)
+            binary_path = _static_underlying_path(wrapper_path, wrapper_path.read_text(encoding="utf-8")).resolve()
+            _check_pin(pin, wrapper_path, binary_path)
             actual_command = [
-                str(launcher_path),
+                str(wrapper_path),
                 profile,
                 "--mode",
                 "plan",
@@ -577,8 +584,8 @@ def run_capture(
                 cleanup_grace=0.5 if mode == "live" else 0.1,
             )
         finally:
-            if pin is not None and launcher_path is not None and binary_path is not None:
-                _check_pin(pin, launcher_path, binary_path)
+            if pin is not None and wrapper_path is not None and binary_path is not None:
+                _check_pin(pin, wrapper_path, binary_path)
     finally:
         for handle in handles.values():
             handle.close()
@@ -594,7 +601,7 @@ def run_capture(
         "runner_sha256": code_before["capture_runner_sha256"],
         "probe_sha256": code_before["probe_sha256"],
         "fake_fixture_sha256": code_before["fake_fixture_sha256"],
-        "wrapper_fixture_sha256": code_before["wrapper_fixture_sha256"],
+        "safe_wrapper_sha256": code_before["safe_wrapper_sha256"],
         "git_head": git_before["head"],
         "git_tree": git_before["tree"],
         "git_before": git_before,
@@ -608,17 +615,27 @@ def run_capture(
         "raw_observed_bytes": counts,
     }
     if pin is not None:
-        provenance["launcher"] = pin
+        provenance["safe_wrapper"] = pin
     manifest = capture_dir / "raw-manifest.json"
     manifest.write_text(
         json.dumps(
             {
-                "schema": "jarvis-901-agy-raw-manifest-v1",
+                "schema": RAW_MANIFEST_SCHEMA,
                 "started_at": started,
                 "mode": mode,
                 "command": _safe_command_label(mode, profile),
                 "workspace": "<WORKSPACE>",
                 "provenance": provenance,
+                "protocol_policy": {
+                    "first_event": "init",
+                    "init_identity": "nonempty",
+                    "identity": "stable",
+                },
+                "cleanup_policy": {
+                    "absolute_deadline_after_final_escalation": True,
+                    "bounded_reader_join": True,
+                    "group_survival_is_failure": True,
+                },
                 "raw": {name: artifact(path) for name, path in raw.items()},
             },
             sort_keys=True,
@@ -647,7 +664,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--profile", default="acc1")
     parser.add_argument("--prompts-file", type=Path)
     parser.add_argument("--capture-dir", type=Path)
-    parser.add_argument("--launcher", type=Path, default=APPROVED_LAUNCHER)
     parser.add_argument("--first-token-timeout", type=float)
     parser.add_argument("--turn-timeout", type=float)
     parser.add_argument("--post-result-exit-grace", type=float)
@@ -670,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             capture_dir=run_dir,
             prompts=prompts,
             profile=arguments.profile,
-            launcher=arguments.launcher,
+            wrapper=APPROVED_WRAPPER,
             first_token_timeout=arguments.first_token_timeout,
             turn_timeout=arguments.turn_timeout,
             post_result_exit_grace=arguments.post_result_exit_grace,

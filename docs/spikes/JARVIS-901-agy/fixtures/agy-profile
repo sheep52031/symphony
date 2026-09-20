@@ -28,9 +28,6 @@ mkdir -p \
 
 chmod 700 "$PROFILE" "$RUNTIME"
 
-[ -f "$REAL_HOME/.gitconfig" ] && [ ! -e "$PROFILE/.gitconfig" ] && ln -s "$REAL_HOME/.gitconfig" "$PROFILE/.gitconfig"
-[ -d "$REAL_HOME/.ssh" ] && [ ! -e "$PROFILE/.ssh" ] && ln -s "$REAL_HOME/.ssh" "$PROFILE/.ssh"
-
 export REAL_HOME
 export HOME="$PROFILE"
 export XDG_CONFIG_HOME="$PROFILE/.config"

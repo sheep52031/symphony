@@ -39,9 +39,11 @@ and stderr counts, workspace sentinel result, and whether `init.cwd` was exposed
 
 The shared probe starts a POSIX process group and closes stdin after the final accepted turn. If it does
 not exit within the configured grace, it sends bounded `SIGINT`, `SIGTERM`, then `SIGKILL`, recording
-the sequence and checking the owned group is gone. It removes known API-key/base-URL names from the
-child environment without reading their values. It does not inspect profile, keyring, settings, or
-credential stores. A raw capture may contain provider output or prompts, so it is accepted only
+the sequence and checking the owned group is gone. An unconditional absolute deadline follows the
+final escalation; at that deadline readers are stopped and joined boundedly, a surviving group is
+recorded as `process_group_empty=false` and `cleanup_failed=true`, and the run fails. It removes
+known API-key/base-URL names from the child environment without reading their values. It does not
+inspect profile, keyring, settings, or credential stores. A raw capture may contain provider output or prompts, so it is accepted only
 outside the repository or below the root [`.agy-captures/`](../../../.gitignore) ignored subtree;
 raw files have no import command and must never be force-added.
 
@@ -51,9 +53,12 @@ check equality. Schema and redaction invariants reject owner paths and the fixtu
 the deterministic tests also assert summary output has neither the temporary workspace path nor
 prompt text. The raw capture is bounded per stream (`1 MiB` default), and retained versus observed
 bytes are explicit in the summary. Provenance binds `capture_runner.py`, `probe.py`, the fake
-fixture when used, the committed wrapper fixture, the clean git HEAD/tree, and (in live mode) the host wrapper and exact absolute
-`agy` binary before and after capture. Live children receive the fixed trusted PATH
-`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`; operator PATH entries are not used.
+fixture when used, the committed safe wrapper bytes, the absolute `$REAL_HOME/.local/bin/agy`
+target hash, and the clean git HEAD/tree before and after capture. Live children receive the fixed
+trusted PATH `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`; operator PATH entries
+are not used. The committed wrapper is executed directly; no host wrapper is required or modified.
+Its profile and keyring contents remain external, and it projects no unrelated operator `.ssh` or
+`.gitconfig` configuration.
 
 ## Run the offline capture only
 
@@ -86,16 +91,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py \
   --capture-dir "$run_dir"
 ```
 
-Live mode invokes only the exact approved profile launcher selected after static wrapper inspection,
-with `--mode plan`, stream-json input/output, and a 60-second CLI print timeout; it never adds the
-dangerous permission-bypass flag. The non-secret source of that launcher is committed at
-[`fixtures/agy-profile`](fixtures/agy-profile); launch fails unless the host wrapper is byte-for-byte
-identical, mode `0700`, and has the committed SHA-256. The wrapper's `REAL_HOME` profile and keyring
-remain external and are never copied. It requires the same local Linux host: shared-SSH or remote
-launchers are unsupported because the wrapper resolves that host's home, D-Bus, keyring, and absolute
-`agy` path rather than providing remote transport. Live deadlines are explicit CLI options with
-bounded safe defaults, and are deliberately not the fixture-scale offline values. It captures
-`agy --version` from the exact underlying executable selected by the pinned wrapper before launch.
+Live mode invokes the committed reviewed safe wrapper directly with `--mode plan`, stream-json
+input/output, and a 60-second CLI print timeout; it never adds the dangerous permission-bypass flag.
+The wrapper source is committed at [`fixtures/agy-profile`](fixtures/agy-profile), and its exact
+SHA-256 is pinned. Provenance also resolves and hashes its absolute `$REAL_HOME/.local/bin/agy`
+target before launch. The wrapper's external `REAL_HOME` profile and keyring remain external and are
+never copied or projected; in particular, no unrelated operator `.ssh` or `.gitconfig` is created.
+It requires the same local Linux host: shared-SSH or remote launchers are unsupported because the
+wrapper resolves that host's home, D-Bus, keyring, and absolute `agy` path rather than providing
+remote transport. Live deadlines are explicit CLI options with bounded safe defaults, and are
+deliberately not the fixture-scale offline values. It captures `agy --version` from the exact
+underlying executable selected by the pinned wrapper before launch.
 Before manually importing any result, the owner must inspect the ignored files locally, retain only a
 reviewed redacted summary/report, and confirm that no prompt, raw envelope, path, auth material, or
 opaque identity was copied. A runner result alone does not close any native gate: the actual observed
@@ -119,10 +125,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py -
 ### Local discovery and host boundary
 
 The original native executable was Windows-hosted `agy.exe`, version `1.1.26`; it must not be
-presented as a Linux worker executable. The supplied Linux launcher is now present at
-`~/.local/bin/agy`, version `1.2.7`, with isolated slots invoked through
-`~/.local/bin/agy-profile`. This establishes a native Linux executable for feasibility,
-not a Symphony runtime: BEAM, shell, workspace, and harness must still share a supported host.
+presented as a Linux worker executable. The supplied Linux executable is present at
+`~/.local/bin/agy`, version `1.2.7`, with isolated slots selected by the committed safe wrapper.
+This establishes a native Linux executable for feasibility, not a Symphony runtime: BEAM, shell,
+workspace, and harness must still share a supported host.
 No Windows interop is Linux evidence. Remote/SSH workers have no evidence and remain unsupported.
 
 A future adapter must resolve an executable in the selected local worker environment, fail with a
@@ -133,7 +139,13 @@ check and observable child cwd; they do not prove native `agy` containment.
 ### Documented headless contract (static only)
 
 - `-p` is one-shot headless mode. `--output-format json` returns a terminal envelope; `--output-format stream-json` is NDJSON. The reference says response data belongs on stdout and diagnostics, auth, progress, and permission notices on stderr.
-- Streaming output begins with `init`, has zero or more `step_update`s, then exactly one `result`. Documented result fields are `conversation_id`, `status`, `response`, `error` on failure, `duration_seconds`, `num_turns`, and usage totals (`input_tokens`, `output_tokens`, `thinking_tokens`, `cache_read_tokens`, `total_tokens`). Agent response deltas occur in `step_update.text_delta`; the reference describes usage/turns as cumulative in a stdin session.
+- Streaming output must begin with exactly one valid `init` carrying its own nonempty
+  `conversation_id`; no step/result may precede it, duplicate init is rejected, and every later
+  identity must match. It then has zero or more `step_update`s, followed by exactly one `result` per
+  submitted turn. Documented result fields are `conversation_id`, `status`, `response`, `error` on
+  failure, `duration_seconds`, `num_turns`, and usage totals (`input_tokens`, `output_tokens`,
+  `thinking_tokens`, `cache_read_tokens`, `total_tokens`). Agent response deltas occur in
+  `step_update.text_delta`; the reference describes usage/turns as cumulative in a stdin session.
 - `--input-format stream-json --output-format stream-json` accepts one NDJSON `user` message per stdin line, holds one process/conversation for multiple turns, and yields one `result` per turn. Closing stdin ends a clean session after its active turn. `--continue` and `--conversation <id>` are documented cross-process resume mechanisms.
 - Documented terminal statuses are `SUCCESS`, `ERROR`, `CANCELED`, `INTERRUPTED`, `INVALID`, `WAITING`, and `RUNNING`. The default `--print-timeout` is five minutes; it is a print-mode ceiling, not evidence of a first-token or per-turn silence policy.
 - The documented default permission mode is request-review. In headless mode, unavailable approvals are described as soft-denied with a stderr notice; the reference does not supply a separately verified machine-readable permission-request event. `--dangerously-skip-permissions` was neither used nor considered acceptable.
@@ -155,14 +167,17 @@ lifecycle policy is inspectable:
 3. Retained events, malformed stdout, and stderr lines are capped independently. Oldest retained evidence is dropped; dropped and truncated counts are recorded in `RunResult`.
 4. A first-token deadline waits for nonempty `step_update.text_delta`; a turn deadline waits for a terminal `result`. Both are absolute from launch, so raw chatter cannot keep a worker alive.
 5. A terminal result starts a bounded post-result exit grace. A process or inherited-pipe descendant that keeps the fixture open is stopped/reaped and classified `post-result-exit`; a cancellation path remains separately classified as `cancel-exit` only if it fails to exit after its terminal result.
-6. Stderr remains diagnostics. A terminal error or `WAITING` result is retained even when the process exits nonzero or emits a permission notice. Exit without a terminal envelope is distinct process loss.
+6. Cleanup escalation has an unconditional absolute deadline. At the deadline, reader stop/join is bounded and a group that still exists is explicit failure rather than an opportunity to loop again.
+7. Stderr remains diagnostics. A terminal error or `WAITING` result is retained even when the process exits nonzero or emits a permission notice. Exit without a terminal envelope is distinct process loss.
 
 The fake-process scenarios exercise partial lines/CRLF/malformed JSON, stderr chatter,
 nonzero error, an actual stdin-driven two-turn same-session identity check, a scripted two-result
 transcript parser check, permission/input waiting, chatter and stall deadlines, post-result hang,
-cancellation race, bounded `SIGINT`/`SIGTERM`/`SIGKILL` escalation, inherited-pipe process-tree
-cleanup, process loss, high-volume bounded evidence, oversized-frame resynchronization, workspace
-cwd, and cross-host rejection. These are fixture properties, not claims about the native CLI.
+cancellation race, bounded `SIGINT`/`SIGTERM`/`SIGKILL` escalation, group-never-empty kill
+failure with an absolute deadline, inherited-pipe process-tree cleanup, process loss, high-volume
+bounded evidence, oversized-frame resynchronization, workspace cwd, and cross-host rejection. It
+also rejects adversarial pre-init step/result events, identity-less or duplicate init, and later
+identity mismatch. These are fixture properties, not claims about the native CLI.
 
 Run only the deterministic suite:
 

@@ -395,6 +395,8 @@ def run_fixture(
     input_closed = not input_lines
     stop_started_at: float | None = None
     stop_reason: str | None = None
+    cleanup_deadline: float | None = None
+    cleanup_deadline_hit = False
     escalation_stage = 0
     session_initialized = False
     session_identity: str | None = None
@@ -422,15 +424,33 @@ def run_fixture(
         except (OSError, ProcessLookupError, ProbeError):
             result.cleanup_failed = True
 
+    def stop_and_join_readers(timeout: float = 0.1) -> None:
+        stop_readers.set()
+        deadline = time.monotonic() + timeout
+        for reader in readers:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            result.cleanup_failed = True
+
     def request_stop(reason: str, initial_signal: str) -> None:
-        nonlocal stop_started_at, stop_reason
+        nonlocal stop_started_at, stop_reason, cleanup_deadline
         if stop_started_at is not None:
             return
         stop_reason = reason
         if reason in {"first-token", "turn", "write"}:
             result.timed_out = reason
         stop_started_at = time.monotonic()
+        # The final SIGKILL gets one grace interval; this absolute deadline also
+        # bounds a process group that lies about termination or a broken kill path.
+        cleanup_deadline = stop_started_at + cleanup_grace * 3
         send_named(initial_signal)
+
+    def hit_cleanup_deadline() -> None:
+        nonlocal cleanup_deadline_hit
+        cleanup_deadline_hit = True
+        result.process_group_empty = False
+        result.cleanup_failed = True
+        stop_and_join_readers()
 
     def close_input() -> None:
         nonlocal input_closed
@@ -510,6 +530,26 @@ def run_fixture(
             return
         if _bounded_append(result.events, event, max_events):
             result.dropped_events += 1
+
+        event_name = event.get("event")
+        if event_name == "init":
+            result.init_events += 1
+            if result.init_events != 1 or session_initialized:
+                result.invalid_session_events += 1
+                return
+            identity = event.get("conversation_id")
+            if not isinstance(identity, str) or not identity.strip():
+                result.invalid_session_events += 1
+                return
+            session_identity = identity
+            session_initialized = True
+            return
+
+        if not session_initialized:
+            # Do not let a pre-init step/result establish identity or terminal state.
+            result.invalid_session_events += 1
+            return
+
         step = event.get("step_update")
         payload = event.get("result")
         identities = [
@@ -521,20 +561,14 @@ def run_fixture(
             )
             if isinstance(value, str) and value
         ]
-        for identity in identities:
-            if session_identity is None:
-                session_identity = identity
-            elif identity != session_identity:
-                result.invalid_session_events += 1
+        identity_valid = bool(identities) and all(identity == session_identity for identity in identities)
+        if event_name in {"step_update", "result"} and not identity_valid:
+            result.invalid_session_events += 1
+            if event_name == "result" and payload is not None:
+                result.invalid_terminal_results += 1
+            return
         if isinstance(step, dict) and isinstance(step.get("text_delta"), str) and step["text_delta"]:
             first_token_seen = True
-        if event.get("event") == "init":
-            result.init_events += 1
-            if result.init_events != 1 or not session_identity:
-                result.invalid_session_events += 1
-            else:
-                session_initialized = True
-            return
         if payload is not None:
             expected_turn = submitted_turns if input_lines else result.completed_turns + 1
             usage = (
@@ -544,10 +578,10 @@ def run_fixture(
                     previous_usage=previous_usage,
                     identity=session_identity,
                 )
-                if event.get("event") == "result" and session_initialized
+                if event_name == "result" and session_initialized
                 else None
             )
-            if usage is None:
+            if usage is None or result.invalid_session_events:
                 result.invalid_terminal_results += 1
             else:
                 result.completed_turns += 1
@@ -593,11 +627,23 @@ def run_fixture(
 
     while True:
         now = time.monotonic()
+        if cleanup_deadline is not None and now >= cleanup_deadline:
+            hit_cleanup_deadline()
+            break
         if cancel_after is not None and not result.interrupted and now - started >= cancel_after:
             result.interrupted = True
             send_named("SIGINT")
             stop_started_at = now
             stop_reason = "cancel"
+            cleanup_deadline = now + cleanup_grace * 3
+
+        if (
+            stop_started_at is None
+            and terminal_at is None
+            and process.poll() is not None
+            and tree.process_group_empty() is False
+        ):
+            request_stop("cleanup", "SIGTERM")
 
         if stop_started_at is None:
             if input_lines and result.completed_turns < submitted_turns:
@@ -625,11 +671,8 @@ def run_fixture(
         except queue.Empty:
             if process.poll() is not None and streams_closed == {"stdout", "stderr"} and tree.process_group_empty() is not False:
                 break
-            if (
-                stop_started_at is not None
-                and now - stop_started_at >= cleanup_grace * 3
-                and tree.process_group_empty() is not False
-            ):
+            if cleanup_deadline is not None and time.monotonic() >= cleanup_deadline:
+                hit_cleanup_deadline()
                 break
             continue
         if chunk is None:
@@ -642,11 +685,14 @@ def run_fixture(
 
     if process.poll() is None:
         request_stop("cleanup", "SIGTERM")
-    if tree.process_group_empty() is False:
+    if tree.process_group_empty() is False and not cleanup_deadline_hit:
         send_named("SIGKILL")
-        deadline = time.monotonic() + cleanup_grace
+        deadline = cleanup_deadline or (time.monotonic() + cleanup_grace)
         while tree.process_group_empty() is False and time.monotonic() < deadline:
             time.sleep(0.01)
+        if tree.process_group_empty() is False:
+            result.process_group_empty = False
+            result.cleanup_failed = True
     try:
         result.returncode = process.wait(timeout=max(0.2, cleanup_grace))
     except subprocess.TimeoutExpired:
@@ -657,9 +703,7 @@ def run_fixture(
         except (OSError, subprocess.TimeoutExpired):
             result.returncode = None
     close_input()
-    stop_readers.set()
-    for reader in readers:
-        reader.join(timeout=0.1)
+    stop_and_join_readers()
     if not any(reader.is_alive() for reader in readers):
         for stream in (process.stdout, process.stderr):
             try:
@@ -672,7 +716,8 @@ def run_fixture(
         result.process_loss = result.timed_out is None
     elif not result.expected_turns and result.completed_turns == 0 and result.timed_out is None:
         result.process_loss = True
-    result.process_group_empty = tree.process_group_empty()
+    if not cleanup_deadline_hit:
+        result.process_group_empty = tree.process_group_empty()
     if result.process_group_empty is False:
         result.cleanup_failed = True
     if result.process_loss and result.exit_outcome is None:

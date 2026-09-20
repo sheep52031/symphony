@@ -18,8 +18,10 @@ from capture_runner import (
     _summary,
     capture_exit_code,
     fake_prompts,
+    APPROVED_AGY_TARGET,
     APPROVED_WRAPPER_SOURCE_SHA256,
     TRUSTED_SYSTEM_PATH,
+    _static_underlying_path,
     minimal_environment,
     redact_text,
     run_capture,
@@ -65,6 +67,10 @@ class CaptureRunnerTest(unittest.TestCase):
             self.assertEqual(summary["provenance"]["code_before"], summary["provenance"]["code_after"])
             self.assertEqual(summary["provenance"]["git_head"], summary["provenance"]["git_before"]["head"])
             self.assertEqual(summary["provenance"]["trusted_path_policy"]["value"], TRUSTED_SYSTEM_PATH)
+            manifest = json.loads((run / "raw-manifest.json").read_text())
+            self.assertEqual(manifest["schema"], "jarvis-901-agy-raw-manifest-v2")
+            self.assertEqual(manifest["protocol_policy"]["first_event"], "init")
+            self.assertTrue(manifest["cleanup_policy"]["absolute_deadline_after_final_escalation"])
             self.assertEqual(summary["raw"]["stdin"]["sha256"], hashlib.sha256(b"".join(prompts)).hexdigest())
             self.assertEqual(json.loads((run / "raw-manifest.json").read_text())["raw"]["stdin"]["bytes"], len(b"".join(prompts)))
 
@@ -77,10 +83,22 @@ class CaptureRunnerTest(unittest.TestCase):
             if os.name != "nt":
                 self.assertTrue(summary["lifecycle"]["process_group_empty"])
 
-    def test_committed_wrapper_fixture_has_approved_bytes_and_mode(self):
+    def test_committed_wrapper_fixture_has_approved_bytes_and_no_ssh_or_git_projection(self):
         fixture = SPIKE / "fixtures" / "agy-profile"
+        source = fixture.read_text(encoding="utf-8")
         self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), APPROVED_WRAPPER_SOURCE_SHA256)
-        self.assertTrue(os.stat(fixture).st_mode & 0o111)
+        if os.name != "nt":
+            self.assertTrue(os.stat(fixture).st_mode & 0o111)
+        self.assertNotIn(".gitconfig", source)
+        self.assertNotIn(".ssh", source)
+        self.assertTrue(APPROVED_AGY_TARGET.is_absolute())
+        self.assertEqual(_static_underlying_path(fixture, source), APPROVED_AGY_TARGET)
+
+    def test_live_capture_source_executes_committed_wrapper_directly(self):
+        source = (SPIKE / "capture_runner.py").read_text(encoding="utf-8")
+        self.assertIn('actual_command = [\n                str(wrapper_path),', source)
+        self.assertIn('provenance["safe_wrapper"] = pin', source)
+        self.assertNotIn("host wrapper", source)
 
     def test_workspace_and_prompt_bounds_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

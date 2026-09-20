@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -83,6 +84,43 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertTrue(result.process_group_empty)
         self.assertEqual(result.observed_bytes["stdin"], sum(map(len, prompts)))
 
+    def test_preinit_step_is_rejected_before_identity_can_be_established(self):
+        result = self.run_scenario("preinit-step")
+
+        self.assertEqual(result.init_events, 1)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_session_events, 0)
+
+    def test_preinit_result_is_rejected_before_terminal_validation(self):
+        result = self.run_scenario("preinit-result")
+
+        self.assertEqual(result.init_events, 1)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_session_events, 0)
+        self.assertGreater(result.invalid_terminal_results, 0)
+
+    def test_identityless_init_is_rejected(self):
+        result = self.run_scenario("identityless-init")
+
+        self.assertEqual(result.init_events, 1)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_session_events, 0)
+
+    def test_duplicate_init_is_rejected(self):
+        result = self.run_scenario("duplicate-init")
+
+        self.assertEqual(result.init_events, 2)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_session_events, 0)
+
+    def test_later_identity_mismatch_is_rejected(self):
+        result = self.run_scenario("identity-mismatch")
+
+        self.assertEqual(result.init_events, 1)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_session_events, 0)
+        self.assertGreater(result.invalid_terminal_results, 0)
+
     def test_malicious_earlier_user_path_helper_is_not_executed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -157,6 +195,32 @@ class AgyHeadlessProbeTest(unittest.TestCase):
             self.assertTrue(result.process_group_empty)
             with self.assertRaises(ProcessLookupError):
                 os.kill(descendant_pid, 0)
+
+    def test_cleanup_deadline_returns_on_group_never_empty_and_kill_failure(self):
+        if os.name == "nt":
+            self.skipTest("POSIX process-group deadline is covered in native WSL")
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            started = time.monotonic()
+            with patch("probe._TreeLifetime.process_group_empty", return_value=False), patch(
+                "probe._TreeLifetime.send", side_effect=ProbeError("synthetic kill failure")
+            ):
+                result = run_fixture(
+                    [sys.executable, str(FAKE), "result-then-hang"],
+                    cwd=workspace,
+                    first_token_timeout=0.2,
+                    turn_timeout=0.4,
+                    post_result_exit_grace=0.01,
+                    cleanup_grace=0.03,
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertFalse(result.process_group_empty)
+            self.assertTrue(result.cleanup_failed)
+            self.assertIsNotNone(result.pid)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(result.pid, 0)
 
     def test_ignored_signal_path_escalates_and_empties_process_group(self):
         if os.name == "nt":
