@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SPIKE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPIKE))
 
+from capture_runner import TRUSTED_SYSTEM_PATH, minimal_environment
 from probe import ProbeError, require_contained_workspace, require_same_host, run_fixture
 
 
@@ -56,6 +60,119 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertEqual(self.terminal(result)[0]["status"], "ERROR")
         self.assertEqual(result.stderr_lines, ["fixture error diagnostic"])
 
+    def test_stdin_turns_are_sequential_and_record_process_session_evidence(self):
+        if os.name == "nt":
+            self.skipTest("POSIX process-group evidence is covered in native WSL")
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            prompts = [b'{"event":"user","message":{"content":"one"}}\n', b'{"event":"user","message":{"content":"two"}}\n']
+            result = run_fixture(
+                [sys.executable, str(FAKE), "interactive-multi-turn"],
+                cwd=workspace,
+                first_token_timeout=0.2,
+                turn_timeout=0.5,
+                stdin_lines=prompts,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.expected_turns, 2)
+        self.assertEqual(result.completed_turns, 2)
+        self.assertEqual(result.signals, [])
+        self.assertTrue(result.process_group_empty)
+        self.assertEqual(result.observed_bytes["stdin"], sum(map(len, prompts)))
+
+    def test_malicious_earlier_user_path_helper_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            malicious = root / "malicious"
+            malicious.mkdir()
+            marker = root / "executed"
+            helper = malicious / "jarvis-901-path-helper"
+            helper.write_text(f"#!/bin/sh\nprintf executed > {marker}\n")
+            helper.chmod(0o700)
+            environment, _ = minimal_environment({"PATH": str(malicious) + os.pathsep + TRUSTED_SYSTEM_PATH})
+            result = run_fixture(
+                [sys.executable, str(FAKE), "path-helper"],
+                cwd=workspace,
+                first_token_timeout=0.2,
+                turn_timeout=0.4,
+                env=environment,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.terminal(result)[0]["response"], "trusted-path-not-user-helper")
+        self.assertFalse(marker.exists())
+
+    def test_child_receives_only_explicit_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENAI_API_KEY": "token",
+                    "HTTP_PROXY": "proxy",
+                    "CLOUDSDK_AUTH_TOKEN": "cloud",
+                    "LINEAR_API_KEY": "linear",
+                    "GITHUB_TOKEN": "github",
+                },
+            ):
+                environment, names = minimal_environment()
+                result = run_fixture(
+                    [sys.executable, str(FAKE), "environment"],
+                    cwd=workspace,
+                    first_token_timeout=0.2,
+                    turn_timeout=0.4,
+                    env=environment,
+                )
+
+        environment_names = json.loads(self.terminal(result)[0]["response"])
+        self.assertTrue(set(environment_names).issubset(set(names) | {"LC_CTYPE"}))
+        self.assertIn("PATH", environment_names)
+        self.assertNotIn("OPENAI_API_KEY", environment_names)
+        self.assertNotIn("HTTP_PROXY", environment_names)
+        self.assertNotIn("LINEAR_API_KEY", environment_names)
+        self.assertNotIn("GITHUB_TOKEN", environment_names)
+
+    def test_parent_exit_with_term_ignoring_same_group_descendant_is_killed(self):
+        if os.name == "nt":
+            self.skipTest("POSIX process-group evidence is covered in native WSL")
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            result = run_fixture(
+                [sys.executable, str(FAKE), "parent-exits-term-ignoring-descendant"],
+                cwd=workspace,
+                first_token_timeout=0.2,
+                turn_timeout=0.4,
+                post_result_exit_grace=0.05,
+                cleanup_grace=0.03,
+            )
+            descendant_pid = int((workspace / ".descendant.pid").read_text())
+            self.assertEqual(result.signals, ["SIGTERM", "SIGKILL"])
+            self.assertTrue(result.process_group_empty)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(descendant_pid, 0)
+
+    def test_ignored_signal_path_escalates_and_empties_process_group(self):
+        if os.name == "nt":
+            self.skipTest("POSIX signal escalation is covered in native WSL")
+        result = self.run_scenario(
+            "ignore-signals",
+            first_token_timeout=2.0,
+            turn_timeout=2.5,
+            cleanup_grace=0.03,
+        )
+
+        self.assertEqual(result.timed_out, "first-token")
+        self.assertEqual(result.signals, ["SIGTERM", "SIGKILL"])
+        self.assertTrue(result.process_group_empty)
+        self.assertFalse(result.cleanup_failed)
+
     def test_two_result_transcript_keeps_opaque_identity_and_cumulative_usage(self):
         result = self.run_scenario("two-result-transcript")
         terminals = self.terminal(result)
@@ -64,6 +181,30 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertEqual(self.session_ids(result), {"fixture-conversation-001"})
         self.assertEqual([event["num_turns"] for event in terminals], [1, 2])
         self.assertEqual(terminals[-1]["usage"]["total_tokens"], 13)
+
+    def test_duplicate_result_is_rejected(self):
+        result = self.run_scenario("duplicate-result")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.completed_turns, 1)
+        self.assertGreater(result.invalid_terminal_results, 0)
+
+    def test_out_of_order_result_is_rejected(self):
+        result = self.run_scenario("out-of-order-result")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_terminal_results, 0)
+
+    def test_non_cumulative_usage_is_rejected(self):
+        result = self.run_scenario("noncumulative-usage")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.completed_turns, 1)
+        self.assertGreater(result.invalid_terminal_results, 0)
+
+    def test_malformed_usage_is_rejected(self):
+        result = self.run_scenario("malformed-usage")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.completed_turns, 0)
+        self.assertGreater(result.invalid_terminal_results, 0)
 
     def test_waiting_result_is_a_visible_input_or_permission_outcome(self):
         result = self.run_scenario("permission-waiting")
@@ -101,7 +242,7 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertEqual(result.exit_outcome, "post-result-exit")
 
     def test_interrupt_race_retains_canceled_terminal_event_without_post_result_classification(self):
-        result = self.run_scenario("cancel-race", cancel_after=0.08, turn_timeout=0.5)
+        result = self.run_scenario("cancel-race", cancel_after=1.0, turn_timeout=2.0)
 
         self.assertTrue(result.interrupted)
         self.assertIsNone(result.timed_out)

@@ -63,6 +63,21 @@ def canceled(_signum: int, _frame: object) -> None:
 
 
 def main(scenario: str) -> int:
+    if scenario == "environment":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response=json.dumps(sorted(os.environ))))
+        return 0
+
+    if scenario == "path-helper":
+        emit(init())
+        try:
+            subprocess.run(["jarvis-901-path-helper"], check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            emit(result("SUCCESS", turns=1, response="trusted-path-not-user-helper"))
+            return 0
+        emit(result("ERROR", turns=1, error="untrusted PATH helper executed"))
+        return 3
+
     if scenario == "interactive-multi-turn":
         turns = 0
         for line in sys.stdin.buffer:
@@ -141,6 +156,32 @@ def main(scenario: str) -> int:
         emit(result("SUCCESS", turns=2, response="second"))
         return 0
 
+    if scenario == "duplicate-result":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="first"))
+        emit(result("SUCCESS", turns=1, response="duplicate"))
+        return 0
+
+    if scenario == "out-of-order-result":
+        emit(init())
+        emit(result("SUCCESS", turns=2, response="out of order"))
+        return 0
+
+    if scenario == "noncumulative-usage":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="first"))
+        lower_usage = {name: value for name, value in USAGE.items()}
+        lower_usage["input_tokens"] = 1
+        emit({"event": "result", "result": {**result("SUCCESS", turns=2)["result"], "usage": lower_usage}})
+        return 0
+
+    if scenario == "malformed-usage":
+        emit(init())
+        malformed = {name: value for name, value in USAGE.items()}
+        malformed["output_tokens"] = "two"
+        emit({"event": "result", "result": {**result("SUCCESS", turns=1)["result"], "usage": malformed}})
+        return 0
+
     if scenario == "permission-waiting":
         emit(init())
         emit(result("WAITING", turns=1, error="permission requires input"))
@@ -207,6 +248,30 @@ def main(scenario: str) -> int:
             close_fds=False,
         )
         return 0
+
+    if scenario == "parent-exits-term-ignoring-descendant":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        emit(init())
+        emit(result("SUCCESS", turns=1, response="parent exited"))
+        child = subprocess.Popen(
+            [sys.executable, __file__, "term-ignoring-descendant"],
+            cwd=Path.cwd(),
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            close_fds=False,
+        )
+        (Path.cwd() / ".descendant.pid").write_text(str(child.pid) + "\n")
+        deadline = time.monotonic() + 1.0
+        while not (Path.cwd() / ".descendant-ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return 0
+
+    if scenario == "term-ignoring-descendant":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        (Path.cwd() / ".descendant-ready").write_text("ready\n")
+        while True:
+            time.sleep(0.02)
 
     if scenario == "pipe-holder":
         while True:

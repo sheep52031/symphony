@@ -50,12 +50,20 @@ paths, and raw conversation IDs. Identities use a deterministic truncated SHA-25
 check equality. Schema and redaction invariants reject owner paths and the fixture prompt strings;
 the deterministic tests also assert summary output has neither the temporary workspace path nor
 prompt text. The raw capture is bounded per stream (`1 MiB` default), and retained versus observed
-bytes are explicit in the summary.
+bytes are explicit in the summary. Provenance binds `capture_runner.py`, `probe.py`, the fake
+fixture when used, the committed wrapper fixture, the clean git HEAD/tree, and (in live mode) the host wrapper and exact absolute
+`agy` binary before and after capture. Live children receive the fixed trusted PATH
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`; operator PATH entries are not used.
 
-Run the offline capture only:
+## Run the offline capture only
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py --mode fake
+mkdir -p .agy-captures
+run_dir="$(mktemp -d "$PWD/.agy-captures/offline-XXXXXX")"
+chmod 700 "$run_dir"
+PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py \
+  --mode fake \
+  --capture-dir "$run_dir"
 ```
 
 ### Future live command — requires fresh owner authorization
@@ -66,6 +74,7 @@ specified or checked in. The explicit authorization value is a guardrail, not a 
 required separately from `--mode live`:
 
 ```bash
+mkdir -p .agy-captures
 run_dir="$(mktemp -d "$PWD/.agy-captures/live-XXXXXX")"
 chmod 700 "$run_dir"
 # Owner creates "$run_dir/prompts.ndjson" as LF-delimited {"event":"user",...} envelopes.
@@ -74,19 +83,36 @@ PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py \
   --live-authorization JARVIS-901-OWNER-AUTHORIZED \
   --profile acc1 \
   --prompts-file "$run_dir/prompts.ndjson" \
-  --capture-dir "$run_dir/capture" \
-  --workspace "$run_dir/workspace"
+  --capture-dir "$run_dir"
 ```
 
-Live mode invokes only the supplied profile launcher with `--mode plan`, stream-json input/output,
-and a 60-second CLI print timeout; it never adds the dangerous permission-bypass flag. It performs
-only a static `agy --version` check before that invocation. Before manually importing any result,
-the owner must inspect the ignored files locally, retain only a reviewed redacted summary/report,
-and confirm that no prompt, raw envelope, path, auth material, or opaque identity was copied.
-A runner result alone does not close any native gate: the actual observed envelopes must meet the
-matrix below. Native `agy` does not document a machine-readable permission-request event, a
-process-tree listing, profile/keyring isolation signal, or proof that `--add-dir`/symlinks cannot
-escape; the runner labels only its own observable lifecycle and `init.cwd` fields.
+Live mode invokes only the exact approved profile launcher selected after static wrapper inspection,
+with `--mode plan`, stream-json input/output, and a 60-second CLI print timeout; it never adds the
+dangerous permission-bypass flag. The non-secret source of that launcher is committed at
+[`fixtures/agy-profile`](fixtures/agy-profile); launch fails unless the host wrapper is byte-for-byte
+identical, mode `0700`, and has the committed SHA-256. The wrapper's `REAL_HOME` profile and keyring
+remain external and are never copied. It requires the same local Linux host: shared-SSH or remote
+launchers are unsupported because the wrapper resolves that host's home, D-Bus, keyring, and absolute
+`agy` path rather than providing remote transport. Live deadlines are explicit CLI options with
+bounded safe defaults, and are deliberately not the fixture-scale offline values. It captures
+`agy --version` from the exact underlying executable selected by the pinned wrapper before launch.
+Before manually importing any result, the owner must inspect the ignored files locally, retain only a
+reviewed redacted summary/report, and confirm that no prompt, raw envelope, path, auth material, or
+opaque identity was copied. A runner result alone does not close any native gate: the actual observed
+envelopes must meet the matrix below. Native `agy` does not document a machine-readable permission-
+request event, a process-tree listing, profile/keyring isolation signal, or proof that
+`--add-dir`/symlinks cannot escape; the runner labels only its own observable lifecycle and `init.cwd`.
+
+The offline-equivalent parser/CLI check is the same command shape without live authorization and
+never launches `agy`; it uses the same explicit directory precondition:
+
+```bash
+mkdir -p .agy-captures
+run_dir="$(mktemp -d "$PWD/.agy-captures/offline-XXXXXX")"
+chmod 700 "$run_dir"
+PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py --mode fake \
+  --capture-dir "$run_dir"
+```
 
 ## Native protocol characterization
 
