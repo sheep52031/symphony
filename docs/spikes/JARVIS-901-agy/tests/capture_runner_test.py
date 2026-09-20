@@ -98,7 +98,7 @@ class CaptureRunnerTest(unittest.TestCase):
         source = (SPIKE / "capture_runner.py").read_text(encoding="utf-8")
         self.assertIn('actual_command = [\n                str(wrapper_path),', source)
         self.assertIn('provenance["safe_wrapper"] = pin', source)
-        self.assertNotIn("APPROVED_LAUNCHER", source)
+        self.assertNotIn("--launcher", source)
 
     def test_workspace_and_prompt_bounds_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
