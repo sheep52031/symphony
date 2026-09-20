@@ -207,22 +207,28 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path),
-        backend: Map.get(running_entry, :backend),
-        session_id: Map.get(running_entry, :session_id)
-      })
+      Config.hold_after_normal_completion?() ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; holding active issue after normal completion")
+        block_issue_from_entry(state, issue_id, running_entry, "normal completion held by agent.hold_after_normal_completion")
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          backend: Map.get(running_entry, :backend),
+          session_id: Map.get(running_entry, :session_id)
+        })
     end
   end
 
@@ -467,6 +473,10 @@ defmodule SymphonyElixir.Orchestrator do
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        release_issue_claim(state, issue.id)
+
+      !issue_identifier_allowed?(issue.identifier) ->
+        Logger.info("Blocked issue is no longer allowed: #{issue_context(issue)}; releasing block")
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -874,6 +884,7 @@ defmodule SymphonyElixir.Orchestrator do
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
+      issue_identifier_allowed?(identifier) and
       issue_routable?(issue) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
@@ -884,6 +895,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
+
+  defp issue_identifier_allowed?(identifier), do: Config.issue_identifier_allowed?(identifier)
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -963,6 +976,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    if issue_identifier_allowed?(issue.identifier) do
+      spawn_allowed_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+    else
+      Logger.warning("Skipping agent spawn; issue identifier is not allowed: #{issue_context(issue)}")
+      state
+    end
+  end
+
+  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     backend_name = Config.settings!().agent.backend
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->

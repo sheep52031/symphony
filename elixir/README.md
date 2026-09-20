@@ -146,6 +146,9 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  # Optional canary controls; omit both to preserve current scheduler behavior.
+  allowed_issue_identifiers: ["JARVIS-917"]
+  hold_after_normal_completion: true
   stall_timeout_ms: 300000
 pi:
   command: pi --mode rpc
@@ -213,6 +216,19 @@ Notes:
   only; it does not receive a tracker bridge, host handoff path, or receipt store.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.allowed_issue_identifiers` is an optional exact, case-sensitive issue-identifier allowlist.
+  When omitted, all otherwise eligible issues remain eligible exactly as before. When present it must
+  be a nonempty, unique list with no blank or whitespace-padded values; invalid configuration is
+  rejected. The scheduler checks it at candidate selection, dispatch refresh, retry/slot reacquisition,
+  and in-run continuation; AgentRunner also checks before starting a backend process.
+- `agent.hold_after_normal_completion` defaults to `false`. When `true`, a normal AgentRunner exit
+  keeps an active issue claimed and visible in the existing blocked status payload with a hold reason
+  instead of scheduling the one-second continuation retry. Failures and stalls still follow their
+  existing retry behavior; input-required exits remain blocked; routing/label revocation, non-active
+  states (including Human Review), cancellation, and terminal states release the claim. Terminal
+  states retain their existing workspace cleanup. Holds are in-memory: restarting Symphony clears
+  them, so an otherwise active allowed issue may dispatch again after restart. Roll back by removing
+  both settings (or setting `hold_after_normal_completion: false`).
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -247,6 +263,16 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+### JARVIS-917 canary capability matrix
+
+| Category | Behavior |
+| --- | --- |
+| Preserved | Unset controls retain the existing Codex-default, Pi-supported scheduler and normal one-second continuation retry. |
+| Added | Exact opt-in admission and scheduler-owned normal-completion hold, both provider-neutral. |
+| Unchanged | Failure/stall retry, input-required blocking, routing/label reconciliation, cancellation, and terminal workspace cleanup. |
+| Out of scope | Tracker bridges, callback daemons, new schedulers, receipt stores, credential/quota changes, dependency upgrades, and remote Pi. |
+| Explicitly removed | None; no backend or existing scheduling path was removed. |
 
 ### Linear adapter profile
 

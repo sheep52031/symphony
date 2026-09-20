@@ -154,6 +154,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:allowed_issue_identifiers, {:array, :string})
+      field(:hold_after_normal_completion, :boolean, default: false)
       field(:stall_timeout_ms, :integer)
     end
 
@@ -168,6 +170,8 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
+          :allowed_issue_identifiers,
+          :hold_after_normal_completion,
           :stall_timeout_ms
         ],
         empty_values: []
@@ -177,8 +181,30 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_allowed_issue_identifiers()
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+
+    defp validate_allowed_issue_identifiers(changeset) do
+      validate_change(changeset, :allowed_issue_identifiers, fn :allowed_issue_identifiers, identifiers ->
+        cond do
+          identifiers == [] ->
+            [allowed_issue_identifiers: "must contain at least one exact issue identifier when configured"]
+
+          Enum.any?(identifiers, &(not is_binary(&1) or String.trim(&1) == "")) ->
+            [allowed_issue_identifiers: "must contain only nonblank issue identifiers"]
+
+          Enum.any?(identifiers, &(String.trim(&1) != &1)) ->
+            [allowed_issue_identifiers: "identifiers must not include surrounding whitespace"]
+
+          length(identifiers) != length(Enum.uniq(identifiers)) ->
+            [allowed_issue_identifiers: "must not contain duplicate identifiers"]
+
+          true ->
+            []
+        end
+      end)
     end
   end
 

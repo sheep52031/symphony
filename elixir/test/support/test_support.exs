@@ -108,6 +108,8 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          allowed_issue_identifiers: nil,
+          hold_after_normal_completion: false,
           agent_stall_timeout_ms: nil,
           pi_command: "pi --mode rpc",
           pi_request_timeout_ms: nil,
@@ -153,6 +155,8 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    allowed_issue_identifiers = Keyword.get(config, :allowed_issue_identifiers)
+    hold_after_normal_completion = Keyword.get(config, :hold_after_normal_completion)
     agent_stall_timeout_ms = Keyword.get(config, :agent_stall_timeout_ms)
     pi_command = Keyword.get(config, :pi_command)
     pi_request_timeout_ms = Keyword.get(config, :pi_request_timeout_ms)
@@ -201,6 +205,8 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  allowed_issue_identifiers: #{yaml_value(allowed_issue_identifiers)}",
+        "  hold_after_normal_completion: #{yaml_value(hold_after_normal_completion)}",
         "  stall_timeout_ms: #{yaml_value(agent_stall_timeout_ms)}",
         "pi:",
         "  command: #{yaml_value(pi_command)}",

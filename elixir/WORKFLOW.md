@@ -32,6 +32,9 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  # Optional exact-issue canary gate; leave both unset for current behavior.
+  # allowed_issue_identifiers: ["JARVIS-917"]
+  # hold_after_normal_completion: true
 pi:
   # Base command for non-interactive bash -lc; Symphony supplies the isolation/session flags.
   command: pi --mode rpc

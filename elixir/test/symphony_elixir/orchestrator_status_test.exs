@@ -1274,6 +1274,142 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = state.blocked[issue_id]
   end
 
+  test "normal completion retains the existing continuation retry by default" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-default-continuation"
+    orchestrator_name = Module.concat(__MODULE__, :DefaultContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+    issue = %Issue{id: issue_id, identifier: "JARVIS-DEFAULT", state: "In Progress", dispatchable: true}
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        issue_id => %{
+          pid: self(),
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          session_id: "default-session",
+          started_at: DateTime.utc_now()
+        }
+      })
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    assert %{attempt: 1} = state.retry_attempts[issue_id]
+  end
+
+  test "normal completion hold keeps an active issue claimed and visible without redispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: true
+    )
+
+    issue_id = "issue-normal-hold"
+    orchestrator_name = Module.concat(__MODULE__, :NormalCompletionHoldOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      state: "In Progress",
+      url: "https://example.org/issues/JARVIS-917",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        issue_id => %{
+          pid: self(),
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          backend: "pi",
+          session_id: "pi-session",
+          started_at: DateTime.utc_now()
+        }
+      })
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    assert %{blocked: [blocked]} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert blocked.identifier == "JARVIS-917"
+    assert blocked.error == "normal completion held by agent.hold_after_normal_completion"
+    assert blocked.backend == "pi"
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert MapSet.member?(state.claimed, issue_id)
+    assert Map.has_key?(state.blocked, issue_id)
+  end
+
+  test "held issues release claims on routing, non-active, cancellation, and terminal transitions" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony"]
+    )
+
+    issue_id = "issue-held-reconciliation"
+
+    base_issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      state: "In Progress",
+      labels: ["symphony"],
+      dispatchable: true
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      blocked: %{issue_id => %{issue: base_issue, identifier: base_issue.identifier}},
+      retry_attempts: %{}
+    }
+
+    for revoked_issue <- [
+          %{base_issue | labels: []},
+          %{base_issue | state: "Human Review"},
+          %{base_issue | state: "Canceled"},
+          %{base_issue | state: "Done"}
+        ] do
+      reconciled = Orchestrator.reconcile_blocked_issue_states_for_test([revoked_issue], state)
+      refute MapSet.member?(reconciled.claimed, issue_id)
+      refute Map.has_key?(reconciled.blocked, issue_id)
+    end
+
+    assert %Orchestrator.State{blocked: blocked} = %Orchestrator.State{}
+    assert blocked == %{}
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
