@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 class ProbeError(RuntimeError):
@@ -239,6 +239,8 @@ def run_fixture(
     max_events: int = 64,
     max_malformed_stdout: int = 32,
     max_stderr_lines: int = 32,
+    stdin_lines: Sequence[bytes] = (),
+    raw_sink: Callable[[str, bytes], None] | None = None,
 ) -> RunResult:
     """Run a fake headless process with bounded framing and absolute lifecycle deadlines.
 
@@ -267,7 +269,7 @@ def run_fixture(
     process = subprocess.Popen(
         list(command),
         cwd=cwd,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin_lines else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         **process_kwargs,
@@ -295,6 +297,8 @@ def run_fixture(
     def read_stream(name: str, stream: Any) -> None:
         try:
             while not stop_readers.is_set() and (chunk := stream.read1(read_chunk_bytes)):
+                if raw_sink is not None:
+                    raw_sink(name, chunk)
                 enqueue(name, chunk)
         except (OSError, ValueError):
             pass
@@ -307,6 +311,14 @@ def run_fixture(
     ]
     for reader in readers:
         reader.start()
+    if stdin_lines:
+        assert process.stdin is not None
+        for line in stdin_lines:
+            if raw_sink is not None:
+                raw_sink("stdin", line)
+            process.stdin.write(line)
+            process.stdin.flush()
+        process.stdin.close()
 
     result = RunResult()
     buffers = {"stdout": bytearray(), "stderr": bytearray()}

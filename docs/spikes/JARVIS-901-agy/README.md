@@ -29,15 +29,15 @@ auth material, settings-file content, raw envelope, or live prompt is committed.
 
 ## Reproducible Linux capture runner (offline by default)
 
-[`capture_runner.py`](capture_runner.py) is a checked-in native-Linux capture helper, not an
+[`capture_runner.py`](capture_runner.py) is a checked-in native-Linux provenance layer, not an
 adapter. Its default `fake` mode runs only `fixtures/fake_agy.py`; it does not discover, launch, or
-contact `agy`. Each bounded capture writes ignored local files for raw stdin/stdout/stderr envelope
-bytes (base64-wrapped JSONL with UTC capture timestamps), an exact-command/version raw manifest,
-and a redacted summary. The summary records sanitized argv and version, timestamps, root PID/process group, every escalation signal,
+contact `agy`. It delegates framing, bounded queues/frames/evidence retention, and process-tree
+cleanup to [`probe.py`](probe.py). Each bounded capture writes ignored exact raw stdin/stdout/stderr
+bytes, a manifest with per-artifact SHA-256/size, and a redacted summary bound to that manifest. The summary records sanitized argv and version, timestamps, root PID/process group, every escalation signal,
 process-group-empty outcome, return status, terminal statuses, hashed session identities, malformed
 and stderr counts, workspace sentinel result, and whether `init.cwd` was exposed.
 
-The runner starts a POSIX process group and closes stdin after the final accepted turn. If it does
+The shared probe starts a POSIX process group and closes stdin after the final accepted turn. If it does
 not exit within the configured grace, it sends bounded `SIGINT`, `SIGTERM`, then `SIGKILL`, recording
 the sequence and checking the owned group is gone. It removes known API-key/base-URL names from the
 child environment without reading their values. It does not inspect profile, keyring, settings, or
