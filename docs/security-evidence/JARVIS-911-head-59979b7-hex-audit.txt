@@ -1,0 +1,12 @@
+JARVIS-911 durable Hex audit evidence
+
+UTC timestamp: 2026-09-20T07:14:42Z
+Source commit: 59979b7b03b7f953709f2e01c404879b98cc6008
+Source tree: 2aa67bb98a606cedbfa2f31e58b9b2b75a874c77
+Source checkout: exact PR head worktree (path intentionally redacted)
+Command: mise --quiet exec -- mix hex.audit
+Tool versions: Mix 1.19.5 (compiled with Erlang/OTP 28); Hex v2.5.1; mise 2026.9.5 linux-x64
+Exit status: 0
+
+Exact mix hex.audit output:
+No retired or security advisory packages found
