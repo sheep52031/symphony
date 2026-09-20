@@ -63,6 +63,11 @@ def canceled(_signum: int, _frame: object) -> None:
 
 
 def main(scenario: str) -> int:
+    if scenario == "environment":
+        emit(init())
+        emit(result("SUCCESS", turns=1, response=json.dumps(sorted(os.environ))) )
+        return 0
+
     if scenario == "interactive-multi-turn":
         turns = 0
         for line in sys.stdin.buffer:

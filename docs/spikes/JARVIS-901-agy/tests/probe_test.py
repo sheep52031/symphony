@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SPIKE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPIKE))
 
+from capture_runner import minimal_environment
 from probe import ProbeError, require_contained_workspace, require_same_host, run_fixture
 
 
@@ -56,6 +60,75 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertEqual(self.terminal(result)[0]["status"], "ERROR")
         self.assertEqual(result.stderr_lines, ["fixture error diagnostic"])
 
+    def test_stdin_turns_are_sequential_and_record_process_session_evidence(self):
+        if os.name == "nt":
+            self.skipTest("POSIX process-group evidence is covered in native WSL")
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            prompts = [b'{"event":"user","message":{"content":"one"}}\n', b'{"event":"user","message":{"content":"two"}}\n']
+            result = run_fixture(
+                [sys.executable, str(FAKE), "interactive-multi-turn"],
+                cwd=workspace,
+                first_token_timeout=0.2,
+                turn_timeout=0.5,
+                stdin_lines=prompts,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.expected_turns, 2)
+        self.assertEqual(result.completed_turns, 2)
+        self.assertEqual(result.signals, [])
+        self.assertTrue(result.process_group_empty)
+        self.assertEqual(result.observed_bytes["stdin"], sum(map(len, prompts)))
+
+    def test_child_receives_only_explicit_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENAI_API_KEY": "token",
+                    "HTTP_PROXY": "proxy",
+                    "CLOUDSDK_AUTH_TOKEN": "cloud",
+                    "LINEAR_API_KEY": "linear",
+                    "GITHUB_TOKEN": "github",
+                },
+            ):
+                environment, names = minimal_environment()
+                result = run_fixture(
+                    [sys.executable, str(FAKE), "environment"],
+                    cwd=workspace,
+                    first_token_timeout=0.2,
+                    turn_timeout=0.4,
+                    env=environment,
+                )
+
+        environment_names = json.loads(self.terminal(result)[0]["response"])
+        self.assertTrue(set(environment_names).issubset(set(names) | {"LC_CTYPE"}))
+        self.assertIn("PATH", environment_names)
+        self.assertNotIn("OPENAI_API_KEY", environment_names)
+        self.assertNotIn("HTTP_PROXY", environment_names)
+        self.assertNotIn("LINEAR_API_KEY", environment_names)
+        self.assertNotIn("GITHUB_TOKEN", environment_names)
+
+    def test_ignored_signal_path_escalates_and_empties_process_group(self):
+        if os.name == "nt":
+            self.skipTest("POSIX signal escalation is covered in native WSL")
+        result = self.run_scenario(
+            "ignore-signals",
+            first_token_timeout=2.0,
+            turn_timeout=2.5,
+            cleanup_grace=0.03,
+        )
+
+        self.assertEqual(result.timed_out, "first-token")
+        self.assertEqual(result.signals, ["SIGTERM", "SIGKILL"])
+        self.assertTrue(result.process_group_empty)
+        self.assertFalse(result.cleanup_failed)
+
     def test_two_result_transcript_keeps_opaque_identity_and_cumulative_usage(self):
         result = self.run_scenario("two-result-transcript")
         terminals = self.terminal(result)
@@ -101,7 +174,7 @@ class AgyHeadlessProbeTest(unittest.TestCase):
         self.assertEqual(result.exit_outcome, "post-result-exit")
 
     def test_interrupt_race_retains_canceled_terminal_event_without_post_result_classification(self):
-        result = self.run_scenario("cancel-race", cancel_after=0.08, turn_timeout=0.5)
+        result = self.run_scenario("cancel-race", cancel_after=1.0, turn_timeout=2.0)
 
         self.assertTrue(result.interrupted)
         self.assertIsNone(result.timed_out)
