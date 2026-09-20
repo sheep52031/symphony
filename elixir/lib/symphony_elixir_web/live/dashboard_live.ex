@@ -98,6 +98,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Held</p>
+            <p class="metric-value numeric"><%= @payload.counts.held %></p>
+            <p class="metric-detail">Issues held by configured scheduler policy.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -279,6 +285,51 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td><%= entry.error || "n/a" %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Held issues</h2>
+              <p class="section-copy">Issues held by configured scheduler policy.</p>
+            </div>
+          </div>
+
+          <%= if @payload.held == [] do %>
+            <p class="empty-state">No held issues.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 680px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Disposition</th>
+                    <th>Reason</th>
+                    <th>Held at</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.held}>
+                    <td>
+                      <div class="issue-stack">
+                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.state || "Held")}>
+                        <%= entry.state || "Held" %>
+                      </span>
+                    </td>
+                    <td><%= entry.disposition %></td>
+                    <td><%= entry.reason || "n/a" %></td>
+                    <td class="mono"><%= entry.blocked_at || "n/a" %></td>
                   </tr>
                 </tbody>
               </table>

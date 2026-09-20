@@ -11,17 +11,21 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        blocked_entries = Map.get(snapshot, :blocked, [])
+        {held_entries, input_required_entries} = Enum.split_with(blocked_entries, &held_entry?/1)
+
         %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: Enum.count(Map.get(snapshot, :blocked, []), &(not held_entry?(&1))),
-            held: Enum.count(Map.get(snapshot, :blocked, []), &held_entry?/1)
+            blocked: length(input_required_entries),
+            held: length(held_entries)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
-          blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          blocked: Enum.map(input_required_entries, &blocked_entry_payload/1),
+          held: Enum.map(held_entries, &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -64,14 +68,16 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked_or_held) do
+    {blocked, held} = split_blocked_and_held(blocked_or_held)
+
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked),
-      status: issue_status(running, retry, blocked),
+      issue_id: issue_id_from_entries(running, retry, blocked_or_held),
+      status: issue_status(running, retry, blocked_or_held),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, blocked),
-        host: workspace_host(running, retry, blocked)
+        path: workspace_path(issue_identifier, running, retry, blocked_or_held),
+        host: workspace_host(running, retry, blocked_or_held)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -79,19 +85,30 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
-      blocked: blocked && blocked_issue_payload(blocked),
       logs: %{
         codex_session_logs: []
       },
-      recent_events: recent_events_payload(running || blocked),
-      last_error: (blocked && Map.get(blocked, :error)) || (retry && retry.error),
-      hold_reason: blocked && Map.get(blocked, :reason),
+      recent_events: recent_events_payload(running || blocked_or_held),
       tracked: %{}
+    }
+    |> Map.merge(blocked_status_payload(blocked, held, retry))
+  end
+
+  defp blocked_status_payload(blocked, held, retry) do
+    %{
+      blocked: blocked && blocked_issue_payload(blocked),
+      held: held && blocked_issue_payload(held),
+      last_error: (blocked && Map.get(blocked, :error)) || (retry && retry.error),
+      hold_reason: held && Map.get(held, :reason)
     }
   end
 
   defp issue_id_from_entries(running, retry, blocked),
     do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
+
+  defp split_blocked_and_held(entry) do
+    if held_entry?(entry), do: {nil, entry}, else: {entry, nil}
+  end
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0

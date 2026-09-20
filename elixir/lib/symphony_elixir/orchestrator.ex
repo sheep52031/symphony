@@ -1867,7 +1867,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.reduce(state, fn {issue_id, blocked_entry}, state_acc ->
       if hold_released_by_config?(state_acc, issue_id, blocked_entry) do
         Logger.info("Releasing hold after config change: issue_id=#{issue_id}")
-        release_issue_claim(state_acc, issue_id)
+        release_config_hold(state_acc, issue_id)
       else
         state_acc
       end
@@ -1883,6 +1883,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp hold_released_by_config?(_state, _issue_id, _blocked_entry), do: false
+
+  defp release_config_hold(%State{} = state, issue_id) do
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        blocked: Map.delete(state.blocked, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states)

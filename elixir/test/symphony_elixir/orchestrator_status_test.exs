@@ -1369,7 +1369,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     presentation = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 1_000)
     assert presentation.counts.held == 1
     assert presentation.counts.blocked == 0
-    assert [presented_hold] = presentation.blocked
+    assert presentation.blocked == []
+    assert [presented_hold] = presentation.held
     assert presented_hold.disposition == :normal_completion_hold
     assert presented_hold.reason == blocked.reason
 
@@ -1613,7 +1614,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert reconciled.attempts == %{}
   end
 
-  test "config rollback releases only normal and increased-budget holds" do
+  test "config hold release preserves attempts and permits only a raised budget's additional attempt" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       hold_after_normal_completion: true,
@@ -1625,21 +1626,44 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
     on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
 
-    issue = %Issue{id: issue_id, identifier: "JARVIS-917", state: "In Progress", dispatchable: true}
-    attempt_issue = %{issue | id: "attempt-limit"}
+    issue = %Issue{
+      id: issue_id,
+      identifier: "JARVIS-917",
+      title: "Config rollback attempt budget",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
     state = :sys.get_state(pid)
 
     :sys.replace_state(pid, fn _ ->
       %{
         state
-        | attempts: %{issue_id => 1, attempt_issue.id => 1},
-          claimed: MapSet.new([issue_id, attempt_issue.id]),
+        | attempts: %{issue_id => 1},
+          claimed: MapSet.new([issue_id]),
           blocked: %{
-            issue_id => %{issue: issue, identifier: issue.identifier, disposition: :normal_completion_hold},
-            attempt_issue.id => %{issue: attempt_issue, identifier: attempt_issue.identifier, disposition: :attempt_limit_hold}
+            issue_id => %{issue: issue, identifier: issue.identifier, disposition: :normal_completion_hold}
           }
       }
     end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      hold_after_normal_completion: false,
+      max_attempts_per_issue: 1
+    )
+
+    assert %{blocked: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    released = :sys.get_state(pid)
+    assert released.attempts[issue_id] == 1
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    reheld = :sys.get_state(pid)
+    assert reheld.running == %{}
+    assert reheld.attempts[issue_id] == 1
+    assert reheld.blocked[issue_id].disposition == :attempt_limit_hold
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1648,9 +1672,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     )
 
     assert %{blocked: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
-    refreshed = :sys.get_state(pid)
-    assert refreshed.claimed == MapSet.new()
-    assert refreshed.attempts == %{}
+    increased = :sys.get_state(pid)
+    assert increased.attempts[issue_id] == 1
+
+    assert {:ok, after_second_start} = Orchestrator.reserve_issue_attempt_for_test(issue, increased)
+    assert after_second_start.attempts[issue_id] == 2
+    assert {:exhausted, exhausted} = Orchestrator.reserve_issue_attempt_for_test(issue, after_second_start)
+    assert exhausted.attempts[issue_id] == 2
   end
 
   test "explicit Human Review terminal state cleans held workspace and releases its claim" do

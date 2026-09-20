@@ -238,8 +238,10 @@ Notes:
   states, and cancellation release claims. Human Review is non-terminal unless a workflow explicitly
   includes it in `tracker.terminal_states`; when explicitly terminal, its held workspace is cleaned up.
   Reducing neither setting releases holds; removing the normal-completion hold or removing/increasing
-  the attempt budget releases only the affected holds. Holds and counters are in-memory: a fresh runtime
-  resets both and requires fresh owner authorization before reuse. Roll back by removing the controls
+  the attempt budget releases only the affected holds while preserving their consumed attempt counters.
+  Therefore disabling normal holds with a limit of `1` re-holds an active issue at the attempt limit,
+  while raising `1` to `2` permits exactly one additional session. Holds and counters are in-memory: a
+  fresh runtime resets both and requires fresh owner authorization before reuse. Roll back by removing the controls
   (or setting `hold_after_normal_completion: false`); no durable store is created.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
