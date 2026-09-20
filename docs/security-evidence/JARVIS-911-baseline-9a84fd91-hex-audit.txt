@@ -1,0 +1,18 @@
+JARVIS-911 durable Hex audit evidence
+
+UTC timestamp: 2026-09-20T07:14:29Z
+Source commit: 9a84fd91e8051f7c9268ea98dea80b2327b620f7
+Source tree: 18db67c1aa0f9dd454aec7690287fb115486e6cc
+Source checkout: detached exact baseline worktree (path intentionally redacted)
+Command: mise --quiet exec -- mix hex.audit
+Tool versions: Mix 1.19.5 (compiled with Erlang/OTP 28); Hex v2.5.1; mise 2026.9.5 linux-x64
+Exit status: 1
+
+Exact mix hex.audit output:
+Advisories:
+  mint 1.10.0 - EEF-CVE-2026-82672 (MEDIUM)
+    aka: CVE-2026-82672, GHSA-rj5m-69wp-cxq9
+    Unvalidated chunk-size line tail in Mint HTTP/1 client enables response smuggling against strict intermediaries on pooled connections
+    https://osv.dev/vulnerability/EEF-CVE-2026-82672
+
+Found packages with security advisories
