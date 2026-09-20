@@ -26,11 +26,13 @@ The baseline is commit `9a84fd91e8051f7c9268ea98dea80b2327b620f7`, tree
 Mint `1.10.0`, **MEDIUM**, `EEF-CVE-2026-82672` / `CVE-2026-82672` /
 `GHSA-rj5m-69wp-cxq9`, fixed in `1.10.1`. The audited dependency-change head is
 commit `59979b7b03b7f953709f2e01c404879b98cc6008`, tree
-`2aa67bb98a606cedbfa2f31e58b9b2b75a874c77`; its exact audit is clean. The current
-documentation head is commit `798386fae31597f9ca7952822de5c6bff625914b`, tree
-`2caad71a3e94d942eceb0c64d01813242d427c11`. Both heads share the exact
-`elixir/mix.lock` blob `344d6760961d826665f4466c4760fbfdd8df1201`; this follow-up
-only changes documentation, so no audit rerun is needed.
+`2aa67bb98a606cedbfa2f31e58b9b2b75a874c77`; its exact audit is clean. The
+evidence-introduction documentation commit is
+`798386fae31597f9ca7952822de5c6bff625914b`, tree
+`2caad71a3e94d942eceb0c64d01813242d427c11`. The audited dependency-change and
+subsequent documentation-only commits share the exact `elixir/mix.lock` blob
+`344d6760961d826665f4466c4760fbfdd8df1201`, so documentation corrections do not
+require an audit rerun.
 
 ## Historical fixed inventory
 
@@ -94,7 +96,7 @@ redacted inside the evidence files.
 Evidence SHA-256 values are recorded here after the files are finalized:
 
 - `JARVIS-911-baseline-9a84fd91-hex-audit.txt`: `24f64bb37fedb0c628e2efe91fc22fb1f1c346b8dbf2f2e1d28992c076256126`
-- `JARVIS-911-audited-dependency-change-head-59979b7-hex-audit.txt`: `8fd95a05dfeaf585650548f0a2757be04118bb008e69e1f63add283f79922e69`
+- `JARVIS-911-audited-dependency-change-head-59979b7-hex-audit.txt`: `5215e5e7359fc2ca2a5a2b4ccc4d63df59208c98953b88c6b70f39416705e809`
 
 ## Primary metadata and citations
 
