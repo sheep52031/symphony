@@ -3,7 +3,11 @@ JARVIS-911 durable Hex audit evidence
 UTC timestamp: 2026-09-20T07:14:42Z
 Source commit: 59979b7b03b7f953709f2e01c404879b98cc6008
 Source tree: 2aa67bb98a606cedbfa2f31e58b9b2b75a874c77
-Source checkout: exact PR head worktree (path intentionally redacted)
+Source checkout: exact audited dependency-change head worktree (path intentionally redacted)
+Current documentation head: 798386fae31597f9ca7952822de5c6bff625914b
+Current documentation tree: 2caad71a3e94d942eceb0c64d01813242d427c11
+Shared elixir/mix.lock blob: 344d6760961d826665f4466c4760fbfdd8df1201
+Audit rerun after documentation-only follow-up: not needed; the lock blob is unchanged.
 Command: mise --quiet exec -- mix hex.audit
 Tool versions: Mix 1.19.5 (compiled with Erlang/OTP 28); Hex v2.5.1; mise 2026.9.5 linux-x64
 Exit status: 0

@@ -10,7 +10,7 @@ the same row, not counted twice.
 The historical intake pins are the versions in the `openai/symphony` `main` lock at
 `be10a1b79df723d6d7612b5651c8522704dafb2e`:
 
-| Package | Historical intake pin | Exact owner-fork baseline pin | Exact PR-head pin |
+| Package | Historical intake pin | Exact owner-fork baseline pin | Exact audited dependency-change head pin |
 | --- | ---: | ---: | ---: |
 | Bandit | `1.10.3` | `1.12.5` | `1.12.5` |
 | Decimal | `2.3.0` | `3.1.1` | `3.1.1` |
@@ -24,16 +24,20 @@ The historical intake pins are the versions in the `openai/symphony` `main` lock
 The baseline is commit `9a84fd91e8051f7c9268ea98dea80b2327b620f7`, tree
 `18db67c1aa0f9dd454aec7690287fb115486e6cc`. Its exact audit has one active finding:
 Mint `1.10.0`, **MEDIUM**, `EEF-CVE-2026-82672` / `CVE-2026-82672` /
-`GHSA-rj5m-69wp-cxq9`, fixed in `1.10.1`. The PR head is commit
-`59979b7b03b7f953709f2e01c404879b98cc6008`, tree
-`2aa67bb98a606cedbfa2f31e58b9b2b75a874c77`; its exact audit is clean.
+`GHSA-rj5m-69wp-cxq9`, fixed in `1.10.1`. The audited dependency-change head is
+commit `59979b7b03b7f953709f2e01c404879b98cc6008`, tree
+`2aa67bb98a606cedbfa2f31e58b9b2b75a874c77`; its exact audit is clean. The current
+documentation head is commit `798386fae31597f9ca7952822de5c6bff625914b`, tree
+`2caad71a3e94d942eceb0c64d01813242d427c11`. Both heads share the exact
+`elixir/mix.lock` blob `344d6760961d826665f4466c4760fbfdd8df1201`; this follow-up
+only changes documentation, so no audit rerun is needed.
 
 ## Historical fixed inventory
 
 Every row below is explicit about the historical affected pin, fixed release, current
 status, reachability, upstream comparison, action, and recheck condition. “Upstream
 status” refers to the `openai/symphony` lock at the commit above; “current graph”
-refers to the owner-fork PR head.
+refers to the owner-fork audited dependency-change head.
 
 | Package | Advisory ID(s) | Severity | Affected / historical pin | Fixed version | Current status | Reachability in Symphony | Upstream status | Action | Recheck condition | Direct citation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -58,7 +62,7 @@ refers to the owner-fork PR head.
 | Mint | `GHSA-x3x7-96vm-6h2w` / `EEF-CVE-2026-59249` / `CVE-2026-59249` | MEDIUM | `1.7.1` (`>=0.1.0,<1.9.3`) | `1.9.3` | Fixed before baseline; baseline `1.10.0` and head `1.10.1` are fixed | Outbound Mint HTTP/1 chunk-size parsing via Finch/Req | Upstream `1.7.1` remains affected | Retain the current fixed pins | Re-audit on Mint/Finch/Req change | [OSV](https://osv.dev/vulnerability/EEF-CVE-2026-59249) |
 | Mint | `GHSA-g83f-2j6r-q6m4` / `EEF-CVE-2026-82728` / `CVE-2026-82728` | HIGH | `1.7.1` (`>=0.1.0,<1.10.0`) | `1.10.0` | Fixed before baseline; baseline `1.10.0` and head `1.10.1` are fixed | Outbound Mint HTTP/1 status-line and chunk-extension buffering via Finch/Req | Upstream `1.7.1` remains affected | Retain the current fixed pins | Re-audit on Mint/Finch/Req change | [OSV](https://osv.dev/vulnerability/EEF-CVE-2026-82728) |
 | Phoenix | `GHSA-6983-jfq8-485w` / `EEF-CVE-2026-56811` / `CVE-2026-56811` | HIGH | `1.8.4` (`>=1.8.0-rc.0,<1.8.9`) | `1.8.9` | Fixed; current `1.8.14` | Dashboard Phoenix transports if LongPoll/WebSocket is exposed | Upstream `1.8.4` remains affected | Retain `1.8.14`; no runtime change | Re-audit when Phoenix or transport exposure changes | [GitHub Advisory](https://github.com/advisories/GHSA-6983-jfq8-485w) |
-| Phoenix | `GHSA-628h-q48j-jr6q` / `CVE-2026-32689` | HIGH | `1.8.4` (`>=1.8.0,<1.8.6`) | `1.8.6` | Fixed; current `1.8.14` | Dashboard LongPoll NDJSON handling | Upstream `1.8.4` remains affected | Retain `1.8.14`; no runtime change | Re-audit when Phoenix or transport exposure changes | [GitHub Advisory](https://github.com/advisories/GHSA-628h-q48j-jr6q) |
+| Phoenix | `GHSA-628h-q48j-jr6q` / `EEF-CVE-2026-32689` / `CVE-2026-32689` | HIGH | `1.8.4` (`>=1.8.0,<1.8.6`) | `1.8.6` | Fixed; current `1.8.14` | Dashboard LongPoll NDJSON handling | Upstream `1.8.4` remains affected | Retain `1.8.14`; no runtime change | Re-audit when Phoenix or transport exposure changes | [GitHub Advisory](https://github.com/advisories/GHSA-628h-q48j-jr6q) |
 | Phoenix | `GHSA-63mc-hw7g-86rr` / `EEF-CVE-2026-56812` / `CVE-2026-56812` | MEDIUM | `1.8.4` (`>=1.8.0-rc.0,<1.8.9`) | `1.8.9` | Fixed; current `1.8.14` | Phoenix JavaScript presence-key handling; Symphony does not use presence state | Upstream `1.8.4` remains affected | Retain `1.8.14`; no runtime change | Re-audit when Phoenix or dashboard client behavior changes | [GitHub Advisory](https://github.com/advisories/GHSA-63mc-hw7g-86rr) |
 | Phoenix LiveView | `EEF-CVE-2026-64941` / `GHSA-36m4-rm57-3prf` | LOW | `1.1.25` (`>=1.1.0-rc.0,<1.1.33`) | `1.1.33` | Fixed; current `1.1.33` | Dashboard links; requires attacker-controlled navigation target | Upstream `1.1.25` remains affected | Retain `1.1.33`; no runtime change | Re-audit when LiveView or user-controlled links change | [OSV](https://osv.dev/vulnerability/EEF-CVE-2026-64941) |
 | Plug | `GHSA-468c-vq7p-gh64` / `EEF-CVE-2026-8468` / `CVE-2026-8468` | HIGH | `1.19.1` (`>=1.19.0,<1.19.2`) | `1.19.2` | Fixed; current `1.20.3` | Inbound multipart header parsing | Upstream `1.19.1` remains affected | Retain `1.20.3`; no runtime change | Re-audit when Plug, Bandit, or Phoenix changes | [GitHub Advisory](https://github.com/advisories/GHSA-468c-vq7p-gh64) |
@@ -72,24 +76,25 @@ refers to the owner-fork PR head.
 
 | Package | Advisory ID(s) | Severity | Affected / baseline pin | Fixed version | Current status | Reachability in Symphony | Upstream status | Action | Recheck condition | Direct citation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Mint | `EEF-CVE-2026-82672` / `CVE-2026-82672` / `GHSA-rj5m-69wp-cxq9` | MEDIUM | `1.10.0` (`>=0.1.0,<1.10.1`) | `1.10.1` | **Baseline-active; fixed at PR head `1.10.1`** | Req/Finch outbound HTTP; a malicious upstream response can reach pooled HTTP/1 parsing | Upstream `1.7.1` remains affected; no upstream lock fix | **Lock-only upgrade `1.10.0` → `1.10.1`**; no declaration or runtime change | Re-run `mix hex.audit` for every dependency update and when upstream adopts a newer Mint pin | [OSV](https://osv.dev/vulnerability/EEF-CVE-2026-82672) |
+| Mint | `EEF-CVE-2026-82672` / `CVE-2026-82672` / `GHSA-rj5m-69wp-cxq9` | MEDIUM | `1.10.0` (`>=0.1.0,<1.10.1`) | `1.10.1` | **Baseline-active; fixed at audited dependency-change head `1.10.1`** | Req/Finch outbound HTTP; a malicious upstream response can reach pooled HTTP/1 parsing | Upstream `1.7.1` remains affected; no upstream lock fix | **Lock-only upgrade `1.10.0` → `1.10.1`**; no declaration or runtime change | Re-run `mix hex.audit` for every dependency update and when upstream adopts a newer Mint pin | [OSV](https://osv.dev/vulnerability/EEF-CVE-2026-82672) |
 
 ## Durable exact audit evidence
 
 The command was run in native WSL from the exact detached baseline worktree and exact
-PR-head worktree. The checked-in files contain the source commit/tree, UTC timestamp,
+audited dependency-change head worktree. The checked-in files contain the source
+commit/tree, UTC timestamp,
 exit status, tool versions, and unmodified command output. Paths are deliberately
 redacted inside the evidence files.
 
 - Baseline `9a84fd91` (expected finding, exit `1`):
   [`docs/security-evidence/JARVIS-911-baseline-9a84fd91-hex-audit.txt`](security-evidence/JARVIS-911-baseline-9a84fd91-hex-audit.txt)
-- PR head `59979b7` (clean, exit `0`):
-  [`docs/security-evidence/JARVIS-911-head-59979b7-hex-audit.txt`](security-evidence/JARVIS-911-head-59979b7-hex-audit.txt)
+- Audited dependency-change head `59979b7` (clean, exit `0`):
+  [`docs/security-evidence/JARVIS-911-audited-dependency-change-head-59979b7-hex-audit.txt`](security-evidence/JARVIS-911-audited-dependency-change-head-59979b7-hex-audit.txt)
 
 Evidence SHA-256 values are recorded here after the files are finalized:
 
 - `JARVIS-911-baseline-9a84fd91-hex-audit.txt`: `24f64bb37fedb0c628e2efe91fc22fb1f1c346b8dbf2f2e1d28992c076256126`
-- `JARVIS-911-head-59979b7-hex-audit.txt`: `5e51dbd22c11a1255d38e009341ee08a3b9161266bf1c7e82aedddadddcbb914`
+- `JARVIS-911-audited-dependency-change-head-59979b7-hex-audit.txt`: `8fd95a05dfeaf585650548f0a2757be04118bb008e69e1f63add283f79922e69`
 
 ## Primary metadata and citations
 
