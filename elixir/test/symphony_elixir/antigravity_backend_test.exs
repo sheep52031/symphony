@@ -180,10 +180,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       "/var/tmp"
     ]
 
-    canonical_aliases = %{"/bin" => "/usr/bin", "/lib" => "/usr/lib", "/lib64" => "/usr/lib", "/sbin" => "/usr/bin"}
-
     for unsafe_root <- unsafe_roots do
-      expected_root = Map.get(canonical_aliases, unsafe_root, unsafe_root)
+      assert {:ok, expected_root} = SymphonyElixir.PathSafety.canonicalize(unsafe_root)
 
       assert {:error, {:unsafe_antigravity_profile_root, ^expected_root}} =
                Launcher.build(workspace_two, agy, unsafe_root, 1_000, bubblewrap_executable: bwrap)
