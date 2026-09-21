@@ -10,10 +10,13 @@
 | Official AntiGravity install/auth reference | [`official-install-auth-reference-full.md`](official-install-auth-reference-full.md), SHA-256 `49aa5ea907061a7c0cb1a05b60fb30ee45314d5ba91d67b7658e1c495ca0e51f` | <https://antigravity.google/docs/cli/install/> |
 | Authorized native Windows capture | [`native-live-windows-2026-09-19-capture.md`](native-live-windows-2026-09-19-capture.md), SHA-256 `7081aa73a0147d10f100e62f8864beb3c097d7412c19ae9f45b13edd837bfa1c` (repository-normalized LF bytes) | local owner-authorized execution summarized in [`native-live-windows-2026-09-19.md`](native-live-windows-2026-09-19.md) |
 | Authorized native Linux follow-up | [`native-live-linux-2026-09-20.md`](native-live-linux-2026-09-20.md) | local owner-authorized native-Linux execution; only sanitized lifecycle summary is retained, with no raw live capture or digest of sensitive output |
+| Superseding native Linux acceptance | [`native-live-linux-2026-09-21.md`](native-live-linux-2026-09-21.md); reviewed aggregate [`native-live-linux-2026-09-21-summary.json`](native-live-linux-2026-09-21-summary.json), SHA-256 `180ceebf18bad14065ce304e019f3573f85668cb456d073a11b6bdae13890e38` | owner-authorized same-host Omarchy execution; exact raw envelopes remain ignored locally and are bound by hashes in the reviewed aggregate |
 
 The committed official-reference and Windows capture files make their exact reviewed content
-available even when a repository is private or a live documentation URL later changes. The Linux
-follow-up is intentionally different: it preserves only a sanitized, non-gating operator report;
-no runner, raw transcript, or digest exists, so it must not be treated as exact machine-auditable
-execution evidence. The local static captures omit executable paths, settings, credentials, and
-authentication material.
+available even when a repository is private or a live documentation URL later changes. The
+2026-09-20 Linux follow-up remains a sanitized, non-gating operator report. The superseding
+2026-09-21 acceptance used the committed capture runner for its canonical stream and retained
+ignored raw streams with recorded hashes; reviewed follow-up summaries close resume, permissions,
+lifecycle, profile separation, and the mandatory outer-containment design. The local static and
+committed reviewed records omit executable paths, settings contents, credentials, raw account
+identifiers, and authentication material.

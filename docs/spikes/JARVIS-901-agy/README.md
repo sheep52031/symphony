@@ -1,11 +1,12 @@
 # JARVIS-901 — native `agy` headless feasibility spike
 
-**Decision: native Windows functionality GO; native Linux live report non-gating; JARVIS-901
-Symphony integration HOLD.** The ephemeral Linux runner and raw envelopes were not retained, and
-the reported session stopped at its second turn. Native NDJSON framing, cwd/workspace containment,
-same-slot/cross-slot resume, permission hardening, and official cancellation remain open. This
-removable spike changes no AgentBackend mapping, runner, orchestrator, tracker, or production
-configuration.
+**Decision: native Linux feasibility GO for JARVIS-907, with mandatory outer OS containment;
+production dispatch remains gated by JARVIS-906.** A retained Omarchy capture now proves native
+NDJSON multi-turn, same-slot resume, cross-slot identity separation, permission soft denial,
+cancellation/timeout cleanup, and selected-profile operation. A negative control also proves that
+native `--sandbox` does not contain `write_to_file`; the accepted route therefore requires a
+fail-closed Bubblewrap boundary. This removable spike changes no AgentBackend mapping, runner,
+orchestrator, tracker, or production configuration.
 
 ## Scope and evidence classes
 
@@ -20,7 +21,7 @@ Windows build was exercised directly in disposable no-tool workspaces; the sanit
 | --- | --- | --- |
 | Local static observation | A native Windows `agy.exe` is discoverable on `PATH`; `agy --version` printed **`1.1.26`**. Explicit discovery in the default `Ubuntu-22.04` WSL worker distribution reported `agy: not found`. | Other WSL distributions or a usable same-host WSL launcher. |
 | Authorized native Windows observation | Account/keyring auth can list models and complete JSON inference; native stream JSON, two-turn stdin state, explicit conversation resume, cwd, usage, stderr separation, and bounded CTRL-BREAK exit were observed. | Linux parity, least-privilege permissions, `--continue`, forced process-tree cleanup, or every native failure shape. |
-| Authorized native Linux operator report | The official Linux `agy` `1.2.7` launcher and the supplied isolated profile launcher start. An ephemeral runner reported one `acc1` NDJSON result followed by a second-turn deadline, but neither runner nor raw envelopes were retained. The sanitized report is [`native-live-linux-2026-09-20.md`](evidence/native-live-linux-2026-09-20.md). | Auditable native NDJSON acceptance, canonical two-turn stdin completion, native cwd/workspace containment, same-slot resume, cross-slot fail-closed, official cancellation result, permission/input behavior, or fresh-session keyring/profile isolation. |
+| Authorized native Linux acceptance | The official Linux `agy` `1.2.7` completed retained two-turn NDJSON, same-slot context resume, cross-slot identity separation, permission denial, and bounded lifecycle checks. Native cwd and `--sandbox` alone failed an outside-write negative control; mandatory Bubblewrap mount isolation passed outside-write, symlink-escape, in-workspace-write, and hardened authenticated-inference checks. See [`native-live-linux-2026-09-21.md`](evidence/native-live-linux-2026-09-21.md). | A production Symphony dispatch, compatibility with later CLI versions, arbitrary remote hosts, or permission to omit the outer OS sandbox. |
 | Official reference | The documented JSON/NDJSON envelopes, `init`/`step_update`/`result` event names, `conversation_id`, cumulative usage fields, terminal statuses, stdin multi-turn rules, stderr split, soft permission denial, and nonzero error behavior. | A guarantee beyond the exact observed build/profile. |
 | Deterministic fixture evidence | This artifact's bounded parser/lifecycle policy handles partial bytes, LF framing with CRLF tolerance, malformed stdout, separate stderr, nonzero exit, a scripted two-result transcript, `WAITING`, no-progress chatter, first-token/turn deadlines, post-result exit grace, interrupt race, process loss, cwd containment, and host mismatch. | Native behavior not listed in the authorized observation. The child is explicitly fake and never invokes `agy` or a provider. |
 
@@ -73,10 +74,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 docs/spikes/JARVIS-901-agy/capture_runner.py \
 
 ### Future live command — requires fresh owner authorization
 
-**Do not execute this command under this task.** A future owner-authorized run must create a new
-ignored directory and owner-reviewed `prompts.ndjson` locally; prompt text is intentionally not
-specified or checked in. The explicit authorization value is a guardrail, not a credential and is
-required separately from `--mode live`:
+The accepted 2026-09-21 capture used this command shape. Any rerun still requires fresh owner
+authorization, a new ignored directory, and owner-reviewed `prompts.ndjson`; prompt text is
+intentionally not specified or checked in. The explicit authorization value is a guardrail, not a
+credential and is required separately from `--mode live`:
 
 ```bash
 mkdir -p .agy-captures
@@ -131,10 +132,12 @@ This establishes a native Linux executable for feasibility, not a Symphony runti
 workspace, and harness must still share a supported host.
 No Windows interop is Linux evidence. Remote/SSH workers have no evidence and remain unsupported.
 
-A future adapter must resolve an executable in the selected local worker environment, fail with a
-classified launch error when absent, and call it with the existing workspace as its cwd.
-`require_contained_workspace` and the `cwd` fake process prove the intended pre-launch containment
-check and observable child cwd; they do not prove native `agy` containment.
+A future adapter must resolve the executable and selected profile root in the local worker
+environment, fail with a classified launch error when either is absent, and launch through the
+accepted Bubblewrap policy with the existing workspace as its only issue-data write root.
+`require_contained_workspace` and the `cwd` fake process prove only a pre-launch path check and
+observable child cwd. The 2026-09-21 negative control proves that cwd plus native `--sandbox` is not
+native file-tool containment.
 
 ### Documented headless contract (static only)
 
@@ -187,36 +190,37 @@ python -m unittest discover -s docs/spikes/JARVIS-901-agy/tests -p '*_test.py' -
 
 ## Native live GO/HOLD matrix
 
-| Contract row | Native-Linux evidence | Status | Remaining gate |
+| Contract row | Native-Linux evidence | Status | Required downstream invariant |
 | --- | --- | --- | --- |
-| Executable placement and process-level catalog invocation | Official Linux `agy` is executable at the approved launcher path and reported `1.2.7`; a fresh-D-Bus `acc3 models` invocation exited `0`, with diagnostics and catalog output deliberately unread. | **PARTIAL GO** | The exit code does not prove authentication or catalog correctness. A supported same-host Symphony runtime and profile/keyring restart isolation are still unproven. |
-| JSON/NDJSON framing | An ephemeral runner reported one `acc1` NDJSON `init` + `SUCCESS` result, but neither runner nor raw envelopes were retained. The new runner is reproducible only in offline fake mode. | **HOLD — operator report only** | Fresh owner authorization must run the runner and retain a manually reviewed, sanitized native summary/envelope-derived report. |
-| Multi-turn identity and cumulative counters | The same operator report says prompt 2 was submitted after turn 1 and produced no terminal result within a 70-second absolute deadline. | **HOLD** | Reproduce with a retained sanitized runner; prove one init/two results, stable identity, clean close, cumulative counters, and a bounded failure policy. |
-| Native cwd/workspace containment | The Linux report names a disposable cwd and sentinel, but does not retain `init.cwd`, sentinel verification, symlink behavior, or `--add-dir` boundary evidence. | **HOLD** | Prove the native child observes the exact contained workspace, cannot escape through symlinks or extra directories, and leaves the sentinel/workspace unchanged unless explicitly authorized. |
-| Same-slot cross-process resume | Planned explicit `acc1 --conversation` check was not submitted. | **HOLD** | Re-authorize/run only after the stream failure is understood. |
-| Cross-slot resume fail-closed | Planned explicit `acc2 --conversation` check was not submitted. | **HOLD** | Prove that an `acc1` conversation cannot be recovered by another isolated slot. |
-| Cancellation/process cleanup | The new fake runner proves its POSIX group escalation and cleanup accounting; the old native result remains an unretained operator report. | **HOLD — no native acceptance** | Fresh authorization must observe native terminal cancellation and owned descendant cleanup; native process-tree details are not protocol envelopes. |
-| Scoped permission/input-required | No permission-seeking prompt or bypass flag was used. | **HOLD** | Observe a real scoped soft-denial/input-required outcome without auto-answer or raw credential inheritance. |
-| Fresh-session profile isolation | Fresh D-Bus catalog invocation exited `0`, but diagnostics and catalog contents were intentionally not inspected. | **HOLD** | Prove clean D-Bus/keyring restart/refresh behavior and cross-slot isolation. |
-| Vendor authorization and production dispatch | No production dispatch or authorization change was attempted. | **HOLD** | Owner/vendor authorization remains external to this spike. |
+| Executable placement and authentication | Native `agy 1.2.7` completed provider turns from two explicit profile slots on the same Omarchy host as Symphony. | **GO** | Local host only; no SSH/Windows interop claim. |
+| JSON/NDJSON framing | Retained capture observed one valid init, two results, no malformed/dropped frames, stable identity, cumulative usage, and clean exit. | **GO** | Preserve exact native envelopes behind the adapter boundary. |
+| Multi-turn and same-slot resume | Two stdin turns completed; a new same-slot process preserved identity and exactly recalled first-turn context. | **GO** | Reject missing or changed continuation identity. |
+| Cross-slot resume | A second slot did not recover the source identity and silently created a new successful conversation. | **GO with policy** | Requested continuation plus returned identity mismatch is a hard adapter error, never a fresh-session fallback. |
+| Cwd and filesystem containment | Cwd matched, but native `--sandbox` still allowed an outside-workspace file write. Bubblewrap read-only-root tests blocked outside and symlink writes while preserving exact workspace writes. | **GO only with outer sandbox** | Bubblewrap is mandatory and fail-closed; native `--sandbox` remains defense in depth. |
+| Cancellation/process cleanup | Native SIGINT produced a terminal interrupt-class `ERROR`; timeout and interrupt runs emptied their process groups. Deterministic tests cover escalation and descendant cases. | **GO with normalization** | A locally initiated cancel owns cancellation classification; unsolicited `ERROR` remains provider failure. |
+| Scoped permission/input-required | `request-review` returned a structured denied action and stderr notice without the shell side effect. | **GO** | Never auto-answer and never use the dangerous bypass flag. |
+| Fresh-session profile isolation | Two selected profile roots completed independently and cross-slot continuation did not recover source identity. | **GO** | Bind only one explicit writable profile root per attempt; no account rotation. |
+| Owner authorization and production dispatch | The owner authorized the bounded development checks. No production issue was dispatched. | **GO for JARVIS-907; production HOLD** | JARVIS-906 owns the exact-issue integrated canary and final dispatch decision. |
 
-The full sanitized live record, exact two-prompt count, and cleanup result are in
-[`native-live-linux-2026-09-20.md`](evidence/native-live-linux-2026-09-20.md). The deadline
-requires a HOLD rather than inference about why the second turn did not settle.
+The superseding record is
+[`native-live-linux-2026-09-21.md`](evidence/native-live-linux-2026-09-21.md), with the reviewed
+aggregate in
+[`native-live-linux-2026-09-21-summary.json`](evidence/native-live-linux-2026-09-21-summary.json).
+The earlier 2026-09-20 report remains historical non-gating evidence.
 
 ## External integration prerequisites and gate ownership
 
-- **Completed baseline:** JARVIS-910 and JARVIS-909 are complete. They provide the accepted Codex+Pi baseline and provider-neutral bounded lifecycle; they do not make AntiGravity worker-ready.
-- **JARVIS-901 feasibility gate:** auditable native Linux NDJSON/multi-turn, same-slot resume, cross-slot fail-closed, cwd/workspace containment, cancellation/process cleanup, permission/input behavior, profile/keyring isolation, and external vendor authorization must reach GO before JARVIS-907 starts.
-- **JARVIS-907 implementation gate:** after JARVIS-901 GO, implement only the removable `agy` adapter and its deterministic contract tests. Do not defer an unresolved native-feasibility row into adapter implementation.
-- **JARVIS-906 integrated acceptance:** after JARVIS-907 completes, revalidate the exact integrated candidate through one disposable Symphony worker canary, including same-host workspace binding, session continuation, cancellation/cleanup, usage/status visibility, Codex+Pi regression, adapter removal, and upstream-sync rehearsal. JARVIS-906 does not waive or replace JARVIS-901's native feasibility gate.
-- **Same-host launcher:** the official Linux CLI is installed, but the unretained first-turn operator report is not acceptance proof. A supported Linux-host Symphony runtime and canonical session behavior still need auditable evidence. Direct Windows success is not permission to use cross-host interop.
-- **Permissions:** close the merged owner contract's permission/input evidence rows for the selected host/profile. The earlier Windows capture records `always-proceed`; it does not redefine acceptance and this Linux follow-up did not exercise permissions.
-- **Tools/MCP/tracker:** these are not acceptance requirements and no bridge is required. The earlier Windows capture reported no configured MCP servers while its inference, same-process multi-turn, and explicit `--conversation` resume succeeded; the incomplete Linux report makes no equivalent claim.
+- **Completed baseline:** JARVIS-910 and JARVIS-909 provide the accepted Codex+Pi baseline and provider-neutral bounded lifecycle.
+- **JARVIS-901 feasibility gate:** **GO on the observed Omarchy host for JARVIS-907.** The mandatory Bubblewrap requirement is a resolved launcher design constraint, not an optional implementation follow-up.
+- **JARVIS-907 implementation gate:** implement only the removable `agy` mapping/module tree, exact native protocol adapter, mandatory mount sandbox, and deterministic/shared contract tests. Identity mismatch, unavailable containment, permission denial, and local cancellation must be explicit neutral outcomes.
+- **JARVIS-906 integrated acceptance:** after JARVIS-907 completes, run one disposable exact-issue Symphony canary, recheck same-host workspace binding, continuation, cancellation/cleanup, usage/status visibility, Codex+Pi regression, adapter removal, and upstream-sync rehearsal.
+- **Same-host launcher:** Linux evidence is accepted only for the tested local route. Direct Windows success is not permission to add cross-host interop.
+- **Permissions:** native `request-review` soft denial is visible. Runtime policy may grant bounded commands inside the sandbox, but the adapter must never auto-answer prompts, add `unsandboxed(...)`, or use `--dangerously-skip-permissions`.
+- **Tools/MCP/tracker:** no bridge is required. The adapter owns no tracker lifecycle and receives no raw Linear credential.
 
 ## Recommendation
 
-- **Version test range:** `1.1.26` (Windows) and `1.2.7` (Linux) are individually observed; neither establishes a compatibility range. Any later version needs the deterministic suite and a bounded native acceptance.
-- **Native functionality:** **GO on the observed Windows host/profile.** **Linux HOLD for acceptance:** executable/version discovery is reproducible and a `models` command exited `0`, but that exit does not prove auth/catalog correctness. The first-turn result and second-turn deadline are retained only as a non-gating operator report.
-- **Symphony adapter integration:** **HOLD, not abandoned.** Do not add the `antigravity` mapping until auditable same-host NDJSON/multi-turn/resume, native cwd/workspace containment, cancellation/process cleanup, permission/input, profile isolation, and vendor-authorization gates close and JARVIS-901 reaches GO. Then JARVIS-907 may implement the adapter; JARVIS-906 must separately revalidate the integrated candidate and rollback/removal path.
-- **Tracker bridge:** **No bridge.** This spike does not justify MCP, loopback, handoff, account rotation, or credential plumbing.
+- **Version test range:** `1.1.26` (Windows) and `1.2.7` (Linux) are individually observed; neither establishes a compatibility range. Any later version needs deterministic regression and bounded native acceptance.
+- **Native functionality:** **GO on the observed Linux host/profile route when launched through the accepted outer containment policy.** Native cwd and native `--sandbox` alone are explicitly NO-GO.
+- **Symphony adapter integration:** **GO for JARVIS-907.** Codex stays default/rollback, Pi stays supported, and AntiGravity remains opt-in. JARVIS-906 separately owns integrated canary and rollback/removal acceptance.
+- **Tracker bridge:** **No bridge.** This spike does not justify MCP, loopback, handoff, account rotation, credential plumbing, or a second controller.
