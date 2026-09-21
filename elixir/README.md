@@ -37,10 +37,10 @@ from the Pi child, while tracker polling and lifecycle mutations remain owned by
 Set `agent.backend` to `antigravity` only on the accepted native Linux route. It is a local-only,
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
 `agy` executable and one explicit profile root. Symphony launches it through a mandatory
-Bubblewrap boundary: host root is read-only, only the issue workspace and selected profile root are
-host-writable, host `/run/user` is masked, `XDG_RUNTIME_DIR` is private, `.symphony` runtime
-metadata is read-only to the child, and native `--sandbox` remains
-enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
+Bubblewrap boundary: host root is read-only, the real user home and host `/run/user` are masked,
+only the issue workspace and selected profile root are host-writable, the exact AGY executable is
+projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony` runtime metadata is
+read-only to the child, and native `--sandbox` remains enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
 usage, or permission/input denial fails visibly. Codex remains the default and rollback path; Pi
 remains supported.
 
@@ -208,9 +208,14 @@ Notes:
   workspace are rejected. Symphony does not rotate profiles or fall back to another backend.
   AntiGravity SSH workers are rejected.
 - AntiGravity requires `/usr/bin/bwrap`. It runs with `--unshare-all --share-net --unshare-user
-  --disable-userns`, read-only `/`, private `/dev`, `/proc`, `/tmp`, and `/run/user`, a private
-  mode-`0700` `XDG_RUNTIME_DIR` without the host session D-Bus address, and writable host binds only
-  for the canonical issue workspace and selected profile root. The native process also receives
+  --disable-userns`, read-only `/`, private `/dev`, `/proc`, `/tmp`, and `/run/user`, and masks the
+  canonical real user home with a private tmpfs unless a broader private tmpfs already contains it.
+  Unrelated host-home contents, including host Git credentials, are unavailable. The selected profile
+  is the sole intentional credential-bearing exception and the only dedicated explicit read-write
+  host root besides the issue workspace. A single read-only bind projects the exact AGY executable
+  to a fixed private `/tmp` path; its installation directory is not separately bound, and a source
+  beneath the masked home remains hidden. The private mode-`0700` `XDG_RUNTIME_DIR` has no host
+  session D-Bus address, and the native process also receives
   `--sandbox --mode accept-edits`; Symphony never adds `--add-dir`, `unsandboxed(...)`, or
   `--dangerously-skip-permissions`. Trusted host wrappers are addressed under `/usr/bin`; tracker
   credential names are removed before launch and the sandboxed child receives a small allowlisted

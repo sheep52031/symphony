@@ -513,13 +513,18 @@ Launch and protocol requirements:
 - The backend MUST reject configured SSH workers and MUST NOT silently hop hosts or backends.
 - `/usr/bin/bwrap` is mandatory. The launch MUST fail closed unless it can use namespace isolation,
   a read-only host root, private `/dev`, `/proc`, `/tmp`, and `/run/user`, a canonical writable issue
-  workspace, and exactly one explicit writable profile root. Host-side launch/cleanup wrappers MUST
-  resolve to trusted system paths. Runtime metadata under workspace `.symphony` MUST be read-only to the child;
-  symlinked metadata directories MUST be rejected and transient process/stderr files MUST be removed
-  during shutdown.
-- The child MUST also receive native `--sandbox`, `--mode accept-edits`, and stream-json
-  input/output. The backend MUST NOT add `--add-dir`, `unsandboxed(...)`, or
-  `--dangerously-skip-permissions`.
+  workspace, and exactly one explicit writable profile root. The canonical real user home MUST be
+  masked by a private tmpfs (unless already covered by a broader private tmpfs), so unrelated host
+  home contents, including host Git credentials, are unavailable. The selected profile is the only
+  intentional credential-bearing exception and MUST remain one dedicated explicit read-write root.
+  Host-side launch/cleanup wrappers MUST resolve to trusted system paths. Runtime metadata under
+  workspace `.symphony` MUST be read-only to the child; symlinked metadata directories MUST be
+  rejected and transient process/stderr files MUST be removed during shutdown.
+- The canonical AGY executable MUST be projected as exactly one read-only file bind at a fixed
+  private path under `/tmp`; its installation directory MUST NOT be separately bound, and a source
+  path beneath the masked home MUST remain hidden. The child MUST execute the private path and MUST
+  also receive native `--sandbox`, `--mode accept-edits`, and stream-json input/output. The backend
+  MUST NOT add `--add-dir`, `unsandboxed(...)`, or `--dangerously-skip-permissions`.
 - The child environment MUST be allowlisted and MUST omit declared tracker credentials and generic
   credential-like names. It MUST use a private mode-`0700` `XDG_RUNTIME_DIR` and MUST NOT receive
   the host session D-Bus address or access the host `/run/user` tree. Tracker credentials and host
