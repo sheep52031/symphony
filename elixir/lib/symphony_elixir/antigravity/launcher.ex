@@ -8,6 +8,21 @@ defmodule SymphonyElixir.Antigravity.Launcher do
   @private_runtime_dir "/tmp/symphony-antigravity-runtime"
   @private_agy_path "/tmp/symphony-antigravity-agy"
   @private_tmpfs_roots ["/tmp", "/run/user"]
+  @security_sensitive_roots ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root", "/run", "/sbin", "/sys", "/usr"]
+  @broad_writable_roots ["/home", "/media", "/mnt", "/opt", "/srv", "/tmp", "/var", "/var/lib", "/var/tmp"]
+  @dedicated_parent_roots ["/tmp", "/var/lib", "/var/tmp", "/opt", "/srv", "/mnt", "/media"]
+  @credential_home_roots [
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".config",
+    ".local",
+    ".cache",
+    ".password-store"
+  ]
 
   @type launch :: %{
           executable: Path.t(),
@@ -29,6 +44,8 @@ defmodule SymphonyElixir.Antigravity.Launcher do
          {:ok, canonical_profile_root} <- canonical_directory(profile_root, :profile_root),
          :ok <- validate_workspace_boundary(canonical_workspace, canonical_home),
          :ok <- validate_profile_boundary(canonical_workspace, canonical_profile_root, canonical_home),
+         :ok <- ensure_directory(canonical_workspace, :workspace),
+         :ok <- ensure_directory(canonical_profile_root, :profile_root),
          {:ok, canonical_agy} <- canonical_executable(agy_executable, :agy),
          :ok <- validate_executable_boundary(canonical_workspace, canonical_profile_root, canonical_agy),
          {:ok, canonical_bubblewrap} <- canonical_executable(bubblewrap, :bubblewrap) do
@@ -188,13 +205,16 @@ defmodule SymphonyElixir.Antigravity.Launcher do
   end
 
   defp canonical_directory(path, label) do
-    with {:ok, canonical} <- PathSafety.canonicalize(path),
-         true <- File.dir?(canonical) do
-      {:ok, canonical}
-    else
-      false -> {:error, {:antigravity_directory_not_found, label, Path.expand(path)}}
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical} -> {:ok, canonical}
       {:error, reason} -> {:error, {:invalid_antigravity_directory, label, reason}}
     end
+  end
+
+  defp ensure_directory(path, label) do
+    if File.dir?(path),
+      do: :ok,
+      else: {:error, {:antigravity_directory_not_found, label, path}}
   end
 
   defp canonical_user_home do
@@ -208,6 +228,8 @@ defmodule SymphonyElixir.Antigravity.Launcher do
     with true <- Path.type(configured_home) == :absolute,
          {:ok, first} <- PathSafety.canonicalize(configured_home),
          true <- first != "/" and File.dir?(first),
+         true <- not top_level_path?(first),
+         true <- not security_sensitive_path?(first),
          {:ok, second} <- PathSafety.canonicalize(configured_home),
          true <- second == first and File.dir?(second) do
       {:ok, first}
@@ -230,32 +252,69 @@ defmodule SymphonyElixir.Antigravity.Launcher do
     end
   end
 
-  defp validate_workspace_boundary(workspace, home) do
-    if workspace == "/" or path_contains?(workspace, home) or private_mount_root?(workspace),
-      do: {:error, {:unsafe_antigravity_workspace, workspace}},
+  defp validate_workspace_boundary(workspace, home),
+    do: validate_writable_root(workspace, :workspace, home)
+
+  defp validate_profile_boundary(workspace, profile_root, home) do
+    with :ok <- validate_writable_root(profile_root, :profile_root, home) do
+      if path_contains?(workspace, profile_root) or path_contains?(profile_root, workspace),
+        do: {:error, {:overlapping_antigravity_write_roots, workspace, profile_root}},
+        else: :ok
+    end
+  end
+
+  defp validate_writable_root(path, label, home) do
+    if unsafe_writable_root?(path, home) or not dedicated_writable_root?(path, home),
+      do: {:error, unsafe_writable_root_error(label, path)},
       else: :ok
   end
 
-  defp validate_profile_boundary(workspace, profile_root, home) do
-    cond do
-      profile_root == "/" or path_contains?(profile_root, home) or private_mount_root?(profile_root) ->
-        {:error, {:unsafe_antigravity_profile_root, profile_root}}
+  defp unsafe_writable_root?(path, home) do
+    path == "/" or path_contains?(path, home) or
+      (path_contains?(home, path) and not dedicated_home_root?(path, home)) or
+      security_sensitive_path?(path) or path in @broad_writable_roots or top_level_path?(path)
+  end
 
-      path_contains?(workspace, profile_root) or path_contains?(profile_root, workspace) ->
-        {:error, {:overlapping_antigravity_write_roots, workspace, profile_root}}
+  defp dedicated_writable_root?(path, home) do
+    dedicated_home_root?(path, home) or Enum.any?(@dedicated_parent_roots, &strictly_contains?(&1, path))
+  end
 
-      true ->
-        :ok
+  defp dedicated_home_root?(path, home) do
+    if path_contains?(home, path) and path != home do
+      case relative_path_segments(home, path) do
+        [".agy-profiles", _slot] -> true
+        [first, _second | _rest] -> not credential_home_root?(first)
+        _ -> false
+      end
+    else
+      false
     end
   end
+
+  defp credential_home_root?(segment),
+    do: segment in @credential_home_roots or String.starts_with?(segment, ".")
+
+  defp relative_path_segments(parent, child) do
+    child
+    |> Path.split()
+    |> Enum.drop(length(Path.split(parent)))
+  end
+
+  defp security_sensitive_path?(path),
+    do: Enum.any?(@security_sensitive_roots, &path_contains?(&1, path))
+
+  defp top_level_path?(path), do: length(Path.split(path)) == 2
+
+  defp strictly_contains?(parent, child), do: path_contains?(parent, child) and parent != child
+
+  defp unsafe_writable_root_error(:workspace, path), do: {:unsafe_antigravity_workspace, path}
+  defp unsafe_writable_root_error(:profile_root, path), do: {:unsafe_antigravity_profile_root, path}
 
   defp validate_executable_boundary(workspace, profile_root, executable) do
     if path_contains?(workspace, executable) or path_contains?(profile_root, executable),
       do: {:error, {:unsafe_antigravity_executable_location, executable}},
       else: :ok
   end
-
-  defp private_mount_root?(path), do: Enum.any?(@private_tmpfs_roots, &path_contains?(path, &1))
 
   defp path_contains?(parent, child) do
     parent_segments = Path.split(parent)

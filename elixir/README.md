@@ -204,8 +204,14 @@ Notes:
   direct-child shutdown. The Pi fields fall back to the compatible Codex read/turn defaults when omitted.
 - `antigravity.executable` and `antigravity.profile_root` are required absolute paths when the
   AntiGravity backend is selected. The executable must be outside both writable roots. The profile
-  root must be a dedicated directory: `/`, the real user home, and roots overlapping the issue
-  workspace are rejected. Symphony does not rotate profiles or fall back to another backend.
+  root must be a dedicated directory: `/`, top-level or security-sensitive host trees (including
+  `/bin`, `/etc`, and `/usr`), broad aggregate roots such as `/var`, the real user home or its
+  ancestors, and roots overlapping the issue workspace are rejected. Specific descendants of the
+  canonical home, private temporary roots, or dedicated roots such as `/var/lib/agy-profile`
+  remain supported; home-based roots require at least two components below home, reject credential
+  and configuration trees, and use `~/.agy-profiles/<slot>` for profiles. The same writable-root
+  policy applies to the issue workspace. Symphony does not
+  rotate profiles or fall back to another backend.
   AntiGravity SSH workers are rejected.
 - AntiGravity requires `/usr/bin/bwrap`. It runs with `--unshare-all --share-net --unshare-user
   --disable-userns`, read-only `/`, private `/dev`, `/proc`, `/tmp`, and `/run/user`, and masks the

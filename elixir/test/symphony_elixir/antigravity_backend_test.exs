@@ -122,19 +122,20 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
-  test "rejects an overlapping or broad workspace/profile boundary" do
+  test "rejects unsafe writable roots at both workspace and profile boundaries" do
     root = temporary_root("unsafe-launcher")
     home = Path.expand(System.user_home!())
     home_parent = Path.dirname(home)
     workspace = Path.join(root, "workspace")
     workspace_two = Path.join(System.tmp_dir!(), "symphony-antigravity-workspace-two-#{System.unique_integer([:positive])}")
     profile = Path.join(workspace, "profile")
+    profile_two = Path.join(root, "profile-two")
     agy = Path.join(root, "agy")
     bwrap = Path.join(root, "bwrap")
+    File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
     File.mkdir_p!(workspace_two)
-    File.mkdir_p!(Path.join(root, "profile-two"))
-    File.mkdir_p!(Path.join(root, "profile-three"))
+    File.mkdir_p!(profile_two)
     write_executable!(agy, "#!/bin/sh\nexit 0\n")
     write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
 
@@ -145,16 +146,102 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
              Launcher.build(workspace_two, agy, home_parent, 1_000, bubblewrap_executable: bwrap)
 
     assert {:error, {:unsafe_antigravity_workspace, ^home_parent}} =
-             Launcher.build(home_parent, agy, Path.join(root, "profile-two"), 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(home_parent, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
 
     assert {:error, {:unsafe_antigravity_workspace, ^home}} =
-             Launcher.build(home, agy, Path.join(root, "profile-three"), 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(home, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
 
-    assert {:error, {:unsafe_antigravity_workspace, "/"}} =
-             Launcher.build("/", agy, Path.join(root, "profile-three"), 1_000, bubblewrap_executable: bwrap)
+    unsafe_roots = [
+      "/",
+      "/bin",
+      "/boot",
+      "/dev",
+      "/etc",
+      "/etc/agy",
+      "/lib",
+      "/lib64",
+      "/proc",
+      "/root",
+      "/run",
+      "/run/user",
+      "/sbin",
+      "/sys",
+      "/usr",
+      "/home",
+      "/home/other",
+      "/media",
+      "/mnt",
+      "/opt",
+      "/srv",
+      "/tmp",
+      "/var",
+      "/var/lib",
+      "/var/log",
+      "/var/tmp"
+    ]
+
+    canonical_aliases = %{"/bin" => "/usr/bin", "/lib" => "/usr/lib", "/lib64" => "/usr/lib", "/sbin" => "/usr/bin"}
+
+    for unsafe_root <- unsafe_roots do
+      expected_root = Map.get(canonical_aliases, unsafe_root, unsafe_root)
+
+      assert {:error, {:unsafe_antigravity_profile_root, ^expected_root}} =
+               Launcher.build(workspace_two, agy, unsafe_root, 1_000, bubblewrap_executable: bwrap)
+
+      assert {:error, {:unsafe_antigravity_workspace, ^expected_root}} =
+               Launcher.build(unsafe_root, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
+    end
+
+    assert {:error, {:antigravity_directory_not_found, :profile_root, "/var/lib/agy-profile"}} =
+             Launcher.build(workspace_two, agy, "/var/lib/agy-profile", 1_000, bubblewrap_executable: bwrap)
 
     File.rm_rf!(root)
     File.rm_rf!(workspace_two)
+  end
+
+  test "requires dedicated home descendants and protects credential roots" do
+    root = temporary_root("home-policy")
+    home = Path.expand(System.user_home!())
+    workspace = Path.join(root, "workspace")
+    profile = Path.join(root, "profile")
+    home_workspace = Path.join(home, "issues/JARVIS-907")
+    home_profile = Path.join(home, ".agy-profiles/slot-a")
+    agy = Path.join(root, "agy")
+    bwrap = Path.join(root, "bwrap")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(profile)
+    write_executable!(agy, "#!/bin/sh\nexit 0\n")
+    write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
+
+    assert {:error, {:antigravity_directory_not_found, :workspace, ^home_workspace}} =
+             Launcher.build(home_workspace, agy, profile, 1_000, bubblewrap_executable: bwrap)
+
+    assert {:error, {:antigravity_directory_not_found, :profile_root, ^home_profile}} =
+             Launcher.build(workspace, agy, home_profile, 1_000, bubblewrap_executable: bwrap)
+
+    for unsafe_root <- [
+          Path.join(home, "issues"),
+          Path.join(home, ".agy-profiles"),
+          Path.join(home, ".ssh"),
+          Path.join(home, ".config/gh"),
+          Path.join(home, ".config/environment.d"),
+          Path.join(home, ".gnupg"),
+          Path.join(home, ".aws"),
+          Path.join(home, ".azure"),
+          Path.join(home, ".kube"),
+          Path.join(home, ".docker"),
+          Path.join(home, ".local/share"),
+          Path.join(home, ".cache/tool"),
+          Path.join(home, ".password-store")
+        ] do
+      assert {:error, {:unsafe_antigravity_profile_root, ^unsafe_root}} =
+               Launcher.build(profile, agy, unsafe_root, 1_000, bubblewrap_executable: bwrap)
+
+      assert {:error, {:unsafe_antigravity_workspace, ^unsafe_root}} =
+               Launcher.build(unsafe_root, agy, profile, 1_000, bubblewrap_executable: bwrap)
+    end
+
+    File.rm_rf!(root)
   end
 
   test "masks the real home and projects only the canonical writable roots and AGY file" do

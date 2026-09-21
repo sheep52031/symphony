@@ -500,7 +500,15 @@ Fields:
     and profile roots.
 - `profile_root` (absolute path, REQUIRED when selected)
   - Selects exactly one native AntiGravity profile/account boundary for the attempt.
-  - `/`, the real user home, and roots overlapping the issue workspace MUST be rejected.
+  - `/`, any top-level or security-sensitive host tree (including `/bin`, `/boot`, `/dev`, `/etc`,
+    `/lib`, `/lib64`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, and `/usr`), the real user home or
+    its ancestors, and roots overlapping the issue workspace MUST be rejected. Broad aggregate roots
+    such as `/home`, `/media`, `/mnt`, `/opt`, `/srv`, `/tmp`, `/var`, `/var/lib`, and `/var/tmp`
+    MUST be rejected when selected directly; sufficiently specific dedicated descendants, including
+    `/var/lib/agy-profile`, MAY be selected when they are canonical directories. Under the canonical
+    home, direct children and credential/configuration trees MUST be rejected; dedicated roots MUST
+    be at least two components below home, with `~/.agy-profiles/<slot>` as the supported profile
+    shape.
 - `first_event_timeout_ms` (positive integer, default `30000`)
   - Absolute deadline from prompt submission to the first native progress/result event.
 - `turn_timeout_ms` (positive integer, default `3600000`)
