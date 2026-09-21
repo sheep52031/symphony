@@ -28,7 +28,7 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
-  # Keep the default on Codex; Pi is an explicit local-only opt-in.
+  # Keep the default on Codex; Pi and AntiGravity are explicit local-only opt-ins.
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
@@ -37,8 +37,15 @@ agent:
   # hold_after_normal_completion: true
   # max_attempts_per_issue: 1
 pi:
-  # Base command for non-interactive bash -lc; Symphony supplies the isolation/session flags.
+  # Base command for non-interactive, non-login bash -c; Symphony supplies isolation/session flags.
   command: pi --mode rpc
+antigravity:
+  # Required only when agent.backend is antigravity. Both values must resolve to absolute paths.
+  executable: $ANTIGRAVITY_EXECUTABLE
+  profile_root: $ANTIGRAVITY_PROFILE_ROOT
+  first_event_timeout_ms: 30000
+  turn_timeout_ms: 3600000
+  cancel_grace_ms: 1000
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

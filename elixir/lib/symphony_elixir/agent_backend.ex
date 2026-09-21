@@ -9,7 +9,7 @@ defmodule SymphonyElixir.AgentBackend do
 
   @type session :: term()
   @type backend :: module()
-  @type backend_id :: :codex | :pi
+  @type backend_id :: :antigravity | :codex | :pi
   @type update :: %{
           required(:event) => atom(),
           required(:timestamp) => DateTime.t(),
@@ -24,6 +24,7 @@ defmodule SymphonyElixir.AgentBackend do
           | {:invalid_backend_stop_result, term()}
 
   @backends %{
+    "antigravity" => {:antigravity, SymphonyElixir.Antigravity.Backend},
     "codex" => {:codex, SymphonyElixir.Codex.AppServer},
     "pi" => {:pi, SymphonyElixir.Pi.Backend}
   }

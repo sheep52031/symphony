@@ -162,6 +162,9 @@ defmodule SymphonyElixir.Config do
       {:unsupported_backend_worker_hosts, :pi} ->
         "Pi backend is local-only and cannot be configured with SSH workers"
 
+      {:unsupported_backend_worker_hosts, :antigravity} ->
+        "AntiGravity backend is local-only and cannot be configured with SSH workers"
+
       :workflow_front_matter_not_a_map ->
         "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
 

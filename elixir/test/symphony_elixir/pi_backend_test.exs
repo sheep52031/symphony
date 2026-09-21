@@ -4,8 +4,8 @@ defmodule SymphonyElixir.Pi.BackendTest do
   alias SymphonyElixir.{AgentBackend, Config.Schema}
   alias SymphonyElixir.Pi.Backend
 
-  test "resolves Codex and Pi from the closed backend mapping" do
-    assert MapSet.new(AgentBackend.supported_names()) == MapSet.new(["codex", "pi"])
+  test "resolves the closed backend mapping without changing Pi" do
+    assert MapSet.new(AgentBackend.supported_names()) == MapSet.new(["antigravity", "codex", "pi"])
     assert {:ok, :codex, SymphonyElixir.Codex.AppServer} = AgentBackend.resolve("codex")
     assert {:ok, :pi, Backend} = AgentBackend.resolve(:pi)
     assert {:error, {:unsupported_backend, "unknown"}} = AgentBackend.resolve("unknown")

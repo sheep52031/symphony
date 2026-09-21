@@ -447,7 +447,7 @@ Fields:
 
 - `backend` (string)
   - Default: `codex`.
-  - Supported values in this fork: `codex` and `pi`.
+  - Supported values in this fork: `codex`, `pi`, and `antigravity`.
   - Selects only the execution backend for new attempts; an in-flight attempt keeps its selected backend.
 - `max_concurrent_agents` (integer)
   - Default: `10`
@@ -470,7 +470,8 @@ Fields:
 
 - `command` (string shell command)
   - Default: `pi --mode rpc`.
-  - The runtime launches this command via `bash -lc` in the issue workspace.
+  - The runtime launches this command via non-login `bash -c` in the issue workspace so shell
+    startup files cannot reintroduce scrubbed credentials.
   - The launched process MUST speak Pi's strict JSONL RPC protocol on stdout; stderr is diagnostics.
   - The runtime MUST append Pi's supported `--session-dir`, `--no-extensions`, `--no-skills`,
     `--no-themes`, `--no-prompt-templates`, `--no-context-files`, and `--no-approve` controls, set
@@ -485,7 +486,57 @@ Fields:
   - In this fork's first slice, Pi is local-only. Configured SSH workers are rejected rather than
     silently treated as supported.
 
-#### 5.3.7 `codex` (object)
+#### 5.3.7 `antigravity` (object)
+
+This is a local-only fork extension. It MUST remain a removable execution adapter and MUST NOT own
+scheduler, polling, retry, workspace, reconciliation, tracker-lifecycle, account-rotation, or
+fallback policy.
+
+Fields:
+
+- `executable` (absolute path, REQUIRED when selected)
+  - Resolves optional `$VAR` indirection before validation.
+  - MUST identify an executable regular file on the local worker outside the writable workspace
+    and profile roots.
+- `profile_root` (absolute path, REQUIRED when selected)
+  - Selects exactly one native AntiGravity profile/account boundary for the attempt.
+  - `/`, the real user home, and roots overlapping the issue workspace MUST be rejected.
+- `first_event_timeout_ms` (positive integer, default `30000`)
+  - Absolute deadline from prompt submission to the first native progress/result event.
+- `turn_timeout_ms` (positive integer, default `3600000`)
+  - Absolute whole-turn deadline; protocol chatter MUST NOT extend it.
+- `cancel_grace_ms` (positive integer, default `1000`)
+  - Bounds collection of a native terminal envelope after locally initiated interruption.
+
+Launch and protocol requirements:
+
+- The backend MUST reject configured SSH workers and MUST NOT silently hop hosts or backends.
+- `/usr/bin/bwrap` is mandatory. The launch MUST fail closed unless it can use namespace isolation,
+  a read-only host root, private `/dev`, `/proc`, and `/tmp`, a canonical writable issue workspace,
+  and exactly one explicit writable profile root. Host-side launch/cleanup wrappers MUST resolve to
+  trusted system paths. Runtime metadata under workspace `.symphony` MUST be read-only to the child;
+  symlinked metadata directories MUST be rejected and transient process/stderr files MUST be removed
+  during shutdown.
+- The child MUST also receive native `--sandbox`, `--mode accept-edits`, and stream-json
+  input/output. The backend MUST NOT add `--add-dir`, `unsandboxed(...)`, or
+  `--dangerously-skip-permissions`.
+- The child environment MUST be allowlisted and MUST omit declared tracker credentials and generic
+  credential-like names. Tracker credentials remain host-side.
+- Stdout MUST contain bounded LF-delimited native `init`, `step_update`, and nested `result` objects;
+  malformed or oversized frames MUST fail closed without retaining their raw contents. Callback
+  updates MUST contain only reviewed protocol fields; stderr remains diagnostics. Exactly one
+  nonempty identity-bearing `init` MUST precede progress/results,
+  `init.cwd` MUST equal the canonical workspace, and `permission_mode` MUST be `request-review`.
+- Every later identity MUST match. `num_turns` MUST increment by one and all native usage counters
+  MUST be present, nonnegative, and cumulative. Identity mismatch MUST fail closed and MUST NOT be
+  treated as a fresh-session continuation.
+- `denied_actions` and `WAITING` MUST surface as input-required outcomes. They MUST NOT be
+  auto-answered or treated as successful completion.
+- Locally initiated timeout/cancellation is authoritative even if the observed native build reports
+  terminal `ERROR` rather than `INTERRUPTED`. Unsolicited native `ERROR` remains a provider failure.
+  Shutdown MUST bound escalation and verify that the owned process group is empty.
+
+#### 5.3.8 `codex` (object)
 
 Fields:
 
@@ -627,6 +678,8 @@ Validation checks:
   resolution.
 - `codex.command` is present and non-empty when `agent.backend` is `codex`.
 - `pi.command` is present and non-empty when `agent.backend` is `pi`.
+- `antigravity.executable` and `antigravity.profile_root` are absolute, non-empty, and local when
+  `agent.backend` is `antigravity`; configured SSH workers are rejected.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -646,12 +699,17 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
-- `agent.backend`: string, default `codex`, supported values `codex` and `pi`
+- `agent.backend`: string, default `codex`, supported values `codex`, `pi`, and `antigravity`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `pi.command`: shell command string, default `pi --mode rpc`
+- `antigravity.executable`: absolute executable path, required when selected
+- `antigravity.profile_root`: absolute dedicated profile path, required when selected
+- `antigravity.first_event_timeout_ms`: integer, default `30000`
+- `antigravity.turn_timeout_ms`: integer, default `3600000`
+- `antigravity.cancel_grace_ms`: integer, default `1000`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined

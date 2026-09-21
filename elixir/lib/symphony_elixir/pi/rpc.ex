@@ -171,7 +171,7 @@ defmodule SymphonyElixir.Pi.Rpc do
           grouped_command =
             "printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{command}"
 
-          "exec #{shell_escape(path)} --wait #{shell_escape(executable)} -lc #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
+          "exec #{shell_escape(path)} --wait #{shell_escape(executable)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
 
         _ ->
           "exec #{command} 2> #{shell_escape(stderr_path)}"
@@ -186,7 +186,7 @@ defmodule SymphonyElixir.Pi.Rpc do
       [
         :binary,
         :exit_status,
-        args: [~c"-lc", String.to_charlist(launch.command)],
+        args: [~c"-c", String.to_charlist(launch.command)],
         cd: String.to_charlist(workspace),
         env: Keyword.get(opts, :env, []),
         line: @port_line_bytes
