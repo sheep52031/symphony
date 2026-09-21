@@ -61,6 +61,15 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.mkdir_p!(profile)
     write_executable!(agy, "#!/bin/sh\nexit 0\n")
     write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
+    previous_runtime = System.get_env("XDG_RUNTIME_DIR")
+    previous_dbus = System.get_env("DBUS_SESSION_BUS_ADDRESS")
+    System.put_env("XDG_RUNTIME_DIR", "/run/user/1000")
+    System.put_env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+
+    on_exit(fn ->
+      restore_env("XDG_RUNTIME_DIR", previous_runtime)
+      restore_env("DBUS_SESSION_BUS_ADDRESS", previous_dbus)
+    end)
 
     assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, bubblewrap_executable: bwrap)
     assert launch.workspace == Path.expand(workspace)
@@ -68,6 +77,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert launch.executable == Path.expand(bwrap)
     assert subsequence?(launch.args, ["--unshare-all", "--share-net", "--unshare-user", "--disable-userns"])
     assert subsequence?(launch.args, ["--ro-bind", "/", "/"])
+    assert subsequence?(launch.args, ["--tmpfs", "/run/user"])
+    assert subsequence?(launch.args, ["--tmpfs", "/tmp", "--dir", "/tmp/symphony-antigravity-runtime", "--chmod", "0700", "/tmp/symphony-antigravity-runtime"])
     assert subsequence?(launch.args, ["--bind", Path.expand(workspace), Path.expand(workspace)])
 
     assert subsequence?(launch.args, [
@@ -78,6 +89,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert subsequence?(launch.args, ["--bind", Path.expand(profile), Path.expand(profile)])
     assert subsequence?(launch.args, ["--chdir", Path.expand(workspace), "--clearenv"])
+    assert subsequence?(launch.args, ["--setenv", "XDG_RUNTIME_DIR", "/tmp/symphony-antigravity-runtime"])
+    refute "DBUS_SESSION_BUS_ADDRESS" in launch.args
+    refute Enum.any?(launch.args, &(&1 == "/run/user/1000"))
+    refute Enum.any?(launch.args, &(&1 == "unix:path=/run/user/1000/bus"))
     assert subsequence?(launch.args, [agy, "--sandbox", "--mode", "accept-edits"])
     assert List.last(launch.args) == "7s"
     refute "--dangerously-skip-permissions" in launch.args
@@ -171,10 +186,80 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert {:error, {:antigravity_input_required, %{status: "SUCCESS", denied_actions_count: 1}}} =
              Backend.run_turn(session, "permission", issue, on_message: on_message)
 
-    assert_receive {:agy_message, %{event: :input_required, payload: %{"denied_actions_count" => 1}}}
+    assert_receive {:agy_message, %{event: :turn_input_required, payload: %{"denied_actions_count" => 1}}}
     refute_receive {:agy_message, %{event: :turn_completed}}
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
+  end
+
+  test "maps WAITING to the neutral input-required event" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    on_message = fn message -> send(self(), {:agy_message, message}) end
+    issue = %{id: "issue-waiting", identifier: "JARVIS-907", title: "Waiting"}
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+
+    assert {:error, {:antigravity_input_required, %{status: "WAITING"}}} =
+             Backend.run_turn(session, "waiting", issue, on_message: on_message)
+
+    assert_receive {:agy_message, %{event: :turn_input_required, payload: %{"status" => "WAITING"}}}
+    refute_receive {:agy_message, %{event: :turn_completed}}
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
+  test "rejects malformed step updates without retaining native values" do
+    secret = "STEP_SECRET_907"
+
+    for prompt <- ["bad_step_type", "bad_text_delta", "oversized_delta"] do
+      {root, workspace, profile, agy} = setup_fake_agy!()
+      configure_backend!(agy, profile)
+      on_message = fn message -> send(self(), {:agy_message, message}) end
+      issue = %{id: "issue-step", identifier: "JARVIS-907", title: "Step validation"}
+      assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+
+      result = Backend.run_turn(session, prompt, issue, on_message: on_message)
+
+      assert {:error, reason} = result
+
+      assert reason in [
+               :invalid_antigravity_step_type,
+               :invalid_antigravity_text_delta,
+               :antigravity_text_delta_too_large
+             ]
+
+      messages = receive_messages([])
+      refute Enum.any?(messages, &(inspect(&1) =~ secret))
+      assert :ok = Backend.stop_session(session)
+      File.rm_rf!(root)
+    end
+  end
+
+  test "redacts rejected native values from callback errors and cancellation summaries" do
+    cases = [
+      {"unsafe_permission_secret", :unsafe_antigravity_permission_mode, "PERMISSION_SECRET_907"},
+      {"invalid_status", :invalid_antigravity_terminal_status, "STATUS_SECRET_907"},
+      {"invalid_turn_count", :invalid_antigravity_turn_count, "TURN_SECRET_907"},
+      {"invalid_usage_secret", :invalid_antigravity_usage, "USAGE_SECRET_907"},
+      {"silent_secret", :timeout, "CANCEL_SECRET_907"}
+    ]
+
+    for {prompt, expected, secret} <- cases do
+      {root, workspace, profile, agy} = setup_fake_agy!()
+      configure_backend!(agy, profile, first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100)
+      on_message = fn message -> send(self(), {:agy_message, message}) end
+      issue = %{id: "issue-redaction", identifier: "JARVIS-907", title: "Redaction"}
+      assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+
+      result = Backend.run_turn(session, prompt, issue, on_message: on_message)
+      assert_redacted_result(result, expected)
+      refute inspect(result) =~ secret
+      messages = receive_messages([])
+      refute Enum.any?(messages, &(inspect(&1) =~ secret))
+      assert :ok = Backend.stop_session(session)
+      File.rm_rf!(root)
+    end
   end
 
   test "fails closed on a native identity mismatch" do
@@ -198,7 +283,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert {:ok, unsafe_session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
 
-    assert {:error, {:unsafe_antigravity_permission_mode, "always-proceed"}} =
+    assert {:error, :unsafe_antigravity_permission_mode} =
              Backend.run_turn(unsafe_session, "unsafe_permission", issue, [])
 
     assert :ok = Backend.stop_session(unsafe_session)
@@ -215,7 +300,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert {:ok, usage_session} = Backend.start_session(third_workspace, launcher: &direct_launcher/5)
     assert {:ok, _first} = Backend.run_turn(usage_session, "first", issue, [])
 
-    assert {:error, {:noncumulative_antigravity_usage, _previous, _current}} =
+    assert {:error, :noncumulative_antigravity_usage} =
              Backend.run_turn(usage_session, "noncumulative", issue, [])
 
     assert :ok = Backend.stop_session(usage_session)
@@ -351,14 +436,44 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       turn=$((turn + 1))
       if [ "$turn" -eq 1 ]; then
         case "$line" in
+          *unsafe_permission_secret*) printf '%s\n' '{"event":"init","conversation_id":"agy-session","init":{"cwd":"'"$PWD"'","permission_mode":"PERMISSION_SECRET_907"}}' ;;
           *unsafe_permission*) printf '{"event":"init","conversation_id":"agy-session","init":{"cwd":"%s","permission_mode":"always-proceed"}}\n' "$PWD" ;;
           *workspace_mismatch*) printf '%s\n' '{"event":"init","conversation_id":"agy-session","init":{"cwd":"/wrong","permission_mode":"request-review"}}' ;;
           *) printf '{"event":"init","conversation_id":"agy-session","init":{"cwd":"%s","permission_mode":"request-review","account_identifier":"must-not-forward"}}\n' "$PWD" ;;
         esac
       fi
       case "$line" in
+        *bad_step_type*)
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"STEP_SECRET_907"}}'
+          ;;
+        *bad_text_delta*)
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":{"value":"STEP_SECRET_907"}}}'
+          ;;
+        *oversized_delta*)
+          printf '%s' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":"'
+          head -c 65537 /dev/zero | tr '\\000' x
+          printf '%s\n' '"}}'
+          ;;
+        *invalid_status*)
+          printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-session","status":"STATUS_SECRET_907","response":"bad","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}'
+          ;;
+        *invalid_turn_count*)
+          printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"bad","duration_seconds":1,"num_turns":"TURN_SECRET_907","usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}'
+          ;;
+        *waiting*)
+          printf '{"event":"result","result":{"conversation_id":"agy-session","status":"WAITING","response":"waiting","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
+          ;;
+        *invalid_usage_secret*)
+          printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"bad","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":"USAGE_SECRET_907","output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}'
+          ;;
+        *silent_secret*)
+          sleep 10
+          if [ "$interrupted" -eq 1 ]; then
+            printf '{"event":"result","result":{"conversation_id":"agy-session","status":"CANCEL_SECRET_907","response":"","error":"interrupted","duration_seconds":0,"num_turns":%s,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}\n' "$turn"
+          fi
+          ;;
         *identity_mismatch*)
-          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"other-session","step_type":"text","text_delta":"bad"}}'
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"other-session","step_type":"agent_response","text_delta":"bad"}}'
           ;;
         *permission*)
           printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"tool"}}\n'
@@ -381,7 +496,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           sleep 30 &
           printf '%s' "$!" > "$PWD/child.pid"
           input=$((turn * 10)); output=$((turn * 3)); thinking=$((turn * 2)); total=$((turn * 15))
-          printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"text","text_delta":"spawned"}}\n'
+          printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":"spawned"}}\n'
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"descendant","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":%s,"output_tokens":%s,"thinking_tokens":%s,"cache_read_tokens":0,"total_tokens":%s}}}\n' "$turn" "$input" "$output" "$thinking" "$total"
           ;;
         *silent*)
@@ -392,7 +507,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           ;;
         *)
           input=$((turn * 10)); output=$((turn * 3)); thinking=$((turn * 2)); total=$((turn * 15))
-          printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"text","text_delta":"working-%s","private_tool_argument":"must-not-forward"}}\n' "$turn"
+          printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":"working-%s","private_tool_argument":"must-not-forward"}}\n' "$turn"
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"done-%s","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":%s,"output_tokens":%s,"thinking_tokens":%s,"cache_read_tokens":0,"total_tokens":%s},"provider_private_field":"must-not-forward"}}\n' "$turn" "$turn" "$input" "$output" "$thinking" "$total"
           ;;
       esac
@@ -407,6 +522,20 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
   defp temporary_root(label) do
     Path.join(System.tmp_dir!(), "symphony-antigravity-#{label}-#{System.unique_integer([:positive])}")
+  end
+
+  defp receive_messages(messages) do
+    receive do
+      {:agy_message, message} -> receive_messages([message | messages])
+    after
+      0 -> Enum.reverse(messages)
+    end
+  end
+
+  defp assert_redacted_result({:error, expected}, expected), do: :ok
+
+  defp assert_redacted_result({:error, {:antigravity_turn_timeout, :first_event, terminal}}, :timeout) do
+    assert is_map(terminal)
   end
 
   defp process_alive?(pid) do

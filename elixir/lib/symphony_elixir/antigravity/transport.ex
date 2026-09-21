@@ -4,6 +4,10 @@ defmodule SymphonyElixir.Antigravity.Transport do
   alias SymphonyElixir.Antigravity.Launcher
 
   @line_bytes 1_048_576
+  @max_identity_bytes 256
+  @max_text_delta_bytes 65_536
+  @step_types ~w(user_input agent_response tool checkpoint)
+  @terminal_statuses ~w(SUCCESS ERROR CANCELED INTERRUPTED INVALID WAITING RUNNING)
   @process_group_detection_attempts 400
   @graceful_close_ms 250
   @forced_close_ms 500
@@ -209,11 +213,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
   defp handle_event(loop, %{"event" => "step_update", "step_update" => update})
        when is_map(update) do
-    with :ok <- validate_event_identity(loop.session.state, Map.get(update, "conversation_id")) do
-      loop.on_event.(%{
-        "event" => "step_update",
-        "step_update" => Map.take(update, ["conversation_id", "step_type", "text_delta"])
-      })
+    with :ok <- validate_event_identity(loop.session.state, Map.get(update, "conversation_id")),
+         {:ok, sanitized} <- validate_step_update(update) do
+      loop.on_event.(%{"event" => "step_update", "step_update" => sanitized})
 
       receive_turn(%{loop | progress_seen?: true})
     end
@@ -239,17 +241,19 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
   defp handle_event(_loop, _event), do: {:error, {:invalid_antigravity_protocol_message, :missing_event}}
 
-  defp accept_init(session, %{"conversation_id" => session_id, "init" => init})
-       when is_binary(session_id) and session_id != "" and is_map(init) do
+  defp accept_init(session, %{"conversation_id" => session_id, "init" => init}) when is_map(init) do
     cwd = Map.get(init, "cwd")
     permission_mode = Map.get(init, "permission_mode")
 
     cond do
+      not valid_identity?(session_id) ->
+        {:error, :invalid_antigravity_conversation_id}
+
       cwd != session.workspace ->
         {:error, :antigravity_workspace_mismatch}
 
       permission_mode != "request-review" ->
-        {:error, {:unsafe_antigravity_permission_mode, permission_mode}}
+        {:error, :unsafe_antigravity_permission_mode}
 
       true ->
         record_init(session, session_id, cwd, permission_mode)
@@ -286,11 +290,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
       with true <- state.init_seen? || {:error, :antigravity_result_before_init},
            true <- identity == state.session_id || {:error, :antigravity_identity_mismatch},
            true <-
-             status in ~w(SUCCESS ERROR CANCELED INTERRUPTED INVALID WAITING RUNNING) ||
-               {:error, {:invalid_antigravity_terminal_status, status}},
-           true <-
-             num_turns == state.turn_count + 1 ||
-               {:error, {:invalid_antigravity_turn_count, state.turn_count + 1, num_turns}},
+             status in @terminal_statuses || {:error, :invalid_antigravity_terminal_status},
+           true <- num_turns == state.turn_count + 1 || {:error, :invalid_antigravity_turn_count},
            :ok <- validate_result_fields(status, result),
            {:ok, normalized_usage} <- validate_usage(usage, state.usage) do
         accepted = %{
@@ -315,12 +316,46 @@ defmodule SymphonyElixir.Antigravity.Transport do
   defp validate_event_identity(state_pid, identity) do
     Agent.get(state_pid, fn state ->
       cond do
+        not valid_identity?(identity) -> {:error, :invalid_antigravity_conversation_id}
         not state.init_seen? -> {:error, :antigravity_event_before_init}
         identity != state.session_id -> {:error, :antigravity_identity_mismatch}
         true -> :ok
       end
     end)
   end
+
+  defp validate_step_update(update) do
+    step_type = Map.get(update, "step_type")
+
+    with :ok <- validate_step_type(step_type),
+         :ok <- validate_text_delta(update) do
+      sanitized = %{"conversation_id" => Map.fetch!(update, "conversation_id"), "step_type" => step_type}
+
+      sanitized =
+        if Map.has_key?(update, "text_delta"),
+          do: Map.put(sanitized, "text_delta", Map.fetch!(update, "text_delta")),
+          else: sanitized
+
+      {:ok, sanitized}
+    end
+  end
+
+  defp validate_step_type(step_type) when step_type in @step_types, do: :ok
+  defp validate_step_type(_step_type), do: {:error, :invalid_antigravity_step_type}
+
+  defp validate_text_delta(update) do
+    case Map.fetch(update, "text_delta") do
+      :error -> :ok
+      {:ok, text_delta} when is_binary(text_delta) and byte_size(text_delta) <= @max_text_delta_bytes -> :ok
+      {:ok, text_delta} when is_binary(text_delta) -> {:error, :antigravity_text_delta_too_large}
+      {:ok, _text_delta} -> {:error, :invalid_antigravity_text_delta}
+    end
+  end
+
+  defp valid_identity?(identity) when is_binary(identity),
+    do: identity != "" and byte_size(identity) <= @max_identity_bytes
+
+  defp valid_identity?(_identity), do: false
 
   defp validate_result_fields(status, result) do
     response = Map.get(result, "response")
@@ -352,12 +387,15 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
     cond do
       not valid? -> {:error, :invalid_antigravity_usage}
-      not cumulative? -> {:error, {:noncumulative_antigravity_usage, previous, normalized}}
+      not cumulative? -> {:error, :noncumulative_antigravity_usage}
       true -> {:ok, normalized}
     end
   end
 
   defp validate_usage(_usage, _previous), do: {:error, :invalid_antigravity_usage}
+
+  defp reviewed_terminal_status(status) when status in @terminal_statuses, do: status
+  defp reviewed_terminal_status(_status), do: "UNKNOWN"
 
   defp remaining_timeout_ms(loop) do
     deadline =
@@ -395,7 +433,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
         case Jason.decode(String.trim_trailing(line, "\r")) do
           {:ok, %{"event" => "result", "result" => result}} when is_map(result) ->
-            %{status: Map.get(result, "status"), terminal_observed: true}
+            %{status: reviewed_terminal_status(Map.get(result, "status")), terminal_observed: true}
 
           {:ok, %{}} ->
             collect_cancellation(loop, deadline_ms, "")
@@ -410,8 +448,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
           {:error, _reason} -> %{terminal_observed: false, oversized_frame: true}
         end
 
-      {port, {:exit_status, status}} when port == loop.session.port ->
-        %{exit_status: status, terminal_observed: false}
+      {port, {:exit_status, _status}} when port == loop.session.port ->
+        %{process_exited: true, terminal_observed: false}
     after
       remaining -> %{terminal_observed: false, grace_expired: true}
     end

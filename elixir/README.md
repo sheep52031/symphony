@@ -38,7 +38,8 @@ Set `agent.backend` to `antigravity` only on the accepted native Linux route. It
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
 `agy` executable and one explicit profile root. Symphony launches it through a mandatory
 Bubblewrap boundary: host root is read-only, only the issue workspace and selected profile root are
-writable, `.symphony` runtime metadata is read-only to the child, and native `--sandbox` remains
+host-writable, host `/run/user` is masked, `XDG_RUNTIME_DIR` is private, `.symphony` runtime
+metadata is read-only to the child, and native `--sandbox` remains
 enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
 usage, or permission/input denial fails visibly. Codex remains the default and rollback path; Pi
 remains supported.
@@ -207,8 +208,9 @@ Notes:
   workspace are rejected. Symphony does not rotate profiles or fall back to another backend.
   AntiGravity SSH workers are rejected.
 - AntiGravity requires `/usr/bin/bwrap`. It runs with `--unshare-all --share-net --unshare-user
-  --disable-userns`, read-only `/`, private `/dev`, `/proc`, and `/tmp`, and writable binds only for
-  the canonical issue workspace and selected profile root. The native process also receives
+  --disable-userns`, read-only `/`, private `/dev`, `/proc`, `/tmp`, and `/run/user`, a private
+  mode-`0700` `XDG_RUNTIME_DIR` without the host session D-Bus address, and writable host binds only
+  for the canonical issue workspace and selected profile root. The native process also receives
   `--sandbox --mode accept-edits`; Symphony never adds `--add-dir`, `unsandboxed(...)`, or
   `--dangerously-skip-permissions`. Trusted host wrappers are addressed under `/usr/bin`; tracker
   credential names are removed before launch and the sandboxed child receives a small allowlisted

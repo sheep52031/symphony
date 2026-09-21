@@ -107,7 +107,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
       "reason" => "native permission or input is required"
     }
 
-    on_message.(update(session, :input_required, result.session_id, payload))
+    on_message.(update(session, :turn_input_required, result.session_id, payload))
     {:error, {:antigravity_input_required, %{status: result.status, denied_actions_count: length(denied_actions)}}}
   end
 
@@ -138,7 +138,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
   defp handle_result(session, %{status: "WAITING"} = result, on_message) do
     on_message.(
-      update(session, :input_required, result.session_id, %{
+      update(session, :turn_input_required, result.session_id, %{
         "status" => result.status,
         "reason" => "native worker is waiting for input"
       })
@@ -179,7 +179,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
     on_message.(
       update(session, :turn_ended_with_error, session_id, %{
         "stage" => Atom.to_string(stage),
-        "reason" => inspect(reason)
+        "reason" => reason_code(reason)
       })
     )
 
@@ -247,6 +247,12 @@ defmodule SymphonyElixir.Antigravity.Backend do
         :ok
     end
   end
+
+  defp reason_code(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp reason_code({reason, _details}) when is_atom(reason), do: Atom.to_string(reason)
+  defp reason_code({reason, _first, _second}) when is_atom(reason), do: Atom.to_string(reason)
+  defp reason_code({reason, _first, _second, _third}) when is_atom(reason), do: Atom.to_string(reason)
+  defp reason_code(_reason), do: "antigravity_protocol_error"
 
   defp default_on_message(_message), do: :ok
 end

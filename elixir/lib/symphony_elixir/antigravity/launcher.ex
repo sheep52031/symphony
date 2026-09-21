@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Antigravity.Launcher do
 
   @bubblewrap "/usr/bin/bwrap"
   @trusted_path "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  @private_runtime_dir "/tmp/symphony-antigravity-runtime"
 
   @type launch :: %{
           executable: Path.t(),
@@ -69,12 +70,19 @@ defmodule SymphonyElixir.Antigravity.Launcher do
       "--ro-bind",
       "/",
       "/",
+      "--tmpfs",
+      "/run/user",
       "--dev",
       "/dev",
       "--proc",
       "/proc",
       "--tmpfs",
       "/tmp",
+      "--dir",
+      @private_runtime_dir,
+      "--chmod",
+      "0700",
+      @private_runtime_dir,
       "--bind",
       workspace,
       workspace,
@@ -108,10 +116,11 @@ defmodule SymphonyElixir.Antigravity.Launcher do
     base = %{
       "HOME" => profile_root,
       "LANG" => System.get_env("LANG") || "C.UTF-8",
-      "PATH" => @trusted_path
+      "PATH" => @trusted_path,
+      "XDG_RUNTIME_DIR" => @private_runtime_dir
     }
 
-    ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LC_ALL", "LC_CTYPE"]
+    ["LC_ALL", "LC_CTYPE"]
     |> Enum.reduce(base, fn name, environment ->
       case System.get_env(name) do
         value when is_binary(value) and value != "" -> Map.put(environment, name, value)
