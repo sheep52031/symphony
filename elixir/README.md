@@ -208,9 +208,10 @@ Notes:
   `/bin`, `/etc`, and `/usr`), broad aggregate roots such as `/var`, the real user home or its
   ancestors, and roots overlapping the issue workspace are rejected. Specific descendants of the
   canonical home, private temporary roots, or dedicated roots such as `/var/lib/agy-profile`
-  remain supported; home-based roots require at least two components below home, reject credential
-  and configuration trees, and use `~/.agy-profiles/<slot>` for profiles. The same writable-root
-  policy applies to the issue workspace. Symphony does not
+  remain supported. Under the canonical home, `profile_root` uses exactly
+  `~/.agy-profiles/<slot>`, while the issue workspace uses a non-hidden,
+  non-credential/configuration path at least two components below home; each role rejects the
+  other's home shape. Symphony does not
   rotate profiles or fall back to another backend.
   AntiGravity SSH workers are rejected.
 - AntiGravity requires `/usr/bin/bwrap`. It runs with `--unshare-all --share-net --unshare-user

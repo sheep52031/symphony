@@ -506,9 +506,9 @@ Fields:
     such as `/home`, `/media`, `/mnt`, `/opt`, `/srv`, `/tmp`, `/var`, `/var/lib`, and `/var/tmp`
     MUST be rejected when selected directly; sufficiently specific dedicated descendants, including
     `/var/lib/agy-profile`, MAY be selected when they are canonical directories. Under the canonical
-    home, direct children and credential/configuration trees MUST be rejected; dedicated roots MUST
-    be at least two components below home, with `~/.agy-profiles/<slot>` as the supported profile
-    shape.
+    home, role semantics are distinct: `profile_root` MUST use exactly `~/.agy-profiles/<slot>`,
+    while `workspace` MUST use a non-hidden, non-credential/configuration path at least two
+    components below home. Each role MUST reject the other's home shape.
 - `first_event_timeout_ms` (positive integer, default `30000`)
   - Absolute deadline from prompt submission to the first native progress/result event.
 - `turn_timeout_ms` (positive integer, default `3600000`)

@@ -39,7 +39,7 @@ defmodule SymphonyElixir.Antigravity.Launcher do
              is_integer(turn_timeout_ms) and turn_timeout_ms > 0 do
     bubblewrap = Keyword.get(opts, :bubblewrap_executable, @bubblewrap)
 
-    with {:ok, canonical_home} <- canonical_user_home(),
+    with {:ok, canonical_home} <- canonical_user_home(Keyword.get(opts, :user_home)),
          {:ok, canonical_workspace} <- canonical_directory(workspace, :workspace),
          {:ok, canonical_profile_root} <- canonical_directory(profile_root, :profile_root),
          :ok <- validate_workspace_boundary(canonical_workspace, canonical_home),
@@ -224,6 +224,8 @@ defmodule SymphonyElixir.Antigravity.Launcher do
     _error -> {:error, :invalid_antigravity_home}
   end
 
+  defp canonical_user_home(nil), do: canonical_user_home()
+
   defp canonical_user_home(configured_home) do
     with true <- Path.type(configured_home) == :absolute,
          {:ok, first} <- PathSafety.canonicalize(configured_home),
@@ -264,32 +266,39 @@ defmodule SymphonyElixir.Antigravity.Launcher do
   end
 
   defp validate_writable_root(path, label, home) do
-    if unsafe_writable_root?(path, home) or not dedicated_writable_root?(path, home),
+    if unsafe_writable_root?(path, label, home) or not dedicated_writable_root?(path, label, home),
       do: {:error, unsafe_writable_root_error(label, path)},
       else: :ok
   end
 
-  defp unsafe_writable_root?(path, home) do
+  defp unsafe_writable_root?(path, label, home) do
     path == "/" or path_contains?(path, home) or
-      (path_contains?(home, path) and not dedicated_home_root?(path, home)) or
+      (path_contains?(home, path) and not dedicated_home_root?(path, label, home)) or
       security_sensitive_path?(path) or path in @broad_writable_roots or top_level_path?(path)
   end
 
-  defp dedicated_writable_root?(path, home) do
-    dedicated_home_root?(path, home) or Enum.any?(@dedicated_parent_roots, &strictly_contains?(&1, path))
+  defp dedicated_writable_root?(path, label, home) do
+    if path_contains?(home, path),
+      do: dedicated_home_root?(path, label, home),
+      else: Enum.any?(@dedicated_parent_roots, &strictly_contains?(&1, path))
   end
 
-  defp dedicated_home_root?(path, home) do
-    if path_contains?(home, path) and path != home do
-      case relative_path_segments(home, path) do
-        [".agy-profiles", _slot] -> true
-        [first, _second | _rest] -> not credential_home_root?(first)
-        _ -> false
-      end
-    else
-      false
-    end
+  defp dedicated_home_root?(path, :profile_root, home) do
+    path_contains?(home, path) and path != home and relative_path_segments(home, path) |> profile_home_root?()
   end
+
+  defp dedicated_home_root?(path, :workspace, home) do
+    path_contains?(home, path) and path != home and
+      relative_path_segments(home, path) |> workspace_home_root?()
+  end
+
+  defp profile_home_root?([".agy-profiles", slot]), do: slot != ""
+  defp profile_home_root?(_segments), do: false
+
+  defp workspace_home_root?(segments) when length(segments) >= 2,
+    do: Enum.all?(segments, &(not credential_home_root?(&1)))
+
+  defp workspace_home_root?(_segments), do: false
 
   defp credential_home_root?(segment),
     do: segment in @credential_home_roots or String.starts_with?(segment, ".")

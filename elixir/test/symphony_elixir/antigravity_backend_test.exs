@@ -199,23 +199,40 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
   test "requires dedicated home descendants and protects credential roots" do
     root = temporary_root("home-policy")
-    home = Path.expand(System.user_home!())
+    home = Path.join(root, "home")
+    File.mkdir_p!(home)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    home_suffix = System.unique_integer([:positive])
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
-    home_workspace = Path.join(home, "issues/JARVIS-907")
-    home_profile = Path.join(home, ".agy-profiles/slot-a")
+    home_workspace = Path.join(home, "issues/symphony-antigravity-#{home_suffix}")
+    home_profile = Path.join(home, ".agy-profiles/slot-#{home_suffix}")
     agy = Path.join(root, "agy")
     bwrap = Path.join(root, "bwrap")
+    launcher_opts = [bubblewrap_executable: bwrap, user_home: home]
     File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
+    File.mkdir_p!(home_workspace)
+    File.mkdir_p!(home_profile)
     write_executable!(agy, "#!/bin/sh\nexit 0\n")
     write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
 
-    assert {:error, {:antigravity_directory_not_found, :workspace, ^home_workspace}} =
-             Launcher.build(home_workspace, agy, profile, 1_000, bubblewrap_executable: bwrap)
+    assert {:ok, workspace_launch} =
+             Launcher.build(home_workspace, agy, profile, 1_000, launcher_opts)
 
-    assert {:error, {:antigravity_directory_not_found, :profile_root, ^home_profile}} =
-             Launcher.build(workspace, agy, home_profile, 1_000, bubblewrap_executable: bwrap)
+    assert workspace_launch.workspace == home_workspace
+
+    assert {:ok, profile_launch} =
+             Launcher.build(workspace, agy, home_profile, 1_000, launcher_opts)
+
+    assert profile_launch.profile_root == home_profile
+
+    assert {:error, {:unsafe_antigravity_workspace, ^home_profile}} =
+             Launcher.build(home_profile, agy, profile, 1_000, launcher_opts)
+
+    assert {:error, {:unsafe_antigravity_profile_root, ^home_workspace}} =
+             Launcher.build(workspace, agy, home_workspace, 1_000, launcher_opts)
 
     for unsafe_root <- [
           Path.join(home, "issues"),
@@ -233,13 +250,11 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           Path.join(home, ".password-store")
         ] do
       assert {:error, {:unsafe_antigravity_profile_root, ^unsafe_root}} =
-               Launcher.build(profile, agy, unsafe_root, 1_000, bubblewrap_executable: bwrap)
+               Launcher.build(profile, agy, unsafe_root, 1_000, launcher_opts)
 
       assert {:error, {:unsafe_antigravity_workspace, ^unsafe_root}} =
-               Launcher.build(unsafe_root, agy, profile, 1_000, bubblewrap_executable: bwrap)
+               Launcher.build(unsafe_root, agy, profile, 1_000, launcher_opts)
     end
-
-    File.rm_rf!(root)
   end
 
   test "masks the real home and projects only the canonical writable roots and AGY file" do
