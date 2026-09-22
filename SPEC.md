@@ -560,8 +560,10 @@ Launch and protocol requirements:
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
   active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
   include a stable workflow scope as well as issue identity so unrelated repositories and tracker
-  instances cannot collide. Every dispatched writer MUST carry a non-null, monotonically reserved
-  attempt identity. Active-marker replacement and removal MUST verify workflow, issue, workspace,
+  instances cannot collide. Every dispatched writer MUST carry a non-null unique writer ID plus a
+  monotonically reserved writer-attempt identity that is distinct from the public retry/continuation
+  attempt used by prompts, status, and backoff. Active-marker replacement and removal MUST verify
+  workflow, issue, workspace,
   event, binding, attempt, and an explicit predecessor-event lineage while holding an exclusive lock
   on a stable ownership key independent of marker existence; a resumed event may transfer ownership
   to exactly its authorized next terminal event, but unrelated, stale, cleared, or concurrent owners
@@ -873,7 +875,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   `terminal_failure` hold before ordinary dispatch. If a corresponding resume-intent receipt already
   exists but no live writer can be proven after restart, recovery is ambiguous and MUST fail closed;
   it MUST NOT create a duplicate writer.
-- A successful attempt clears all active-marker locations only after backend process settlement and
+- A successful attempt uses the same canonical lifecycle settlement operation as terminal cleanup,
+  clearing both active and storage-fault marker families only after backend process settlement and
   only when their recorded event owner matches. Failure to clear is a typed lifecycle-storage
   failure, MUST hold without continuation, and MUST disable further dispatch in that service
   instance. Immutable terminal and resume receipts remain as lifecycle evidence until normal
@@ -886,8 +889,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
   resume paths until an operator repairs storage and restarts. Lifecycle settlement MUST
   ownership-clear both a matching active-marker family and its storage-fault family; clearing only
   one is not successful settlement.
-- Startup terminal cleanup and running-issue reconciliation remove each exact recorded workspace
-  for an issue already in a terminal state before clearing that issue's ownership-checked active
+- Startup terminal cleanup and running-issue reconciliation read durable lifecycle evidence after
+  stopping the writer, even when its update is still queued, then remove each exact recorded
+  workspace for an issue already in a terminal state before clearing that issue's ownership-checked active
   markers. Cleanup or marker settlement failure MUST stop startup or latch dispatch rather than
   silently release ownership.
 - A proven resumed writer that later crashes or stalls MUST become a new durably linked terminal

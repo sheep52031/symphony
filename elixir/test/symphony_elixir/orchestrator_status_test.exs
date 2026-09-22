@@ -195,6 +195,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         :ok
     end
 
+    settled_snapshot =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          Enum.any?(snapshot.blocked, fn blocked ->
+            blocked.issue_id == issue.id and
+              blocked.disposition == :terminal_failure and
+              blocked.terminal_failure.reason == :worker_crashed and
+              blocked.terminal_failure.predecessor_event_id == evidence.event_id
+          end)
+        end,
+        1_000
+      )
+
+    assert settled_snapshot.retrying == []
     GenServer.stop(pid, :normal)
     recovery_name = Module.concat(__MODULE__, :TerminalRecoveryOrchestrator)
     {:ok, recovery_pid} = Orchestrator.start_link(name: recovery_name)
@@ -204,10 +219,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     Orchestrator.request_refresh(recovery_name)
-    Process.sleep(75)
 
-    assert %{running: [], retrying: [], blocked: [recovered]} =
-             Orchestrator.snapshot(recovery_name, 1_000)
+    recovery_snapshot =
+      wait_for_snapshot(
+        recovery_name,
+        fn snapshot ->
+          Enum.any?(snapshot.blocked, &(&1.issue_id == issue.id))
+        end,
+        1_000
+      )
+
+    assert %{running: [], retrying: [], blocked: [recovered]} = recovery_snapshot
 
     assert recovered.disposition == :terminal_failure
     assert recovered.recovery_state == :settled
@@ -472,8 +494,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, second])
     Orchestrator.request_refresh(orchestrator_name)
-    Process.sleep(100)
-    after_refresh = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    after_refresh =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          snapshot.polling.checking? == false and
+            is_integer(snapshot.polling.next_poll_in_ms) and
+            snapshot.polling.next_poll_in_ms > 1_000
+        end,
+        1_000
+      )
+
     assert after_refresh.running == []
     assert after_refresh.retrying == []
     refute File.exists?(Path.join(workspace_root, second.identifier))
@@ -702,7 +734,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       worker_host: nil,
       workspace_path: workspace,
       session_id: evidence.session_id,
-      terminal_failure: evidence,
+      terminal_failure: nil,
       terminal_storage_failure: nil,
       resume_handoff: nil,
       retry_attempt: 0,

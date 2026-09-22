@@ -381,7 +381,8 @@ defmodule SymphonyElixir.Orchestrator do
         backend: Map.get(running_entry, :backend),
         issue_id: issue_id,
         issue_identifier: Map.get(running_entry, :identifier),
-        attempt: Map.get(running_entry, :retry_attempt),
+        attempt: Map.get(running_entry, :writer_attempt),
+        writer_id: Map.get(running_entry, :writer_id),
         session_id: Map.get(running_entry, :session_id),
         workspace: Map.get(running_entry, :workspace_path),
         binding_id: Map.get(running_entry, :binding_id),
@@ -803,13 +804,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp settle_running_terminal_issue(state, issue_id, running_entry, issue) do
-    cleanup_result =
-      if terminal_failure_blocker?(running_entry) or
-           terminal_storage_failure_blocker?(running_entry) do
-        cleanup_terminal_issue_lifecycle(issue, running_entry)
-      else
-        normalize_workspace_cleanup(cleanup_issue_workspace_strict(issue, running_entry))
-      end
+    cleanup_result = settle_running_terminal_lifecycle(issue, running_entry)
 
     case cleanup_result do
       :ok ->
@@ -831,6 +826,32 @@ defmodule SymphonyElixir.Orchestrator do
           )
 
         latch_lifecycle_storage_fault(state, failure)
+    end
+  end
+
+  defp settle_running_terminal_lifecycle(issue, running_entry) do
+    workspace =
+      Map.get(running_entry, :workspace_path) ||
+        Path.join(Config.local_workspace_root(), Workspace.workspace_key(issue))
+
+    running_entry = Map.put(running_entry, :workspace_path, workspace)
+
+    case SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id) do
+      :none ->
+        normalize_workspace_cleanup(cleanup_issue_workspace_strict(issue, running_entry))
+
+      {disposition, evidence} when disposition in [:settled, :ambiguous] ->
+        running_entry
+        |> Map.put(:terminal_failure, evidence)
+        |> then(&cleanup_terminal_issue_lifecycle(issue, &1))
+
+      {:storage_fault, failure} ->
+        running_entry
+        |> Map.put(:terminal_storage_failure, failure)
+        |> then(&cleanup_terminal_issue_lifecycle(issue, &1))
+
+      {:error, reason} ->
+        {:error, {:terminal_recovery_read_failed, reason}}
     end
   end
 
@@ -1497,7 +1518,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, _attempt, recipient, worker_host, binding, workspace_path) do
+  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding, workspace_path) do
     case reserve_issue_attempt(state, issue) do
       {:ok, state} ->
         writer_attempt = max(issue_attempt_count(state, issue.id) - 1, 0)
@@ -1505,6 +1526,7 @@ defmodule SymphonyElixir.Orchestrator do
         spawn_reserved_issue_on_worker_host(
           state,
           issue,
+          attempt,
           writer_attempt,
           recipient,
           worker_host,
@@ -1517,14 +1539,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding, workspace_path) do
+  defp spawn_reserved_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         writer_attempt,
+         recipient,
+         worker_host,
+         binding,
+         workspace_path
+       ) do
     backend_name = binding_backend_name(binding, Config.settings!().agent.backend)
+    writer_id = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(
              issue,
              recipient,
              attempt: attempt,
+             writer_attempt: writer_attempt,
+             writer_id: writer_id,
              worker_host: worker_host,
              backend: backend_name,
              binding: binding,
@@ -1567,6 +1601,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            writer_attempt: writer_attempt,
+            writer_id: writer_id,
             started_at: DateTime.utc_now()
           })
 

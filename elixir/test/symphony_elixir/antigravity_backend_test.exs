@@ -414,13 +414,16 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       evidence =
         Backend.run_turn(session, prompt, issue,
           on_message: on_message,
-          attempt: 2
+          attempt: 7,
+          writer_attempt: 2,
+          writer_id: String.duplicate("c", 64)
         )
         |> assert_terminal_failure(reason)
 
       assert evidence.issue_id == issue.id
       assert evidence.issue_identifier == issue.identifier
       assert evidence.attempt == 2
+      assert evidence.writer_id == String.duplicate("c", 64)
       assert evidence.session_id == "agy-session"
       assert Map.get(evidence, :provider_code) == provider_code
       assert Map.get(evidence, :http_status) == http_status

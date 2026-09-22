@@ -1624,6 +1624,7 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       issue = %Issue{
+        id: "issue-s99",
         identifier: "S-99",
         title: "Smoke test",
         description: "Run and keep workspace",
@@ -1632,21 +1633,33 @@ defmodule SymphonyElixir.CoreTest do
         labels: ["backend"]
       }
 
-      before = MapSet.new(File.ls!(workspace_root))
-      assert :ok = AgentRunner.run(issue)
-      entries_after = MapSet.new(File.ls!(workspace_root))
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
 
-      created =
-        MapSet.difference(entries_after, before) |> Enum.filter(&(&1 == "S-99"))
+      evidence =
+        SymphonyElixir.TerminalFailure.build(:worker_crashed, %{}, %{
+          backend: :codex,
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          attempt: 0,
+          session_id: nil,
+          workspace: workspace,
+          binding_id: nil,
+          writer_id: String.duplicate("a", 64)
+        })
 
-      created = MapSet.new(created)
+      assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
 
-      assert MapSet.size(created) == 1
-      workspace_name = created |> Enum.to_list() |> List.first()
-      assert workspace_name == "S-99"
+      assert {:ok, _path} =
+               SymphonyElixir.TerminalFailure.persist_storage_fault(
+                 workspace,
+                 evidence,
+                 :active_marker_unavailable
+               )
 
-      workspace = Path.join(workspace_root, workspace_name)
+      issue_state_fetcher = fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: issue_state_fetcher)
       assert File.exists?(workspace)
+      assert :none = SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
       assert File.exists?(Path.join(workspace, "README.md"))
     after
       File.rm_rf(test_root)

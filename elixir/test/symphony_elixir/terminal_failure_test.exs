@@ -54,6 +54,22 @@ defmodule SymphonyElixir.TerminalFailureTest do
       )
 
     refute next_attempt.event_id == first.event_id
+
+    first_writer =
+      TerminalFailure.build(
+        :worker_crashed,
+        %{},
+        Map.put(context, :writer_id, String.duplicate("a", 64))
+      )
+
+    restarted_writer =
+      TerminalFailure.build(
+        :worker_crashed,
+        %{},
+        Map.put(context, :writer_id, String.duplicate("b", 64))
+      )
+
+    refute first_writer.event_id == restarted_writer.event_id
     refute Map.has_key?(first, :message)
     refute inspect(first) =~ "owner@example.com"
     refute inspect(first) =~ "secret-refresh-value"
@@ -101,6 +117,7 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert :ok = TerminalFailure.clear_active(workspace, context.issue_id)
     assert :none = TerminalFailure.recovery_state(workspace, context.issue_id)
     assert :none = TerminalFailure.recovery_state(relocated_workspace, context.issue_id)
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id)
     File.rm_rf!(Path.dirname(relocated_workspace))
   end
 
@@ -254,6 +271,9 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
     assert {:storage_fault, %{code: :incomplete_terminal_mirror}} =
              TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    assert :ok = TerminalFailure.clear_active(workspace, evidence.issue_id)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
 
     File.write!(global_event, event_bytes)
     File.rm!(global_active)
@@ -1007,6 +1027,32 @@ defmodule SymphonyElixir.TerminalFailureTest do
         "occurred_at" => DateTime.utc_now() |> DateTime.to_iso8601()
       })
     )
+
+    assert {:error, :invalid_terminal_failure_receipt} =
+             TerminalFailure.recovery_state(workspace)
+
+    malformed_writer =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: "issue-tamper",
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+      |> Map.put(:writer_id, "short")
+      |> Map.delete(:event_id)
+
+    malformed_writer =
+      Map.put(
+        malformed_writer,
+        :event_id,
+        :crypto.hash(:sha256, :erlang.term_to_binary(malformed_writer, [:deterministic]))
+        |> Base.encode16(case: :lower)
+      )
+
+    File.write!(marker, Jason.encode!(malformed_writer))
 
     assert {:error, :invalid_terminal_failure_receipt} =
              TerminalFailure.recovery_state(workspace)

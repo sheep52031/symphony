@@ -160,7 +160,9 @@ defmodule SymphonyElixir.AgentRunner do
         do: TerminalFailure.recovery_state(workspace, issue.id),
         else: TerminalFailure.recovery_state(workspace)
 
-    case TerminalFailure.clear_active(workspace, issue.id) do
+    result = settle_recovered_lifecycle(workspace, issue.id, recovery)
+
+    case result do
       :ok ->
         :ok
 
@@ -170,10 +172,35 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp settle_recovered_lifecycle(_workspace, _issue_id, :none), do: :ok
+
+  defp settle_recovered_lifecycle(workspace, issue_id, recovery) when is_binary(issue_id) do
+    case recovery do
+      {disposition, %{event_id: event_id}} when disposition in [:settled, :ambiguous] ->
+        TerminalFailure.settle_lifecycle(workspace, issue_id, event_id)
+
+      {:storage_fault, %{event_id: event_id}} ->
+        TerminalFailure.settle_lifecycle(workspace, issue_id, event_id)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp settle_recovered_lifecycle(workspace, _issue_id, _recovery) do
+    TerminalFailure.clear_active(workspace)
+  end
+
   defp send_marker_storage_failure(recipient, issue, workspace, recovery, reason) do
     evidence =
       case recovery do
         {disposition, recovered} when disposition in [:settled, :ambiguous] -> recovered
+        _other -> nil
+      end
+
+    event_id =
+      case recovery do
+        {_disposition, %{event_id: event_id}} -> event_id
         _other -> nil
       end
 
@@ -189,7 +216,7 @@ defmodule SymphonyElixir.AgentRunner do
       event: :terminal_storage_failure,
       terminal_storage_failure: %{
         code: stable_error_code(reason),
-        event_id: if(evidence, do: evidence.event_id)
+        event_id: event_id
       },
       timestamp: DateTime.utc_now()
     })
@@ -236,6 +263,8 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: agent_message_handler(codex_update_recipient, issue, backend_name),
              attempt: Keyword.get(opts, :attempt),
+             writer_attempt: Keyword.get(opts, :writer_attempt),
+             writer_id: Keyword.get(opts, :writer_id),
              turn_number: turn_number,
              binding: Keyword.get(opts, :binding),
              predecessor_event_id: Keyword.get(opts, :predecessor_event_id)

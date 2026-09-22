@@ -38,6 +38,7 @@ defmodule SymphonyElixir.TerminalFailure do
           required(:issue_id) => String.t() | nil,
           required(:issue_identifier) => String.t() | nil,
           required(:attempt) => non_neg_integer() | nil,
+          optional(:writer_id) => String.t(),
           required(:session_id) => String.t() | nil,
           required(:workspace) => Path.t(),
           required(:binding_id) => String.t() | nil,
@@ -71,6 +72,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
     evidence =
       evidence
+      |> maybe_put(:writer_id, normalize_writer_id(Map.get(context, :writer_id)))
       |> maybe_put(:provider_code, normalize_provider_code(Map.get(details, :provider_code)))
       |> maybe_put(:http_status, normalize_http_status(Map.get(details, :http_status)))
       |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(details, :reset_hint)))
@@ -249,34 +251,36 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
-  @doc false
-  @spec remove_active_marker_for_test(Path.t()) :: :ok | {:error, term()}
-  def remove_active_marker_for_test(path) do
-    case remove_active_marker(path) do
-      {:cont, :ok} -> :ok
-      {:halt, {:error, _reason} = error} -> error
+  if Mix.env() == :test do
+    @doc false
+    @spec remove_active_marker_for_test(Path.t()) :: :ok | {:error, term()}
+    def remove_active_marker_for_test(path) do
+      case remove_active_marker(path) do
+        {:cont, :ok} -> :ok
+        {:halt, {:error, _reason} = error} -> error
+      end
     end
-  end
 
-  @doc false
-  @spec active_transfer_allowed_for_test(Path.t(), String.t(), evidence()) ::
-          :ok | {:error, term()}
-  def active_transfer_allowed_for_test(path, payload, evidence),
-    do: active_transfer_allowed?(path, payload, evidence)
+    @doc false
+    @spec active_transfer_allowed_for_test(Path.t(), String.t(), evidence()) ::
+            :ok | {:error, term()}
+    def active_transfer_allowed_for_test(path, payload, evidence),
+      do: active_transfer_allowed?(path, payload, evidence)
 
-  @doc false
-  @spec persist_active_paths_for_test([Path.t()], String.t()) :: :ok | {:error, term()}
-  def persist_active_paths_for_test(paths, payload),
-    do: persist_all_existing_active(paths, payload)
+    @doc false
+    @spec persist_active_paths_for_test([Path.t()], String.t()) :: :ok | {:error, term()}
+    def persist_active_paths_for_test(paths, payload),
+      do: persist_all_existing_active(paths, payload)
 
-  @doc false
-  @spec classify_candidate_error_for_test(term()) :: {:error, term()}
-  def classify_candidate_error_for_test(reason) do
-    persist_candidates(
-      [Path.join(System.tmp_dir!(), "terminal-failure-candidate-test")],
-      fn _path -> {:error, reason} end,
-      :candidate_error
-    )
+    @doc false
+    @spec classify_candidate_error_for_test(term()) :: {:error, term()}
+    def classify_candidate_error_for_test(reason) do
+      persist_candidates(
+        [Path.join(System.tmp_dir!(), "terminal-failure-candidate-test")],
+        fn _path -> {:error, reason} end,
+        :candidate_error
+      )
+    end
   end
 
   @spec storage_ready() :: :ok | {:error, term()}
@@ -347,17 +351,27 @@ defmodule SymphonyElixir.TerminalFailure do
           occurred_at: occurred_at
         } = evidence
       ) do
-    predecessor_event_id = Map.get(evidence, :predecessor_event_id)
-
-    valid_hash?(event_id) and valid_hash?(Map.get(evidence, :workflow_scope)) and
-      (is_nil(predecessor_event_id) or valid_hash?(predecessor_event_id)) and
-      valid_reason?(reason, category) and valid_backend?(backend) and
+    valid_event_id?(event_id, evidence) and valid_hash?(Map.get(evidence, :workflow_scope)) and
+      valid_optional_hashes?(evidence) and valid_reason?(reason, category) and
+      valid_backend?(backend) and
       is_binary(workspace) and workspace != "" and is_binary(occurred_at)
   end
 
   def valid?(_evidence), do: false
 
   defp valid_hash?(value), do: is_binary(value) and byte_size(value) == 64
+
+  defp valid_event_id?(value, evidence) do
+    valid_hash?(value) and value == event_id(Map.delete(evidence, :event_id))
+  end
+
+  defp valid_optional_hashes?(evidence) do
+    Enum.all?([:predecessor_event_id, :writer_id], fn key ->
+      value = Map.get(evidence, key)
+      is_nil(value) or valid_hash?(value)
+    end)
+  end
+
   defp valid_reason?(reason, category), do: reason in @reasons and category == category(reason)
   defp valid_backend?(backend), do: is_atom(backend) and not is_nil(backend)
 
@@ -546,6 +560,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
     evidence =
       evidence
+      |> maybe_put(:writer_id, normalize_writer_id(Map.get(decoded, "writer_id")))
       |> maybe_put(:provider_code, normalize_provider_code(Map.get(decoded, "provider_code")))
       |> maybe_put(:http_status, normalize_http_status(Map.get(decoded, "http_status")))
       |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(decoded, "reset_hint")))
@@ -892,12 +907,14 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
-  @doc false
-  @spec active_lock_path_for_test(Path.t(), String.t()) :: Path.t()
-  def active_lock_path_for_test(workspace, issue_id) do
-    workspace
-    |> active_paths(issue_id)
-    |> ownership_lock_path()
+  if Mix.env() == :test do
+    @doc false
+    @spec active_lock_path_for_test(Path.t(), String.t()) :: Path.t()
+    def active_lock_path_for_test(workspace, issue_id) do
+      workspace
+      |> active_paths(issue_id)
+      |> ownership_lock_path()
+    end
   end
 
   defp with_active_marker_locks(paths, operation) do
@@ -922,14 +939,21 @@ defmodule SymphonyElixir.TerminalFailure do
     Path.join(state_root(), "locks/#{ownership_key}.lock")
   end
 
-  defp acquire_marker_locks([], acquired), do: {:ok, acquired}
+  defp acquire_marker_locks(paths, acquired), do: acquire_marker_locks(paths, acquired, 40)
 
-  defp acquire_marker_locks([lock_path | rest], acquired) do
+  defp acquire_marker_locks([], acquired, _attempts_left), do: {:ok, acquired}
+
+  defp acquire_marker_locks([lock_path | rest] = paths, acquired, attempts_left) do
     with :ok <- File.mkdir_p(Path.dirname(lock_path)),
          :ok <- File.mkdir(lock_path) do
-      acquire_marker_locks(rest, [lock_path | acquired])
+      acquire_marker_locks(rest, [lock_path | acquired], 40)
     else
-      {:error, reason} -> {:error, {:active_marker_locked, lock_path, reason}, acquired}
+      {:error, :eexist} when attempts_left > 0 ->
+        Process.sleep(5)
+        acquire_marker_locks(paths, acquired, attempts_left - 1)
+
+      {:error, reason} ->
+        {:error, {:active_marker_locked, lock_path, reason}, acquired}
     end
   end
 
@@ -1057,6 +1081,9 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp normalize_attempt(value) when is_integer(value) and value >= 0, do: value
   defp normalize_attempt(_value), do: nil
+
+  defp normalize_writer_id(value) when is_binary(value) and byte_size(value) == 64, do: value
+  defp normalize_writer_id(_value), do: nil
 
   defp normalize_provider_code(value) when value in ["RESOURCE_EXHAUSTED", "UNAUTHENTICATED", "PERMISSION_DENIED", "UNAVAILABLE"],
     do: value

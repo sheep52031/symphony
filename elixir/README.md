@@ -50,8 +50,9 @@ fields—never raw provider prose, account identifiers, tokens, OAuth payloads, 
 persists an immutable receipt plus a fail-closed active marker, with a workspace-root fallback and
 a workflow-scoped lifecycle index beside the configured log directory so workspace-root reloads
 cannot lose an active hold or collide with another tracker/repository instance. Active ownership is
-bound to the workflow, issue, workspace, event, binding, monotonically reserved attempt, and an
-explicit predecessor event. It is changed under a stable ownership-key lock that exists independently
+bound to the workflow, issue, workspace, event, binding, unique writer ID, monotonically reserved
+writer attempt, and an explicit predecessor event. Writer identity remains distinct from the public
+retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key lock that exists independently
 of marker files; stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
@@ -82,8 +83,9 @@ clear failures are distinct lifecycle-storage blockers: the service schedules no
 immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
 operator repairs storage and restarts. Startup probes the actual event, active, resume, and fault
 namespaces; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
-reconciliation remove the exact recorded workspace before ownership-checked settlement of both the
-active and storage-fault marker families. The JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or
+reconciliation reread durable lifecycle evidence after the writer stops, then remove the exact
+recorded workspace before ownership-checked settlement of both the active and storage-fault marker
+families. Successful AgentRunner completion uses that same dual-family settlement operation. The JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or
 provider secrets.
 
 ## How to use it
