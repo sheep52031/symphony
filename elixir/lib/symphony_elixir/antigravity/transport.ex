@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @line_bytes 1_048_576
   @max_identity_bytes 256
   @max_text_delta_bytes 65_536
-  @step_types ~w(user_input agent_response tool checkpoint)
+  @step_types ~w(user_input agent_response tool checkpoint system_message)
   @terminal_statuses ~w(SUCCESS ERROR CANCELED INTERRUPTED INVALID WAITING RUNNING)
   @process_group_detection_attempts 400
   @graceful_close_ms 250
