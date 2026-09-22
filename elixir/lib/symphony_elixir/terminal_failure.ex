@@ -31,6 +31,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
   @type evidence :: %{
           required(:event_id) => String.t(),
+          required(:workflow_scope) => String.t(),
           required(:reason) => reason(),
           required(:category) => String.t(),
           required(:backend) => atom(),
@@ -53,6 +54,7 @@ defmodule SymphonyElixir.TerminalFailure do
   @spec build(reason(), map(), map()) :: evidence()
   def build(reason, details, context) when reason in @reasons and is_map(details) and is_map(context) do
     evidence = %{
+      workflow_scope: lifecycle_scope(),
       reason: reason,
       category: category(reason),
       backend: Map.fetch!(context, :backend),
@@ -81,11 +83,20 @@ defmodule SymphonyElixir.TerminalFailure do
     with {:ok, payload} <- Jason.encode(json_safe(evidence), pretty: true),
          {:ok, receipt_path} <-
            persist_immutable_candidates(
-             event_receipt_paths(workspace, evidence.issue_id, event_id),
+             event_receipt_paths(
+               workspace,
+               evidence.issue_id,
+               event_id,
+               evidence.workflow_scope
+             ),
              payload
            ),
          {:ok, _active_path} <-
-           persist_replace_candidates(active_paths(workspace, evidence.issue_id), payload) do
+           persist_active_candidates(
+             active_paths(workspace, evidence.issue_id, evidence.workflow_scope),
+             payload,
+             evidence
+           ) do
       {:ok, receipt_path}
     end
   end
@@ -102,24 +113,79 @@ defmodule SymphonyElixir.TerminalFailure do
     read_active(active_paths(workspace, issue_id), workspace, nil)
   end
 
+  @spec recovery_state_for_issue(String.t()) ::
+          :none | {:settled, evidence()} | {:ambiguous, evidence()} | {:error, term()}
+  def recovery_state_for_issue(issue_id) when is_binary(issue_id) do
+    read_active([global_active_path(issue_id)], nil, nil)
+  end
+
   @spec clear_active(Path.t(), String.t() | nil) :: :ok | {:error, term()}
   def clear_active(workspace, issue_id \\ nil) when is_binary(workspace) do
-    {local_paths, global_paths} = Enum.split(active_paths(workspace, issue_id), 2)
+    recovery =
+      if is_binary(issue_id), do: recovery_state(workspace, issue_id), else: recovery_state(workspace)
 
-    case clear_paths(local_paths) do
-      :ok -> clear_paths(global_paths)
+    case recovery do
+      :none ->
+        :ok
+
+      {disposition, evidence} when disposition in [:settled, :ambiguous] ->
+        clear_active(workspace, issue_id, evidence.event_id)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec clear_active(Path.t(), String.t() | nil, String.t()) :: :ok | {:error, term()}
+  def clear_active(workspace, issue_id, expected_event_id)
+      when is_binary(workspace) and is_binary(expected_event_id) do
+    scope = active_marker_scope(workspace, issue_id, expected_event_id)
+    {local_paths, global_paths} = Enum.split(active_paths(workspace, issue_id, scope), 2)
+
+    case clear_paths(local_paths, expected_event_id) do
+      :ok -> clear_paths(global_paths, expected_event_id)
       {:error, _reason} = error -> error
     end
   end
 
-  defp clear_paths(paths) do
+  defp clear_paths(paths, expected_event_id) do
     Enum.reduce_while(paths, :ok, fn path, :ok ->
-      case File.rm(path) do
-        :ok -> {:cont, :ok}
-        {:error, :enoent} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {path, reason}}}
+      case read_active_event_id(path) do
+        {:ok, ^expected_event_id} ->
+          remove_active_marker(path)
+
+        {:ok, _other_event_id} ->
+          {:halt, {:error, {:active_marker_owner_mismatch, path}}}
+
+        {:error, :enoent} ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt, {:error, {path, reason}}}
       end
     end)
+  end
+
+  defp remove_active_marker(path) do
+    case File.rm(path) do
+      :ok -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, {path, reason}}}
+    end
+  end
+
+  @spec storage_ready() :: :ok | {:error, term()}
+  def storage_ready do
+    probe_path = Path.join(state_root(), ".write-probe-#{System.unique_integer([:positive, :monotonic])}")
+
+    with :ok <- File.mkdir_p(Path.dirname(probe_path)),
+         :ok <- File.write(probe_path, "ready", [:exclusive, :sync]),
+         :ok <- File.rm(probe_path) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(probe_path)
+        {:error, {:terminal_state_root_unavailable, reason}}
+    end
   end
 
   @spec record_resume(Path.t(), evidence(), String.t(), non_neg_integer()) ::
@@ -136,27 +202,38 @@ defmodule SymphonyElixir.TerminalFailure do
 
     with {:ok, payload} <- Jason.encode(receipt, pretty: true) do
       persist_immutable_candidates(
-        resume_receipt_paths(workspace, evidence.issue_id, event_id),
+        resume_receipt_paths(
+          workspace,
+          evidence.issue_id,
+          event_id,
+          evidence.workflow_scope
+        ),
         payload
       )
     end
   end
 
   @spec valid?(term()) :: boolean()
-  def valid?(%{
-        event_id: event_id,
-        reason: reason,
-        category: category,
-        backend: backend,
-        workspace: workspace,
-        occurred_at: occurred_at
-      }) do
-    is_binary(event_id) and byte_size(event_id) == 64 and reason in @reasons and
-      category == category(reason) and is_atom(backend) and not is_nil(backend) and
+  def valid?(
+        %{
+          event_id: event_id,
+          reason: reason,
+          category: category,
+          backend: backend,
+          workspace: workspace,
+          occurred_at: occurred_at
+        } = evidence
+      ) do
+    valid_hash?(event_id) and valid_hash?(Map.get(evidence, :workflow_scope)) and
+      valid_reason?(reason, category) and valid_backend?(backend) and
       is_binary(workspace) and workspace != "" and is_binary(occurred_at)
   end
 
   def valid?(_evidence), do: false
+
+  defp valid_hash?(value), do: is_binary(value) and byte_size(value) == 64
+  defp valid_reason?(reason, category), do: reason in @reasons and category == category(reason)
+  defp valid_backend?(backend), do: is_atom(backend) and not is_nil(backend)
 
   defp read_active([], _workspace, nil), do: :none
   defp read_active([], _workspace, error), do: {:error, error}
@@ -169,6 +246,16 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  defp read_active_event_id(path) do
+    with {:ok, contents} <- File.read(path),
+         {:ok, decoded} <- Jason.decode(contents),
+         {:ok, evidence} <- decode_evidence(decoded) do
+      {:ok, evidence.event_id}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp decode_recovery_state(workspace, contents) do
     with {:ok, decoded} <- Jason.decode(contents),
          {:ok, evidence} <- decode_evidence(decoded) do
@@ -176,9 +263,17 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  defp recovery_disposition(nil, evidence),
+    do: recovery_disposition(evidence.workspace, evidence)
+
   defp recovery_disposition(workspace, evidence) do
     if Enum.any?(
-         resume_receipt_paths(workspace, evidence.issue_id, evidence.event_id),
+         resume_receipt_paths(
+           workspace,
+           evidence.issue_id,
+           evidence.event_id,
+           evidence.workflow_scope
+         ),
          &File.regular?/1
        ),
        do: {:ambiguous, evidence},
@@ -192,6 +287,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
     evidence = %{
       event_id: Map.get(decoded, "event_id"),
+      workflow_scope: Map.get(decoded, "workflow_scope"),
       reason: reason,
       category: Map.get(decoded, "category"),
       backend: backend,
@@ -254,33 +350,61 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
-  defp event_receipt_paths(workspace, issue_id, event_id) do
+  defp active_marker_scope(workspace, _issue_id, expected_event_id) do
+    [
+      Path.join(workspace, ".symphony/terminal-failure.json"),
+      Path.join(fallback_root(workspace), "active/#{workspace_hash(workspace)}.json")
+    ]
+    |> Enum.find_value(fn path ->
+      with {:ok, contents} <- File.read(path),
+           {:ok, decoded} <- Jason.decode(contents),
+           {:ok, evidence} <- decode_evidence(decoded),
+           true <- evidence.event_id == expected_event_id do
+        evidence.workflow_scope
+      else
+        _other -> nil
+      end
+    end)
+    |> case do
+      nil -> lifecycle_scope()
+      scope -> scope
+    end
+  end
+
+  defp event_receipt_paths(workspace, issue_id, event_id, scope) do
+    scope = scope || lifecycle_scope()
+
     local_paths = [
       Path.join(workspace, ".symphony/terminal-events/#{event_id}.json"),
       Path.join(fallback_root(workspace), "events/#{workspace_hash(workspace)}-#{event_id}.json")
     ]
 
     if is_binary(issue_id) and issue_id != "" do
-      local_paths ++ [Path.join(state_root(), "events/#{identity_hash(issue_id)}-#{event_id}.json")]
+      local_paths ++
+        [Path.join(state_root(), "events/#{scoped_identity(issue_id, scope)}-#{event_id}.json")]
     else
       local_paths
     end
   end
 
-  defp active_paths(workspace, issue_id) do
+  defp active_paths(workspace, issue_id, scope \\ nil) do
+    scope = scope || lifecycle_scope()
+
     local_paths = [
       Path.join(workspace, ".symphony/terminal-failure.json"),
       Path.join(fallback_root(workspace), "active/#{workspace_hash(workspace)}.json")
     ]
 
     if is_binary(issue_id) and issue_id != "" do
-      local_paths ++ [Path.join(state_root(), "active/#{identity_hash(issue_id)}.json")]
+      local_paths ++ [global_active_path(issue_id, scope)]
     else
       local_paths
     end
   end
 
-  defp resume_receipt_paths(workspace, issue_id, event_id) do
+  defp resume_receipt_paths(workspace, issue_id, event_id, scope) do
+    scope = scope || lifecycle_scope()
+
     local_paths = [
       Path.join(workspace, ".symphony/terminal-resumes/#{event_id}.json"),
       Path.join(fallback_root(workspace), "resumes/#{workspace_hash(workspace)}-#{event_id}.json")
@@ -288,7 +412,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
     if is_binary(issue_id) and issue_id != "" do
       local_paths ++
-        [Path.join(state_root(), "resumes/#{identity_hash(issue_id)}-#{event_id}.json")]
+        [Path.join(state_root(), "resumes/#{scoped_identity(issue_id, scope)}-#{event_id}.json")]
     else
       local_paths
     end
@@ -307,6 +431,19 @@ defmodule SymphonyElixir.TerminalFailure do
       |> Path.join("terminal-holds")
   end
 
+  defp global_active_path(issue_id, scope \\ nil),
+    do: Path.join(state_root(), "active/#{scoped_identity(issue_id, scope)}.json")
+
+  defp scoped_identity(issue_id, scope),
+    do: "#{scope || lifecycle_scope()}-#{identity_hash(issue_id)}"
+
+  defp lifecycle_scope do
+    Application.get_env(:symphony_elixir, :terminal_lifecycle_scope) ||
+      SymphonyElixir.Workflow.workflow_file_path()
+      |> Path.expand()
+      |> identity_hash()
+  end
+
   defp identity_hash(identity) do
     identity
     |> then(&:crypto.hash(:sha256, &1))
@@ -323,8 +460,62 @@ defmodule SymphonyElixir.TerminalFailure do
   defp persist_immutable_candidates(paths, payload),
     do: persist_mirrored(paths, &atomic_create(&1, payload), :immutable_receipt_unavailable)
 
-  defp persist_replace_candidates(paths, payload),
-    do: persist_mirrored(paths, &atomic_replace(&1, payload), :active_marker_unavailable)
+  defp persist_active_candidates(paths, payload, evidence) do
+    persist_mirrored(
+      paths,
+      &claim_active_marker(&1, payload, evidence),
+      :active_marker_unavailable
+    )
+  end
+
+  defp claim_active_marker(path, payload, evidence) do
+    case atomic_create(path, payload) do
+      :ok ->
+        :ok
+
+      {:error, :receipt_conflict} ->
+        replace_claimed_active_marker(path, payload, evidence)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp replace_claimed_active_marker(path, payload, evidence) do
+    with {:ok, contents} <- File.read(path),
+         {:ok, decoded} <- Jason.decode(contents),
+         {:ok, prior} <- decode_evidence(decoded),
+         true <- same_active_owner?(prior, evidence),
+         true <- resumed_event?(prior) do
+      replace_active_marker(path, payload)
+    else
+      false -> {:error, :active_marker_owner_mismatch}
+      {:error, reason} -> {:error, {:active_marker_invalid, reason}}
+    end
+  end
+
+  defp replace_active_marker(path, payload) do
+    case atomic_replace(path, payload) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:active_marker_replace_failed, reason}}
+    end
+  end
+
+  defp same_active_owner?(prior, evidence) do
+    prior.workflow_scope == evidence.workflow_scope and prior.issue_id == evidence.issue_id
+  end
+
+  defp resumed_event?(evidence) do
+    Enum.any?(
+      resume_receipt_paths(
+        evidence.workspace,
+        evidence.issue_id,
+        evidence.event_id,
+        evidence.workflow_scope
+      ),
+      &File.regular?/1
+    )
+  end
 
   defp persist_mirrored(paths, writer, error_tag) do
     {local_paths, global_paths} = Enum.split(paths, 2)
@@ -353,6 +544,9 @@ defmodule SymphonyElixir.TerminalFailure do
       case result do
         :ok -> {:halt, {:ok, path}}
         {:error, :receipt_conflict} = error -> {:halt, error}
+        {:error, :active_marker_owner_mismatch} = error -> {:halt, error}
+        {:error, {:active_marker_invalid, _reason}} = error -> {:halt, error}
+        {:error, {:active_marker_replace_failed, _reason}} = error -> {:halt, error}
         {:error, reason} -> {:cont, {:error, {error_tag, path, reason}}}
       end
     end)

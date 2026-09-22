@@ -610,6 +610,111 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "terminal persistence failure emits a distinct storage blocker without terminal evidence" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    blocked_state_root = Path.join(root, "blocked-state-root")
+    File.write!(blocked_state_root, "not a directory")
+    original_state_root = Application.get_env(:symphony_elixir, :terminal_state_root)
+
+    on_exit(fn ->
+      if original_state_root,
+        do: Application.put_env(:symphony_elixir, :terminal_state_root, original_state_root),
+        else: Application.delete_env(:symphony_elixir, :terminal_state_root)
+
+      File.rm_rf!(root)
+    end)
+
+    Application.put_env(:symphony_elixir, :terminal_state_root, blocked_state_root)
+    issue = %{id: "issue-storage-failure", identifier: "JARVIS-936", title: "Storage failure"}
+    on_message = fn message -> send(self(), {:agy_message, message}) end
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+
+    assert {:error, {:backend_terminal_storage_failure, event_id}} =
+             Backend.run_turn(session, "quota_error", issue,
+               on_message: on_message,
+               attempt: 1
+             )
+
+    assert is_binary(event_id)
+
+    assert_receive {:agy_message,
+                    %{
+                      event: :terminal_storage_failure,
+                      terminal_storage_failure: %{event_id: ^event_id}
+                    }}
+
+    refute_receive {:agy_message, %{event: :terminal_failure}}
+    assert :ok = Backend.stop_session(session)
+  end
+
+  test "AgentRunner emits a lifecycle storage blocker when active-marker clear fails" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+
+    configure_backend!(agy, profile,
+      workspace_root: Path.dirname(workspace),
+      max_turns: 1
+    )
+
+    issue = %Issue{
+      id: "issue-marker-clear",
+      identifier: Path.basename(workspace),
+      title: "Marker clear failure",
+      description: "complete normally",
+      state: "In Progress",
+      url: "https://example.org/issues/marker-clear",
+      dispatchable: true
+    }
+
+    evidence =
+      SymphonyElixir.TerminalFailure.build(
+        :provider_quota_exhausted,
+        %{},
+        %{
+          backend: :antigravity,
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          attempt: 0,
+          session_id: "prior-session",
+          workspace: workspace,
+          binding_id: "slot-a"
+        }
+      )
+
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
+    issue_hash = :crypto.hash(:sha256, issue.id) |> Base.encode16(case: :lower)
+
+    global_marker =
+      Path.join(
+        Application.fetch_env!(:symphony_elixir, :terminal_state_root),
+        "active/#{evidence.workflow_scope}-#{issue_hash}.json"
+      )
+
+    File.rm!(global_marker)
+    File.mkdir_p!(global_marker)
+
+    assert_raise RuntimeError, ~r/terminal_marker_clear_failed/, fn ->
+      SymphonyElixir.AgentRunner.run(
+        issue,
+        self(),
+        workspace_path: workspace,
+        max_turns: 1,
+        issue_state_fetcher: fn _ids -> {:ok, []} end
+      )
+    end
+
+    issue_id = issue.id
+
+    assert_receive {:codex_worker_update, ^issue_id,
+                    %{
+                      event: :terminal_storage_failure,
+                      terminal_storage_failure: %{code: _code}
+                    }}
+
+    refute_receive {:codex_worker_update, ^issue_id, %{event: :terminal_failure}}
+    File.rm_rf!(root)
+  end
+
   test "remains local-only at session start" do
     workspace = temporary_root("remote")
     File.mkdir_p!(workspace)
@@ -657,6 +762,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
     agy = Path.join(root, "fake-agy")
+    File.rm_rf!(root)
     File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
     write_fake_agy!(agy)
@@ -822,6 +928,14 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
          reason
        ) do
     assert SymphonyElixir.TerminalFailure.valid?(evidence)
+
+    assert :ok =
+             SymphonyElixir.TerminalFailure.clear_active(
+               evidence.workspace,
+               evidence.issue_id,
+               evidence.event_id
+             )
+
     evidence
   end
 

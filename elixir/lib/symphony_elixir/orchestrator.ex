@@ -42,7 +42,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      lifecycle_storage_fault: nil
     ]
   end
 
@@ -71,10 +72,12 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
-
-        {:ok, state}
+        with :ok <- SymphonyElixir.TerminalFailure.storage_ready(),
+             :ok <- run_terminal_workspace_cleanup() do
+          {:ok, schedule_tick(state, 0)}
+        else
+          {:error, reason} -> {:stop, {:terminal_lifecycle_storage_unavailable, reason}}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -209,6 +212,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     cond do
+      terminal_storage_failure_blocker?(running_entry) ->
+        block_terminal_storage_failure_agent_down(state, issue_id, running_entry, session_id)
+
       terminal_failure_blocker?(running_entry) ->
         block_terminal_failure_agent_down(state, issue_id, running_entry, session_id)
 
@@ -246,6 +252,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     cond do
+      terminal_storage_failure_blocker?(running_entry) ->
+        block_terminal_storage_failure_agent_down(state, issue_id, running_entry, session_id)
+
       terminal_failure_blocker?(running_entry) ->
         block_terminal_failure_agent_down(state, issue_id, running_entry, session_id)
 
@@ -255,6 +264,25 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
+  end
+
+  defp block_terminal_storage_failure_agent_down(state, issue_id, running_entry, session_id) do
+    failure = Map.fetch!(running_entry, :terminal_storage_failure)
+
+    Logger.error(
+      "Agent lifecycle storage failed issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} code=#{failure.code}; disabling all dispatch until operator restart after storage recovery"
+    )
+
+    state =
+      block_issue_from_entry(
+        state,
+        issue_id,
+        running_entry,
+        "terminal lifecycle storage unavailable: #{failure.code}",
+        :terminal_storage_failure
+      )
+
+    %{state | lifecycle_storage_fault: failure}
   end
 
   defp block_terminal_failure_agent_down(state, issue_id, running_entry, session_id) do
@@ -304,6 +332,15 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
+    if state.lifecycle_storage_fault do
+      Logger.error("Dispatch disabled by terminal lifecycle storage fault code=#{state.lifecycle_storage_fault.code}")
+      state
+    else
+      dispatch_available_issues(state)
+    end
+  end
+
+  defp dispatch_available_issues(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
@@ -522,9 +559,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
-        release_issue_claim(state, issue.id)
+        Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; settling lifecycle and releasing block")
+        blocked_entry = Map.get(state.blocked, issue.id, %{})
+
+        case cleanup_terminal_issue_lifecycle(issue, blocked_entry) do
+          :ok ->
+            release_issue_claim(state, issue.id)
+
+          {:error, reason} ->
+            failure = %{code: :terminal_cleanup_failed, event_id: terminal_event_id(blocked_entry)}
+            blocked = Map.update!(state.blocked, issue.id, &Map.put(&1, :reason, "terminal lifecycle cleanup failed: #{stable_terminal_error(reason)}"))
+            %{state | blocked: blocked, lifecycle_storage_fault: failure}
+        end
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
@@ -760,6 +806,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp last_activity_timestamp(_running_entry), do: nil
 
+  defp terminal_storage_failure_blocker?(%{terminal_storage_failure: %{code: code}})
+       when is_atom(code) or is_binary(code),
+       do: true
+
+  defp terminal_storage_failure_blocker?(_running_entry), do: false
+
   defp terminal_failure_blocker?(%{terminal_failure: evidence}) when is_map(evidence),
     do: SymphonyElixir.TerminalFailure.valid?(evidence)
 
@@ -887,6 +939,7 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_event: Map.get(running_entry, :last_codex_event),
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
       terminal_failure: Map.get(running_entry, :terminal_failure),
+      terminal_storage_failure: Map.get(running_entry, :terminal_storage_failure),
       binding: Map.get(running_entry, :binding),
       binding_id: Map.get(running_entry, :binding_id)
     }
@@ -1177,6 +1230,7 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_event: nil,
       last_codex_timestamp: nil,
       terminal_failure: nil,
+      terminal_storage_failure: nil,
       binding: nil,
       binding_id: nil
     }
@@ -1272,6 +1326,7 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: workspace_path,
             session_id: nil,
             terminal_failure: nil,
+            terminal_storage_failure: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1503,20 +1558,84 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
+  defp cleanup_terminal_issue_lifecycle(%Issue{} = issue, metadata) do
+    workspace_path = Map.get(metadata, :workspace_path)
+    evidence = Map.get(metadata, :terminal_failure)
+
+    case normalize_workspace_cleanup(cleanup_issue_workspace(issue, metadata)) do
+      :ok -> clear_terminal_marker(workspace_path, issue.id, evidence)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_workspace_cleanup(:ok), do: :ok
+  defp normalize_workspace_cleanup({:ok, _removed}), do: :ok
+  defp normalize_workspace_cleanup({:error, _reason, _output} = error), do: {:error, error}
+
+  defp clear_terminal_marker(workspace, issue_id, %{event_id: event_id})
+       when is_binary(workspace) and is_binary(event_id),
+       do: SymphonyElixir.TerminalFailure.clear_active(workspace, issue_id, event_id)
+
+  defp clear_terminal_marker(_workspace, _issue_id, _evidence), do: :ok
+
+  defp terminal_event_id(metadata) do
+    case Map.get(metadata, :terminal_failure) do
+      %{event_id: event_id} when is_binary(event_id) -> event_id
+      _other -> nil
+    end
+  end
+
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
-
-          _ ->
-            :ok
-        end)
+        Enum.reduce_while(issues, :ok, &cleanup_startup_terminal_issue_reducer/2)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp cleanup_startup_terminal_issue_reducer(%Issue{} = issue, :ok) do
+    case cleanup_startup_terminal_issue(issue) do
+      :ok -> {:cont, :ok}
+      {:error, _reason} = error -> {:halt, error}
+    end
+  end
+
+  defp cleanup_startup_terminal_issue_reducer(_other, :ok), do: {:cont, :ok}
+
+  defp cleanup_startup_terminal_issue(%Issue{} = issue) do
+    case SymphonyElixir.TerminalFailure.recovery_state_for_issue(issue.id) do
+      :none ->
+        normalize_workspace_cleanup(cleanup_issue_workspace(issue))
+
+      {disposition, evidence} when disposition in [:settled, :ambiguous] ->
+        cleanup_startup_terminal_evidence(issue, evidence)
+
+      {:error, reason} ->
+        {:error, {:terminal_recovery_read_failed, reason}}
+    end
+  end
+
+  defp cleanup_startup_terminal_evidence(issue, evidence) do
+    case normalize_workspace_cleanup(Workspace.remove_recorded(evidence.workspace, nil)) do
+      :ok ->
+        clear_startup_terminal_evidence(issue, evidence)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp clear_startup_terminal_evidence(issue, evidence) do
+    case SymphonyElixir.TerminalFailure.clear_active(
+           evidence.workspace,
+           issue.id,
+           evidence.event_id
+         ) do
+      :ok -> normalize_workspace_cleanup(cleanup_issue_workspace(issue))
+      {:error, _reason} = error -> error
     end
   end
 
@@ -1753,6 +1872,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp validate_terminal_resume_lifecycle(state, issue_id, blocked_entry) do
     cond do
+      state.lifecycle_storage_fault != nil ->
+        {:error, :terminal_resume_lifecycle_storage_unavailable}
+
       Map.get(blocked_entry, :disposition) != :terminal_failure ->
         {:error, :terminal_resume_wrong_disposition}
 
@@ -1853,16 +1975,9 @@ defmodule SymphonyElixir.Orchestrator do
             blocked_entry.workspace_path
           )
 
-        disposition =
-          cond do
-            Map.has_key?(next_state.running, issue.id) -> :running
-            Map.has_key?(next_state.retry_attempts, issue.id) -> :retry_queued
-            true -> nil
-          end
-
-        if disposition do
+        if Map.has_key?(next_state.running, issue.id) do
           Logger.info(
-            "Accepted externally selected terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} attempt=#{attempt} disposition=#{disposition}"
+            "Accepted externally selected terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} attempt=#{attempt} disposition=running"
           )
 
           {:reply,
@@ -1875,13 +1990,15 @@ defmodule SymphonyElixir.Orchestrator do
               backend: binding.backend,
               workspace_path: blocked_entry.workspace_path,
               attempt: attempt,
-              disposition: disposition,
+              disposition: :running,
               receipt_path: receipt_path
             }}, next_state}
         else
+          next_state = cancel_issue_retry(next_state, issue.id)
           ambiguous = Map.put(blocked_entry, :recovery_state, :ambiguous)
-          blocked = Map.put(state.blocked, issue.id, ambiguous)
-          {:reply, {:error, :terminal_resume_dispatch_rejected}, %{state | blocked: blocked}}
+          blocked = Map.put(next_state.blocked, issue.id, ambiguous)
+
+          {:reply, {:error, :terminal_resume_dispatch_ambiguous}, %{next_state | blocked: blocked, claimed: MapSet.put(next_state.claimed, issue.id)}}
         end
 
       {:error, reason} ->
@@ -1893,6 +2010,15 @@ defmodule SymphonyElixir.Orchestrator do
 
         {:reply, {:error, {:terminal_resume_receipt_failed, stable_terminal_error(reason)}}, failed_state}
     end
+  end
+
+  defp cancel_issue_retry(state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+      _other -> :ok
+    end
+
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
   defp mark_resume_ambiguous_if_durable(state, issue_id, blocked_entry) do
@@ -1942,11 +2068,9 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, map()} | {:error, term()} | :unavailable
   def resume_terminal_attempt(issue_id, binding, server \\ __MODULE__)
       when is_binary(issue_id) and is_map(binding) do
-    if Process.whereis(server) do
-      GenServer.call(server, {:resume_terminal_attempt, issue_id, binding}, 15_000)
-    else
-      :unavailable
-    end
+    GenServer.call(server, {:resume_terminal_attempt, issue_id, binding}, 15_000)
+  catch
+    :exit, _reason -> :unavailable
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
@@ -2066,6 +2190,10 @@ defmodule SymphonyElixir.Orchestrator do
         |> maybe_put_runtime_value(:backend, Map.get(metadata, :backend))
         |> maybe_put_runtime_value(:binding_id, Map.get(metadata, :binding_id))
         |> maybe_put_runtime_value(:terminal_failure, Map.get(metadata, :terminal_failure))
+        |> maybe_put_runtime_value(
+          :terminal_storage_failure,
+          Map.get(metadata, :terminal_storage_failure)
+        )
       end)
 
     {:reply,
@@ -2075,6 +2203,7 @@ defmodule SymphonyElixir.Orchestrator do
        blocked: blocked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       lifecycle_storage_fault: state.lifecycle_storage_fault,
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -2117,6 +2246,13 @@ defmodule SymphonyElixir.Orchestrator do
     backend_command = Map.get(running_entry, :backend_command)
     stderr_path = Map.get(running_entry, :stderr_path)
     terminal_failure = terminal_failure_for_update(Map.get(running_entry, :terminal_failure), update)
+
+    terminal_storage_failure =
+      terminal_storage_failure_for_update(
+        Map.get(running_entry, :terminal_storage_failure),
+        update
+      )
+
     last_assistant_text = assistant_text_for_update(Map.get(running_entry, :last_assistant_text), update)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
@@ -2138,6 +2274,7 @@ defmodule SymphonyElixir.Orchestrator do
         backend_command: runtime_value_for_update(backend_command, update, :backend_command),
         stderr_path: runtime_value_for_update(stderr_path, update, :stderr_path),
         terminal_failure: terminal_failure,
+        terminal_storage_failure: terminal_storage_failure,
         last_assistant_text: last_assistant_text,
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -2151,11 +2288,24 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp terminal_failure_for_update(nil, %{event: :terminal_failure, terminal_failure: evidence})
+  defp terminal_failure_for_update(nil, %{
+         event: :terminal_failure,
+         terminal_failure: evidence,
+         terminal_failure_persisted: true
+       })
        when is_map(evidence),
        do: evidence
 
   defp terminal_failure_for_update(existing, _update), do: existing
+
+  defp terminal_storage_failure_for_update(nil, %{
+         event: :terminal_storage_failure,
+         terminal_storage_failure: %{code: code} = failure
+       })
+       when is_atom(code) or is_binary(code),
+       do: Map.take(failure, [:code, :event_id])
+
+  defp terminal_storage_failure_for_update(existing, _update), do: existing
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

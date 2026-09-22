@@ -250,6 +250,59 @@ defmodule SymphonyElixir.TerminalFailureTest do
              TerminalFailure.record_resume(file_workspace, file_evidence, "slot-z", 9)
 
     assert String.contains?(fallback_resume, "terminal-holds")
+
+    clear_workspace = Path.join(root, "clear-permission")
+    File.mkdir_p!(clear_workspace)
+
+    clear_evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: "clear-permission-issue",
+        issue_identifier: "CLEAR-1",
+        attempt: 0,
+        session_id: nil,
+        workspace: clear_workspace,
+        binding_id: nil
+      })
+
+    assert {:ok, _path} = TerminalFailure.persist(clear_workspace, clear_evidence)
+    metadata_dir = Path.join(clear_workspace, ".symphony")
+    File.chmod!(metadata_dir, 0o500)
+
+    assert {:error, {_path, :eacces}} =
+             TerminalFailure.clear_active(
+               clear_workspace,
+               clear_evidence.issue_id,
+               clear_evidence.event_id
+             )
+
+    File.chmod!(metadata_dir, 0o700)
+    assert :ok = TerminalFailure.clear_active(clear_workspace, clear_evidence.issue_id)
+  end
+
+  test "host lifecycle readiness fails closed when the state root is not writable" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-storage-probe-#{System.unique_integer([:positive])}"
+      )
+
+    blocked_root = Path.join(root, "state-root-file")
+    File.mkdir_p!(root)
+    File.write!(blocked_root, "not a directory")
+    original_state_root = Application.get_env(:symphony_elixir, :terminal_state_root)
+
+    on_exit(fn ->
+      if original_state_root,
+        do: Application.put_env(:symphony_elixir, :terminal_state_root, original_state_root),
+        else: Application.delete_env(:symphony_elixir, :terminal_state_root)
+
+      File.rm_rf!(root)
+    end)
+
+    Application.put_env(:symphony_elixir, :terminal_state_root, blocked_root)
+    assert {:error, {:terminal_state_root_unavailable, reason}} = TerminalFailure.storage_ready()
+    assert reason in [:eexist, :enotdir]
   end
 
   test "default global hold root follows the configured log directory" do
@@ -293,8 +346,213 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
     assert {:ok, _receipt} = TerminalFailure.persist(workspace, evidence)
     issue_hash = :crypto.hash(:sha256, evidence.issue_id) |> Base.encode16(case: :lower)
-    assert File.regular?(Path.join(root, "logs/terminal-holds/active/#{issue_hash}.json"))
+
+    assert File.regular?(
+             Path.join(
+               root,
+               "logs/terminal-holds/active/#{evidence.workflow_scope}-#{issue_hash}.json"
+             )
+           )
+
     assert :ok = TerminalFailure.clear_active(workspace, evidence.issue_id)
+  end
+
+  test "global lifecycle markers are workflow-scoped and cleared only by their event owner" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-scope-#{System.unique_integer([:positive])}"
+      )
+
+    state_root = Path.join(root, "state")
+    workspace_a = Path.join(root, "workflow-a/SHARED-1")
+    workspace_b = Path.join(root, "workflow-b/SHARED-1")
+    File.mkdir_p!(workspace_a)
+    File.mkdir_p!(workspace_b)
+    original_scope = Application.get_env(:symphony_elixir, :terminal_lifecycle_scope)
+    original_state_root = Application.get_env(:symphony_elixir, :terminal_state_root)
+
+    on_exit(fn ->
+      if original_scope,
+        do: Application.put_env(:symphony_elixir, :terminal_lifecycle_scope, original_scope),
+        else: Application.delete_env(:symphony_elixir, :terminal_lifecycle_scope)
+
+      if original_state_root,
+        do: Application.put_env(:symphony_elixir, :terminal_state_root, original_state_root),
+        else: Application.delete_env(:symphony_elixir, :terminal_state_root)
+
+      File.rm_rf!(root)
+    end)
+
+    Application.put_env(:symphony_elixir, :terminal_state_root, state_root)
+    Application.put_env(:symphony_elixir, :terminal_lifecycle_scope, String.duplicate("a", 64))
+
+    evidence_a =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: "shared-issue-id",
+        issue_identifier: "SHARED-1",
+        attempt: 0,
+        session_id: "session-a",
+        workspace: workspace_a,
+        binding_id: nil
+      })
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace_a, evidence_a)
+
+    Application.put_env(:symphony_elixir, :terminal_lifecycle_scope, String.duplicate("b", 64))
+
+    evidence_b =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: "shared-issue-id",
+        issue_identifier: "SHARED-1",
+        attempt: 0,
+        session_id: "session-b",
+        workspace: workspace_b,
+        binding_id: nil
+      })
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace_b, evidence_b)
+    assert {:settled, %{event_id: event_b}} = TerminalFailure.recovery_state(workspace_b, "shared-issue-id")
+    assert event_b == evidence_b.event_id
+
+    assert {:error, {:active_marker_owner_mismatch, _path}} =
+             TerminalFailure.clear_active(
+               workspace_b,
+               "shared-issue-id",
+               evidence_a.event_id
+             )
+
+    assert :ok = TerminalFailure.clear_active(workspace_a, "shared-issue-id", evidence_a.event_id)
+    assert {:settled, %{event_id: ^event_b}} = TerminalFailure.recovery_state(workspace_b, "shared-issue-id")
+    assert :ok = TerminalFailure.clear_active(workspace_b, "shared-issue-id", evidence_b.event_id)
+  end
+
+  test "active ownership rejects unresumed and malformed predecessor markers" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-owner-reject-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "owner-reject",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, first)
+
+    second =
+      TerminalFailure.build(
+        :provider_auth_failed,
+        %{},
+        %{context | attempt: 1, session_id: "second-session"}
+      )
+
+    assert {:error, :active_marker_owner_mismatch} = TerminalFailure.persist(workspace, second)
+
+    marker = Path.join(workspace, ".symphony/terminal-failure.json")
+    File.write!(marker, "not-json")
+
+    third =
+      TerminalFailure.build(
+        :provider_network_unreachable,
+        %{},
+        %{context | attempt: 2, session_id: "third-session"}
+      )
+
+    assert {:error, {:active_marker_invalid, %Jason.DecodeError{}}} =
+             TerminalFailure.persist(workspace, third)
+  end
+
+  test "active replacement fails closed when an ownership-checked marker cannot be rewritten" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-owner-replace-error-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "owner-replace-error",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, first)
+    assert {:ok, _path} = TerminalFailure.record_resume(workspace, first, "slot-b", 1)
+    metadata_dir = Path.join(workspace, ".symphony")
+    File.chmod!(metadata_dir, 0o500)
+
+    second =
+      TerminalFailure.build(
+        :provider_auth_failed,
+        %{},
+        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+      )
+
+    assert {:error, {:active_marker_replace_failed, :eacces}} =
+             TerminalFailure.persist(workspace, second)
+
+    File.chmod!(metadata_dir, 0o700)
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, first.event_id)
+  end
+
+  test "a resumed event may atomically hand active ownership to its next terminal event" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-owner-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "owner-handoff",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, first)
+    assert {:ok, _path} = TerminalFailure.record_resume(workspace, first, "slot-b", 1)
+
+    second =
+      TerminalFailure.build(
+        :provider_auth_failed,
+        %{provider_code: "UNAUTHENTICATED", http_status: 401},
+        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+      )
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace, second)
+    assert {:settled, %{event_id: event_id}} = TerminalFailure.recovery_state(workspace, context.issue_id)
+    assert event_id == second.event_id
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)
   end
 
   test "tampered or malformed active evidence fails closed" do

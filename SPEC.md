@@ -558,9 +558,12 @@ Launch and protocol requirements:
   binding ID. It MUST have a deterministic event ID, an immutable create-once event receipt, and a
   fail-closed active marker; if workspace metadata is unavailable, a workspace-root hold MUST retain
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
-  active markers and resume intents so configuration reload cannot lose a hold. Collisions MUST
-  accept byte-identical receipts or fail closed without
-  rewriting history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
+  active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
+  include a stable workflow scope as well as issue identity so unrelated repositories and tracker
+  instances cannot collide. Active-marker replacement and removal MUST verify event ownership; a
+  resumed event may transfer ownership to its next terminal event, but unrelated or stale owners
+  MUST fail closed. Collisions MUST accept byte-identical receipts or fail closed without rewriting
+  history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
   liveness fields MAY accompany the normalized reason. Raw messages, provider account identifiers,
   email addresses, tokens, OAuth payloads, usernames, and profile paths MUST NOT be retained.
 - Locally initiated timeout/cancellation is authoritative even if the observed native build reports
@@ -574,8 +577,9 @@ Launch and protocol requirements:
   `profile_root`. A create-once resume-intent receipt MUST be durable before dispatch. The new
   attempt MUST open the exact recorded issue workspace even if configuration reload changed the
   workspace root, preserve its existing bytes/branch, and MUST NOT rerun `after_create`. A failed
-  intent write MUST launch no writer; a written intent with unproven dispatch is ambiguous and MUST
-  require explicit recovery. Symphony validates and executes the binding but MUST NOT select an account,
+  intent write MUST launch no writer; after an intent is written, only a proven running task is a
+  successful handoff. A queued retry or any other unproven dispatch MUST be cancelled, marked
+  ambiguous, and require explicit recovery. Symphony validates and executes the binding but MUST NOT select an account,
   provider, model, pool order, cooldown, or failover policy.
 
 #### 5.3.8 `codex` (object)
@@ -836,8 +840,11 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (abnormal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - If the adapter emitted a valid typed terminal failure, hold the claimed issue without an
-    ordinary retry until an external policy selects a valid new-attempt binding.
+  - If the adapter emitted a valid, durably persisted typed terminal failure, hold the claimed issue
+    without an ordinary retry until an external policy selects a valid new-attempt binding.
+  - If terminal persistence or active-marker settlement failed, create a distinct lifecycle-storage
+    hold and disable all further dispatch in that service instance; this failure MUST NOT become an
+    ordinary retry.
   - Otherwise schedule exponential-backoff retry.
 
 - `Codex Update Event`
@@ -862,10 +869,16 @@ Distinct terminal reasons are important because retry logic and logs differ.
   `terminal_failure` hold before ordinary dispatch. If a corresponding resume-intent receipt already
   exists but no live writer can be proven after restart, recovery is ambiguous and MUST fail closed;
   it MUST NOT create a duplicate writer.
-- A successful attempt clears all active-marker locations only after backend process settlement.
-  Failure to clear is a typed lifecycle failure and MUST hold without continuation. Immutable
-  terminal and resume receipts remain as lifecycle evidence until normal workspace cleanup.
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- A successful attempt clears all active-marker locations only after backend process settlement and
+  only when their recorded event owner matches. Failure to clear is a typed lifecycle-storage
+  failure, MUST hold without continuation, and MUST disable further dispatch in that service
+  instance. Immutable terminal and resume receipts remain as lifecycle evidence until normal
+  workspace cleanup.
+- The service MUST verify the host lifecycle state root is writable before enabling dispatch. A
+  runtime lifecycle-storage fault remains latched until an operator repairs storage and restarts.
+- Startup terminal cleanup removes each recorded stale workspace for an issue already in a terminal
+  state before clearing that issue's ownership-checked active markers. Cleanup or marker settlement
+  failure MUST stop startup rather than permit dispatch.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
@@ -979,11 +992,16 @@ Part B: Tracker state refresh
 
 When the service starts:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+1. Verify the host lifecycle state root is writable.
+2. Query tracker for issues in terminal states.
+3. For each returned issue, read any workflow-scoped global active marker, remove its exact recorded
+   workspace, then clear local/fallback/global markers only when the expected event owner matches.
+4. Remove any remaining workspace derived from the current configured root.
+5. If the tracker fetch fails, log a warning and continue startup because no lifecycle mutation was
+   attempted. If lifecycle storage, workspace cleanup, or marker settlement fails, stop startup.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+This prevents stale terminal workspaces and global holds from accumulating after restarts without
+silently losing lifecycle ownership.
 
 ## 9. Workspace Management and Safety
 
@@ -1447,7 +1465,8 @@ Orchestrator behavior on tracker errors:
 
 - Candidate fetch failure: log and skip dispatch for this tick.
 - Running-state refresh failure: log and keep active workers running.
-- Startup terminal cleanup failure: log warning and continue startup.
+- Startup terminal tracker-fetch failure: log warning and continue startup.
+- Startup lifecycle storage, workspace cleanup, or active-marker settlement failure: stop startup.
 
 ### 11.5 Tracker Writes and Agent Tools (Important Boundary)
 

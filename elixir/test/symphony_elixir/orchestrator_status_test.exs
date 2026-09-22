@@ -36,9 +36,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     File.write!(agy, """
     #!/bin/sh
+    printf '%s\\n' "$$" > "$PWD/active-writer.pid"
     while IFS= read -r _line; do
-      printf '{"event":"init","conversation_id":"resume-session","init":{"cwd":"%s","permission_mode":"request-review"}}\\n' "$PWD"
-      printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"resume-session","step_type":"agent_response","text_delta":"resumed"}}'
+      if [ "$HOME" = "#{Path.join(root, "profiles/slot-a")}" ]; then
+        printf '{"event":"init","conversation_id":"quota-session","init":{"cwd":"%s","permission_mode":"request-review"}}\\n' "$PWD"
+        sleep 1
+        printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"quota-session","step_type":"error_message","source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"RESOURCE_EXHAUSTED (code 429): quota reached"}}'
+      else
+        printf '{"event":"init","conversation_id":"resume-session","init":{"cwd":"%s","permission_mode":"request-review"}}\\n' "$PWD"
+        printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"resume-session","step_type":"agent_response","text_delta":"resumed"}}'
+      fi
       sleep 30
     done
     """)
@@ -68,81 +75,48 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       dispatchable: true
     }
 
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
     orchestrator_name = Module.concat(__MODULE__, :TerminalResumeOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-    :ok = :sys.suspend(pid)
 
     on_exit(fn ->
       if Process.alive?(pid), do: Process.exit(pid, :normal)
       File.rm_rf!(root)
     end)
 
-    evidence =
-      SymphonyElixir.TerminalFailure.build(
-        :provider_quota_exhausted,
-        %{provider_code: "RESOURCE_EXHAUSTED", http_status: 429, message: "quota reached"},
-        %{
-          backend: :antigravity,
-          issue_id: issue.id,
-          issue_identifier: issue.identifier,
-          attempt: 0,
-          session_id: "quota-session",
-          workspace: workspace,
-          binding_id: "slot-a"
-        }
+    first_writer_snapshot =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          Enum.any?(
+            snapshot.running,
+            &(&1.issue_id == issue.id and &1.session_id == "quota-session" and
+                not is_nil(Map.get(&1, :backend_process_pid)))
+          )
+        end,
+        2_000
       )
 
-    assert {:ok, _receipt_path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
+    [first_writer] = first_writer_snapshot.running
+    old_writer_pid = first_writer.backend_process_pid
+    assert os_process_alive?(old_writer_pid)
 
-    initial_state = :sys.get_state(pid)
-    process_ref = make_ref()
+    blocked_snapshot =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          Enum.any?(snapshot.blocked, &(&1.issue_id == issue.id and &1.disposition == :terminal_failure))
+        end,
+        3_000
+      )
 
-    running_entry = %{
-      pid: self(),
-      ref: process_ref,
-      identifier: issue.identifier,
-      issue: issue,
-      backend: :antigravity,
-      binding: %{binding_id: "slot-a", backend: :antigravity, options: %{profile_root: Path.join(root, "profiles/slot-a")}},
-      binding_id: "slot-a",
-      worker_host: nil,
-      workspace_path: workspace,
-      session_id: "quota-session",
-      terminal_failure: nil,
-      last_codex_message: nil,
-      last_codex_timestamp: nil,
-      last_codex_event: nil,
-      retry_attempt: 0,
-      started_at: DateTime.utc_now()
-    }
-
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue.id => running_entry})
-      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
-      |> Map.put(:attempts, %{issue.id => 1})
-    end)
-
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
-    :ok = :sys.resume(pid)
-
-    send(
-      pid,
-      {:codex_worker_update, issue.id,
-       %{
-         event: :terminal_failure,
-         terminal_failure: evidence,
-         session_id: evidence.session_id,
-         backend: :antigravity,
-         timestamp: DateTime.utc_now()
-       }}
-    )
-
-    send(pid, {:DOWN, process_ref, :process, self(), {:backend_terminal_failure, evidence}})
-    assert %{blocked: [blocked], retrying: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert %{blocked: [blocked], retrying: [], running: []} = blocked_snapshot
     assert blocked.disposition == :terminal_failure
-    assert blocked.terminal_failure.event_id == evidence.event_id
+    evidence = blocked.terminal_failure
+    assert evidence.reason == :provider_quota_exhausted
+    assert evidence.session_id == "quota-session"
+
+    refute os_process_alive?(old_writer_pid)
 
     drift_workspace_root = Path.join(root, "changed-workspace-root")
 
@@ -171,7 +145,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     global_resume_receipt =
       Path.join(
         Application.fetch_env!(:symphony_elixir, :terminal_state_root),
-        "resumes/#{issue_hash}-#{evidence.event_id}.json"
+        "resumes/#{evidence.workflow_scope}-#{issue_hash}-#{evidence.event_id}.json"
       )
 
     File.mkdir_p!(global_resume_receipt)
@@ -207,7 +181,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                  backend: :antigravity,
                  options: %{profile_root: profile}
                },
-               orchestrator_name
+               pid
              )
 
     assert receipt.prior_event_id == evidence.event_id
@@ -226,6 +200,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       )
 
     assert [%{workspace_path: ^workspace, binding_id: "slot-b"}] = live_snapshot.running
+    [resumed_writer] = live_snapshot.running
+    resumed_writer_pid = resumed_writer.backend_process_pid
+    refute resumed_writer_pid == old_writer_pid
+    assert os_process_alive?(resumed_writer_pid)
     refute File.exists?(Path.join(drift_workspace_root, "JARVIS-936"))
     assert File.read!(Path.join(workspace, "dirty-candidate.txt")) == "preserve me\n"
     refute File.exists?(Path.join(workspace, "after-create-ran"))
@@ -272,6 +250,238 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                },
                recovery_name
              )
+  end
+
+  test "durable resume intent becomes ambiguous and cancels retry when no writer starts" do
+    unique = System.unique_integer([:positive])
+    root = Path.join("/var/tmp", "symphony-j936-resume-dispatch-#{unique}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "JARVIS-937")
+    profile = Path.join(root, "profile")
+    agy = Path.join(root, "fake-agy")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(profile)
+    File.write!(agy, "#!/bin/sh\nexit 0\n")
+    File.chmod!(agy, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_backend: "antigravity",
+      workspace_root: workspace_root,
+      antigravity_executable: agy,
+      antigravity_profile_root: profile
+    )
+
+    issue = %Issue{
+      id: "issue-resume-dispatch-failure-#{unique}",
+      identifier: "JARVIS-937",
+      title: "Resume dispatch failure",
+      description: "Do not queue after durable intent",
+      state: "In Progress",
+      url: "https://example.org/issues/JARVIS-937",
+      dispatchable: true
+    }
+
+    evidence =
+      SymphonyElixir.TerminalFailure.build(
+        :provider_quota_exhausted,
+        %{provider_code: "RESOURCE_EXHAUSTED", http_status: 429},
+        %{
+          backend: :antigravity,
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          attempt: 0,
+          session_id: "prior-session",
+          workspace: workspace,
+          binding_id: "slot-a"
+        }
+      )
+
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    supervisor_name = Module.concat(__MODULE__, :NoCapacityTaskSupervisor)
+    {:ok, supervisor} = Task.Supervisor.start_link(name: supervisor_name, max_children: 0)
+    orchestrator_name = Module.concat(__MODULE__, :ResumeDispatchFailureOrchestrator)
+
+    {:ok, orchestrator} =
+      Orchestrator.start_link(name: orchestrator_name, task_supervisor: supervisor_name)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: Process.exit(orchestrator, :normal)
+      if Process.alive?(supervisor), do: Process.exit(supervisor, :normal)
+      File.rm_rf!(root)
+    end)
+
+    blocked =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot -> Enum.any?(snapshot.blocked, &(&1.issue_id == issue.id)) end,
+        1_000
+      )
+
+    assert [%{recovery_state: :settled}] = blocked.blocked
+
+    assert {:error, :terminal_resume_dispatch_ambiguous} =
+             Orchestrator.resume_terminal_attempt(
+               issue.id,
+               %{
+                 binding_id: "slot-b",
+                 backend: :antigravity,
+                 options: %{profile_root: profile}
+               },
+               orchestrator
+             )
+
+    assert %{running: [], retrying: [], blocked: [%{recovery_state: :ambiguous}]} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    resume_path = Path.join(workspace, ".symphony/terminal-resumes/#{evidence.event_id}.json")
+    assert File.regular?(resume_path)
+  end
+
+  test "terminal storage failure disables ordinary retry and all further dispatch" do
+    unique = System.unique_integer([:positive])
+    root = Path.join("/var/tmp", "symphony-j936-storage-fault-#{unique}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "JARVIS-938")
+    profile = Path.join(root, "profile")
+    agy = Path.join(root, "fake-agy")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(profile)
+
+    File.write!(agy, """
+    #!/bin/sh
+    while IFS= read -r _line; do
+      printf '{"event":"init","conversation_id":"storage-session","init":{"cwd":"%s","permission_mode":"request-review"}}\\n' "$PWD"
+      sleep 1
+      printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"storage-session","step_type":"error_message","source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"RESOURCE_EXHAUSTED (code 429): quota reached"}}'
+      sleep 30
+    done
+    """)
+
+    File.chmod!(agy, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_backend: "antigravity",
+      workspace_root: workspace_root,
+      antigravity_executable: agy,
+      antigravity_profile_root: profile,
+      antigravity_first_event_timeout_ms: 1_000,
+      antigravity_turn_timeout_ms: 10_000
+    )
+
+    issue = %Issue{
+      id: "issue-storage-fault-#{unique}",
+      identifier: "JARVIS-938",
+      title: "Storage failure",
+      description: "Fail storage after launch",
+      state: "In Progress",
+      url: "https://example.org/issues/JARVIS-938",
+      dispatchable: true
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    orchestrator_name = Module.concat(__MODULE__, :StorageFaultOrchestrator)
+    {:ok, orchestrator} = Orchestrator.start_link(name: orchestrator_name)
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: Process.exit(orchestrator, :normal)
+      File.rm_rf!(state_root)
+      File.mkdir_p!(state_root)
+      File.rm_rf!(root)
+    end)
+
+    _running =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          Enum.any?(snapshot.running, &(&1.issue_id == issue.id and &1.session_id == "storage-session"))
+        end,
+        2_000
+      )
+
+    File.rm_rf!(state_root)
+    File.write!(state_root, "blocked")
+
+    failed =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          not is_nil(snapshot.lifecycle_storage_fault) and
+            Enum.any?(snapshot.blocked, &(&1.issue_id == issue.id))
+        end,
+        3_000
+      )
+
+    assert %{running: [], retrying: [], lifecycle_storage_fault: %{code: _code}} = failed
+    assert [%{disposition: :terminal_storage_failure}] = failed.blocked
+
+    second = %Issue{
+      issue
+      | id: "issue-after-storage-fault-#{unique}",
+        identifier: "JARVIS-939",
+        title: "Must not dispatch",
+        url: "https://example.org/issues/JARVIS-939"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, second])
+    Orchestrator.request_refresh(orchestrator_name)
+    Process.sleep(100)
+    after_refresh = Orchestrator.snapshot(orchestrator_name, 1_000)
+    assert after_refresh.running == []
+    assert after_refresh.retrying == []
+    refute File.exists?(Path.join(workspace_root, second.identifier))
+  end
+
+  test "startup terminal cleanup removes the recorded workspace before its global hold" do
+    unique = System.unique_integer([:positive])
+    root = Path.join("/var/tmp", "symphony-j936-terminal-cleanup-#{unique}")
+    workspace_root = Path.join(root, "workspaces")
+    workspace = Path.join(workspace_root, "JARVIS-940")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      tracker_terminal_states: ["Done"]
+    )
+
+    issue = %Issue{
+      id: "issue-terminal-cleanup-#{unique}",
+      identifier: "JARVIS-940",
+      title: "Terminal cleanup",
+      state: "Done",
+      url: "https://example.org/issues/JARVIS-940",
+      dispatchable: false
+    }
+
+    evidence =
+      SymphonyElixir.TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        attempt: 0,
+        session_id: "terminal-session",
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
+    assert {:settled, _evidence} = SymphonyElixir.TerminalFailure.recovery_state_for_issue(issue.id)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    orchestrator_name = Module.concat(__MODULE__, :TerminalCleanupOrchestrator)
+    {:ok, orchestrator} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(orchestrator), do: Process.exit(orchestrator, :normal)
+      File.rm_rf!(root)
+    end)
+
+    refute File.exists?(workspace)
+    assert :none = SymphonyElixir.TerminalFailure.recovery_state_for_issue(issue.id)
   end
 
   test "orchestrator snapshot reflects last codex update and session id" do
@@ -2580,6 +2790,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
     end
+  end
+
+  defp os_process_alive?(pid) do
+    match?({_output, 0}, System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true))
   end
 
   defp graph_samples_from_rates(rates_per_bucket) do

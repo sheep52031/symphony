@@ -247,19 +247,31 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
     case TerminalFailure.persist(session.workspace, evidence) do
       {:ok, _path} ->
-        :ok
+        on_message.(
+          session
+          |> update(:terminal_failure, evidence.session_id, evidence)
+          |> Map.put(:terminal_failure, evidence)
+          |> Map.put(:terminal_failure_persisted, true)
+        )
+
+        {:error, {:backend_terminal_failure, evidence}}
 
       {:error, persist_reason} ->
-        Logger.error("Terminal evidence storage unavailable event_id=#{evidence.event_id} reason=#{stable_storage_error(persist_reason)}; holding the live issue fail-closed")
+        storage_failure = %{
+          event_id: evidence.event_id,
+          code: stable_storage_error(persist_reason)
+        }
+
+        Logger.error("Terminal evidence storage unavailable event_id=#{evidence.event_id} reason=#{storage_failure.code}; stopping lifecycle dispatch fail-closed")
+
+        on_message.(
+          session
+          |> update(:terminal_storage_failure, evidence.session_id, storage_failure)
+          |> Map.put(:terminal_storage_failure, storage_failure)
+        )
+
+        {:error, {:backend_terminal_storage_failure, evidence.event_id}}
     end
-
-    on_message.(
-      session
-      |> update(:terminal_failure, evidence.session_id, evidence)
-      |> Map.put(:terminal_failure, evidence)
-    )
-
-    {:error, {:backend_terminal_failure, evidence}}
   end
 
   defp emit_usage(session, result, on_message) do

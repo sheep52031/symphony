@@ -160,25 +160,26 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        send_marker_failure_evidence(recipient, issue, workspace)
+        send_marker_storage_failure(recipient, issue, workspace, reason)
         {:error, {:terminal_marker_clear_failed, stable_error_code(reason)}}
     end
   end
 
-  defp send_marker_failure_evidence(recipient, issue, workspace) do
-    case TerminalFailure.recovery_state(workspace, issue.id) do
-      {disposition, evidence} when disposition in [:settled, :ambiguous] ->
-        send_codex_update(recipient, issue, %{
-          event: :terminal_failure,
-          terminal_failure: evidence,
-          session_id: evidence.session_id,
-          backend: evidence.backend,
-          timestamp: DateTime.utc_now()
-        })
+  defp send_marker_storage_failure(recipient, issue, workspace, reason) do
+    event_id =
+      case TerminalFailure.recovery_state(workspace, issue.id) do
+        {disposition, evidence} when disposition in [:settled, :ambiguous] -> evidence.event_id
+        _other -> nil
+      end
 
-      _other ->
-        :ok
-    end
+    send_codex_update(recipient, issue, %{
+      event: :terminal_storage_failure,
+      terminal_storage_failure: %{
+        code: stable_error_code(reason),
+        event_id: event_id
+      },
+      timestamp: DateTime.utc_now()
+    })
   end
 
   defp safe_failure_reason(reason, opts) do

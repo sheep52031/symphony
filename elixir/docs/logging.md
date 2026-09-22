@@ -20,6 +20,8 @@ When logging execution lifecycle events, include:
 - `session_id`: the backend session identifier (combined Codex thread/turn identifier for Codex).
 - `backend`: the selected execution backend when the event is not inherently Codex-only.
 - `terminal_reason` and deterministic `event_id` for typed terminal failures.
+- A stable `code` and optional `event_id` for lifecycle-storage failures; never log receipt paths,
+  profile paths, raw filesystem details, or provider prose.
 - `binding_id` for an externally selected new-attempt binding; never log its profile path,
   credentials, account email, or provider payload.
 
