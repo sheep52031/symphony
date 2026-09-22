@@ -394,10 +394,52 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "classifies native terminal errors without leaking account or credential values" do
+    cases = [
+      {"quota_error", :provider_quota_exhausted, "RESOURCE_EXHAUSTED", 429},
+      {"auth_error", :provider_auth_failed, "UNAUTHENTICATED", 401},
+      {"network_error", :provider_network_unreachable, nil, nil},
+      {"provider_permission_error", :permission_denied, "PERMISSION_DENIED", 403},
+      {"unknown_error", :unknown_terminal_failure, nil, nil},
+      {"crash", :worker_crashed, nil, nil}
+    ]
+
+    for {prompt, reason, provider_code, http_status} <- cases do
+      {root, workspace, profile, agy} = setup_fake_agy!()
+      configure_backend!(agy, profile)
+      on_message = fn message -> send(self(), {:agy_message, message}) end
+      issue = %{id: "issue-terminal", identifier: "JARVIS-936", title: "Terminal classification"}
+      assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+
+      evidence =
+        Backend.run_turn(session, prompt, issue,
+          on_message: on_message,
+          attempt: 2
+        )
+        |> assert_terminal_failure(reason)
+
+      assert evidence.issue_id == issue.id
+      assert evidence.issue_identifier == issue.identifier
+      assert evidence.attempt == 2
+      assert evidence.session_id == "agy-session"
+      assert Map.get(evidence, :provider_code) == provider_code
+      assert Map.get(evidence, :http_status) == http_status
+      refute inspect(evidence) =~ "owner@example.com"
+      refute inspect(evidence) =~ "secret-refresh-value"
+      assert_receive {:agy_message, %{event: :terminal_failure, terminal_failure: ^evidence}}
+
+      receipt = Path.join(workspace, ".symphony/terminal-events/#{evidence.event_id}.json")
+      assert File.regular?(receipt)
+      assert Jason.decode!(File.read!(receipt))["reason"] == Atom.to_string(reason)
+      assert :ok = Backend.stop_session(session)
+      File.rm_rf!(root)
+    end
+  end
+
   test "rejects malformed step updates without retaining native values" do
     secret = "STEP_SECRET_907"
 
-    for prompt <- ["bad_step_type", "bad_text_delta", "oversized_delta"] do
+    for prompt <- ["bad_step_type", "bad_step_shape", "bad_text_delta", "oversized_delta"] do
       {root, workspace, profile, agy} = setup_fake_agy!()
       configure_backend!(agy, profile)
       on_message = fn message -> send(self(), {:agy_message, message}) end
@@ -406,13 +448,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
       result = Backend.run_turn(session, prompt, issue, on_message: on_message)
 
-      assert {:error, reason} = result
-
-      assert reason in [
-               :invalid_antigravity_step_type,
-               :invalid_antigravity_text_delta,
-               :antigravity_text_delta_too_large
-             ]
+      evidence = assert_terminal_failure(result, :provider_protocol_error)
+      assert evidence.category == "protocol"
 
       messages = receive_messages([])
       refute Enum.any?(messages, &(inspect(&1) =~ secret))
@@ -454,8 +491,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
 
-    assert {:error, :antigravity_identity_mismatch} =
-             Backend.run_turn(session, "identity_mismatch", issue, [])
+    Backend.run_turn(session, "identity_mismatch", issue, [])
+    |> assert_terminal_failure(:provider_protocol_error)
 
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
@@ -468,8 +505,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert {:ok, unsafe_session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
 
-    assert {:error, :unsafe_antigravity_permission_mode} =
-             Backend.run_turn(unsafe_session, "unsafe_permission", issue, [])
+    Backend.run_turn(unsafe_session, "unsafe_permission", issue, [])
+    |> assert_terminal_failure(:provider_protocol_error)
 
     assert :ok = Backend.stop_session(unsafe_session)
 
@@ -477,7 +514,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.mkdir_p!(second_workspace)
     assert {:ok, duplicate_session} = Backend.start_session(second_workspace, launcher: &direct_launcher/5)
     assert {:ok, _first} = Backend.run_turn(duplicate_session, "first", issue, [])
-    assert {:error, :duplicate_antigravity_init} = Backend.run_turn(duplicate_session, "duplicate_init", issue, [])
+
+    Backend.run_turn(duplicate_session, "duplicate_init", issue, [])
+    |> assert_terminal_failure(:provider_protocol_error)
+
     assert :ok = Backend.stop_session(duplicate_session)
 
     third_workspace = Path.join(root, "workspace-three")
@@ -485,8 +525,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert {:ok, usage_session} = Backend.start_session(third_workspace, launcher: &direct_launcher/5)
     assert {:ok, _first} = Backend.run_turn(usage_session, "first", issue, [])
 
-    assert {:error, :noncumulative_antigravity_usage} =
-             Backend.run_turn(usage_session, "noncumulative", issue, [])
+    Backend.run_turn(usage_session, "noncumulative", issue, [])
+    |> assert_terminal_failure(:provider_protocol_error)
 
     assert :ok = Backend.stop_session(usage_session)
     File.rm_rf!(root)
@@ -499,15 +539,8 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       issue = %{id: "issue-frame", identifier: "JARVIS-907", title: "Frame bounds"}
       assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
 
-      case prompt do
-        "malformed" ->
-          assert {:error, {:malformed_antigravity_protocol_line, :invalid_json}} =
-                   Backend.run_turn(session, prompt, issue, [])
-
-        "oversized" ->
-          assert {:error, :antigravity_protocol_frame_too_large} =
-                   Backend.run_turn(session, prompt, issue, [])
-      end
+      Backend.run_turn(session, prompt, issue, [])
+      |> assert_terminal_failure(:provider_protocol_error)
 
       assert :ok = Backend.stop_session(session)
       File.rm_rf!(root)
@@ -527,21 +560,27 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
-  test "bounds a silent turn, initiates cancellation, and empties the process group" do
-    {root, workspace, profile, agy} = setup_fake_agy!()
-    configure_backend!(agy, profile, first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100)
-    issue = %{id: "issue-timeout", identifier: "JARVIS-907", title: "Timeout"}
-    on_message = fn message -> send(self(), {:agy_message, message}) end
+  test "bounds silent turns, records liveness, and empties each process group" do
+    for {prompt, liveness} <- [
+          {"silent", :alive_but_thinking},
+          {"no_event", :dead_or_unreachable}
+        ] do
+      {root, workspace, profile, agy} = setup_fake_agy!()
+      configure_backend!(agy, profile, first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100)
+      issue = %{id: "issue-timeout", identifier: "JARVIS-907", title: "Timeout"}
+      on_message = fn message -> send(self(), {:agy_message, message}) end
 
-    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+      assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
 
-    assert {:error, {:antigravity_turn_timeout, :first_event, terminal}} =
-             Backend.run_turn(session, "silent", issue, on_message: on_message)
+      evidence =
+        Backend.run_turn(session, prompt, issue, on_message: on_message)
+        |> assert_terminal_failure(:worker_stalled)
 
-    assert is_map(terminal)
-    assert_receive {:agy_message, %{event: :turn_aborted, payload: %{"locally_initiated" => true}}}
-    assert :ok = Backend.stop_session(session)
-    File.rm_rf!(root)
+      assert evidence.liveness == liveness
+      assert_receive {:agy_message, %{event: :terminal_failure, terminal_failure: ^evidence}}
+      assert :ok = Backend.stop_session(session)
+      File.rm_rf!(root)
+    end
   end
 
   test "remains local-only at session start" do
@@ -624,16 +663,38 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           *unsafe_permission_secret*) printf '%s\n' '{"event":"init","conversation_id":"agy-session","init":{"cwd":"'"$PWD"'","permission_mode":"PERMISSION_SECRET_907"}}' ;;
           *unsafe_permission*) printf '{"event":"init","conversation_id":"agy-session","init":{"cwd":"%s","permission_mode":"always-proceed"}}\n' "$PWD" ;;
           *workspace_mismatch*) printf '%s\n' '{"event":"init","conversation_id":"agy-session","init":{"cwd":"/wrong","permission_mode":"request-review"}}' ;;
+          *no_event*) : ;;
           *) printf '{"event":"init","conversation_id":"agy-session","init":{"cwd":"%s","permission_mode":"request-review","account_identifier":"must-not-forward"}}\n' "$PWD" ;;
         esac
       fi
       case "$line" in
+        *quota_error*)
+          printf '%s\n' '{"event":"step_update","step_update":{"step_type":"error_message","source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h1m10s."}}'
+          ;;
+        *auth_error*)
+          printf '%s\n' '{"event":"step_update","step_update":{"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"UNAUTHENTICATED (code 401): OAuth failed for owner@example.com refresh_token=secret-refresh-value"}}'
+          ;;
+        *network_error*)
+          printf '%s\n' '{"event":"step_update","step_update":{"source":"SYSTEM","type":"ERROR_MESSAGE","status":"ERROR","error":"network unreachable: DNS resolution failed"}}'
+          ;;
+        *provider_permission_error*)
+          printf '%s\n' '{"event":"step_update","step_update":{"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"PERMISSION_DENIED (code 403): forbidden"}}'
+          ;;
+        *unknown_error*)
+          printf '%s\n' '{"event":"step_update","step_update":{"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"provider ended the request for an undocumented reason"}}'
+          ;;
+        *crash*)
+          exit 42
+          ;;
         *system_message*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"system_message"}}'
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"system-message-done","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
           ;;
         *bad_step_type*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"STEP_SECRET_907"}}'
+          ;;
+        *bad_step_shape*)
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":{"secret":"STEP_SECRET_907"}}}'
           ;;
         *bad_text_delta*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":{"value":"STEP_SECRET_907"}}}'
@@ -688,7 +749,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           printf '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"agent_response","text_delta":"spawned"}}\n'
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"descendant","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":%s,"output_tokens":%s,"thinking_tokens":%s,"cache_read_tokens":0,"total_tokens":%s}}}\n' "$turn" "$input" "$output" "$thinking" "$total"
           ;;
-        *silent*)
+        *silent*|*no_event*)
           sleep 10
           if [ "$interrupted" -eq 1 ]; then
             printf '{"event":"result","result":{"conversation_id":"agy-session","status":"ERROR","response":"","error":"interrupted","duration_seconds":0,"num_turns":%s,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}\n' "$turn"
@@ -721,10 +782,20 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     end
   end
 
-  defp assert_redacted_result({:error, expected}, expected), do: :ok
+  defp assert_redacted_result(result, :timeout) do
+    assert_terminal_failure(result, :worker_stalled)
+  end
 
-  defp assert_redacted_result({:error, {:antigravity_turn_timeout, :first_event, terminal}}, :timeout) do
-    assert is_map(terminal)
+  defp assert_redacted_result(result, _native_reason) do
+    assert_terminal_failure(result, :provider_protocol_error)
+  end
+
+  defp assert_terminal_failure(
+         {:error, {:backend_terminal_failure, %{reason: reason} = evidence}},
+         reason
+       ) do
+    assert SymphonyElixir.TerminalFailure.valid?(evidence)
+    evidence
   end
 
   defp process_alive?(pid) do

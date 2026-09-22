@@ -28,6 +28,88 @@ defmodule SymphonyElixir.AgentBackendContractTest do
              AgentBackend.validate_turn_result(%{result: :missing_session})
   end
 
+  test "validates opaque launch bindings without allowing backend mutation" do
+    assert {:ok, settings} = Config.Schema.parse(%{"agent" => %{"backend" => "antigravity"}})
+
+    assert {:ok,
+            %{
+              binding_id: "slot-b-receipt",
+              backend: :antigravity,
+              options: %{"profile_root" => "/var/lib/agy-profile-b"}
+            }} =
+             AgentBackend.validate_launch_binding(
+               "antigravity",
+               %{
+                 "binding_id" => "slot-b-receipt",
+                 "backend" => "antigravity",
+                 "options" => %{"profile_root" => "/var/lib/agy-profile-b"}
+               },
+               settings
+             )
+
+    assert {:error, :launch_binding_backend_mismatch} =
+             AgentBackend.validate_launch_binding(
+               "antigravity",
+               %{binding_id: "wrong-backend", backend: "codex", options: %{}},
+               settings
+             )
+
+    assert {:error, :invalid_antigravity_launch_binding_options} =
+             AgentBackend.validate_launch_binding(
+               "antigravity",
+               %{
+                 binding_id: "provider-switch",
+                 backend: "antigravity",
+                 options: %{profile_root: "/var/lib/agy-profile-b", model: "different"}
+               },
+               settings
+             )
+
+    assert {:error, :invalid_launch_binding} =
+             AgentBackend.validate_launch_binding("antigravity", :not_a_map, settings)
+
+    assert {:error, :launch_binding_backend_missing} =
+             AgentBackend.validate_launch_binding(
+               "antigravity",
+               %{binding_id: "missing-backend", options: %{}},
+               settings
+             )
+
+    for binding_id <- ["", String.duplicate("x", 257), 42] do
+      assert {:error, error} =
+               AgentBackend.validate_launch_binding(
+                 "antigravity",
+                 %{binding_id: binding_id, backend: "antigravity", options: %{}},
+                 settings
+               )
+
+      assert error in [:launch_binding_id_blank, :launch_binding_id_invalid]
+    end
+
+    assert {:error, :launch_binding_options_invalid} =
+             AgentBackend.validate_launch_binding(
+               "antigravity",
+               %{binding_id: "bad-options", backend: "antigravity", options: []},
+               settings
+             )
+
+    codex_settings = %{settings | agent: %{settings.agent | backend: "codex"}}
+
+    assert {:ok, %{backend: :codex, options: %{}}} =
+             AgentBackend.validate_launch_binding(
+               "codex",
+               %{binding_id: "codex-same-route", backend: "codex", options: %{}},
+               codex_settings
+             )
+
+    assert {:error, :launch_binding_options_unsupported} =
+             AgentBackend.validate_launch_binding(
+               "codex",
+               %{binding_id: "codex-options", backend: "codex", options: %{model: "other"}},
+               codex_settings
+             )
+  end
+
   test "parses provider-neutral and Pi lifecycle deadlines" do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: 321)
     assert Config.agent_stall_timeout_ms() == 321

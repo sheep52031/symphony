@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{AgentBackend, Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentBackend, Config, PromptBuilder, TerminalFailure, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -95,34 +95,58 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  defp stop_backend!(backend, session) do
+    case backend.stop_session(session) |> AgentBackend.validate_stop_result() do
+      :ok -> :ok
+      {:error, reason} -> raise RuntimeError, "Backend stop contract failed: #{inspect(reason)}"
+    end
+  end
+
   defp run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
     with {:ok, backend_name, backend} <- resolve_backend(opts),
          {:ok, session} <-
-           backend.start_session(workspace, worker_host: worker_host, issue: issue)
+           backend.start_session(
+             workspace,
+             worker_host: worker_host,
+             issue: issue,
+             binding: Keyword.get(opts, :binding)
+           )
            |> AgentBackend.validate_start_result() do
+      stop_key = {__MODULE__, :backend_stopped, make_ref()}
+
       try do
-        do_run_agent_turns(
-          %{
-            backend: backend,
-            backend_name: backend_name,
-            app_session: session,
-            workspace: workspace,
-            issue: issue,
-            recipient: codex_update_recipient,
-            opts: opts,
-            issue_state_fetcher: issue_state_fetcher,
-            max_turns: max_turns
-          },
-          1
-        )
-      after
-        case backend.stop_session(session) |> AgentBackend.validate_stop_result() do
-          :ok -> :ok
-          {:error, reason} -> raise RuntimeError, "Backend stop contract failed: #{inspect(reason)}"
+        result =
+          do_run_agent_turns(
+            %{
+              backend: backend,
+              backend_name: backend_name,
+              app_session: session,
+              workspace: workspace,
+              issue: issue,
+              recipient: codex_update_recipient,
+              opts: opts,
+              issue_state_fetcher: issue_state_fetcher,
+              max_turns: max_turns
+            },
+            1
+          )
+
+        Process.put(stop_key, true)
+        stop_backend!(backend, session)
+
+        if result == :ok do
+          case TerminalFailure.clear_active(workspace) do
+            :ok -> :ok
+            {:error, reason} -> Logger.warning("Unable to clear settled terminal marker workspace=#{workspace} reason=#{inspect(reason)}")
+          end
         end
+
+        result
+      after
+        unless Process.delete(stop_key), do: stop_backend!(backend, session)
       end
     end
   end
@@ -152,7 +176,8 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: agent_message_handler(codex_update_recipient, issue, backend_name),
              attempt: Keyword.get(opts, :attempt),
-             turn_number: turn_number
+             turn_number: turn_number,
+             binding: Keyword.get(opts, :binding)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session.session_id} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 

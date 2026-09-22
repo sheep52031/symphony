@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Antigravity.Transport do
   @moduledoc false
 
-  alias SymphonyElixir.Antigravity.Launcher
+  alias SymphonyElixir.{Antigravity.Launcher, TerminalFailure}
 
   @line_bytes 1_048_576
   @max_identity_bytes 256
@@ -89,6 +89,13 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
   @spec stderr(session()) :: {:ok, String.t()} | {:error, term()}
   def stderr(%{stderr_path: stderr_path}), do: File.read(stderr_path)
+
+  @spec session_id(session()) :: String.t() | nil
+  def session_id(%{state: state_pid}) when is_pid(state_pid) do
+    if Process.alive?(state_pid), do: Agent.get(state_pid, &Map.get(&1, :session_id)), else: nil
+  catch
+    :exit, _ -> nil
+  end
 
   defp start_port(launch, opts) do
     runtime_directory = Path.join(launch.workspace, ".symphony/antigravity")
@@ -207,17 +214,22 @@ defmodule SymphonyElixir.Antigravity.Transport do
         "init" => %{"cwd" => proof.cwd, "permission_mode" => proof.permission_mode}
       })
 
-      receive_turn(Map.put(loop, :session_proof, proof))
+      receive_turn(Map.merge(loop, %{session_proof: proof, progress_seen?: true}))
     end
   end
 
   defp handle_event(loop, %{"event" => "step_update", "step_update" => update})
        when is_map(update) do
-    with :ok <- validate_event_identity(loop.session.state, Map.get(update, "conversation_id")),
-         {:ok, sanitized} <- validate_step_update(update) do
-      loop.on_event.(%{"event" => "step_update", "step_update" => sanitized})
+    case accept_step_update(loop.session.state, update) do
+      {:ok, sanitized} ->
+        loop.on_event.(%{"event" => "step_update", "step_update" => sanitized})
+        receive_turn(%{loop | progress_seen?: true})
 
-      receive_turn(%{loop | progress_seen?: true})
+      {:terminal_error, sanitized} ->
+        {:error, {:antigravity_terminal_error, sanitized}}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -324,6 +336,19 @@ defmodule SymphonyElixir.Antigravity.Transport do
     end)
   end
 
+  defp accept_step_update(state_pid, update) do
+    if terminal_error_update?(update) do
+      with {:ok, identity} <- resolve_event_identity(state_pid, Map.get(update, "conversation_id")),
+           {:ok, sanitized} <- validate_terminal_error_update(update, identity) do
+        {:terminal_error, sanitized}
+      end
+    else
+      with :ok <- validate_event_identity(state_pid, Map.get(update, "conversation_id")) do
+        validate_step_update(update)
+      end
+    end
+  end
+
   defp validate_step_update(update) do
     step_type = Map.get(update, "step_type")
 
@@ -338,6 +363,56 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
       {:ok, sanitized}
     end
+  end
+
+  defp terminal_error_update?(update) do
+    step_type = Map.get(update, "step_type")
+
+    (is_binary(step_type) and String.downcase(step_type) == "error_message") or
+      (Map.get(update, "source") == "SYSTEM" and Map.get(update, "type") == "ERROR_MESSAGE")
+  end
+
+  defp validate_terminal_error_update(update, identity) do
+    source = Map.get(update, "source")
+    type = Map.get(update, "type")
+    status = Map.get(update, "status")
+    error = Map.get(update, "error")
+
+    cond do
+      source != "SYSTEM" ->
+        {:error, :invalid_antigravity_terminal_error_source}
+
+      type != "ERROR_MESSAGE" ->
+        {:error, :invalid_antigravity_terminal_error_type}
+
+      status not in ["DONE", "ERROR"] ->
+        {:error, :invalid_antigravity_terminal_error_status}
+
+      not is_binary(error) or String.trim(error) == "" ->
+        {:error, :invalid_antigravity_terminal_error_message}
+
+      true ->
+        {:ok,
+         %{
+           "conversation_id" => identity,
+           "source" => source,
+           "type" => type,
+           "status" => status,
+           "error" => TerminalFailure.sanitize_message(error)
+         }}
+    end
+  end
+
+  defp resolve_event_identity(state_pid, identity) do
+    Agent.get(state_pid, fn state ->
+      cond do
+        not state.init_seen? -> {:error, :antigravity_event_before_init}
+        is_nil(identity) -> {:ok, state.session_id}
+        not valid_identity?(identity) -> {:error, :invalid_antigravity_conversation_id}
+        identity != state.session_id -> {:error, :antigravity_identity_mismatch}
+        true -> {:ok, identity}
+      end
+    end)
   end
 
   defp validate_step_type(step_type) when step_type in @step_types, do: :ok
@@ -417,6 +492,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
     signal_process_group(loop.session, "INT")
     terminal = collect_cancellation(loop, monotonic_ms() + loop.cancel_grace_ms, "")
     mark_closed(loop.session.state)
+
+    terminal = Map.put(terminal, :progress_seen, loop.progress_seen?)
 
     case close_process(loop.session) do
       :ok -> {:error, {:antigravity_turn_timeout, stage, terminal}}

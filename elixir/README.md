@@ -41,16 +41,31 @@ Bubblewrap boundary: host root is read-only, the real user home and host `/run/u
 only the issue workspace and selected profile root are host-writable, the exact AGY executable is
 projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony` runtime metadata is
 read-only to the child, and native `--sandbox` remains enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
-usage, or permission/input denial fails visibly. Codex remains the default and rollback path; Pi
-remains supported.
+usage, or permission/input denial fails visibly. Native `SYSTEM / ERROR_MESSAGE` steps are accepted
+as terminal provider evidence instead of being misreported as an unknown step type. The adapter
+classifies a bounded, redacted provider-neutral reason (`provider_quota_exhausted`,
+`provider_auth_failed`, `provider_network_unreachable`, `permission_denied`, `worker_crashed`,
+`worker_stalled`, `provider_protocol_error`, or `unknown_terminal_failure`) and persists an
+idempotent receipt under the existing issue workspace. Codex remains the default and rollback path;
+Pi remains supported.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Those
+input-required entries are in memory only; restarting the orchestrator clears that blocked map, so
+an otherwise eligible tracker issue can become a dispatch candidate again after restart.
+
+A typed provider terminal failure follows a stricter boundary. The worker process is reaped before
+the orchestrator moves the issue to a `terminal_failure` hold, and no ordinary retry is scheduled.
+A policy owner may call the narrow `Orchestrator.resume_terminal_attempt/3` seam with an opaque,
+validated launch binding. The backend must remain unchanged; for AntiGravity the only binding option
+is a dedicated absolute `profile_root`. The new attempt reuses the same issue workspace, skips
+`after_create`, and records a non-secret resume receipt. Symphony validates and executes that
+binding but never selects an account or rotates profiles itself. A restart that finds a settled
+terminal marker reconstructs the hold; a marker that already has a resume receipt is ambiguous and
+fails closed instead of creating a duplicate writer.
 
 ## How to use it
 
@@ -233,9 +248,11 @@ Notes:
   sends bounded `SIGINT`/`SIGTERM`/`SIGKILL`, and verifies the process group is empty.
   `antigravity.cancel_grace_ms` bounds collection of a native terminal envelope after `SIGINT`.
   Native `denied_actions` and `WAITING` are surfaced as input-required errors rather than silently
-  completed turns. Stdout frames are bounded and only reviewed protocol fields are forwarded to
-  orchestration callbacks. A requested continuation identity may never become a fresh-session
-  fallback.
+  completed turns. `SYSTEM / ERROR_MESSAGE` is a terminal provider event; its message is redacted
+  and bounded before it enters callbacks, logs, or workspace receipts. Unknown error messages stay
+  `unknown_terminal_failure` and are never inferred to be quota failures. Stdout frames are bounded
+  and only reviewed protocol fields are forwarded to orchestration callbacks. A requested
+  continuation identity may never become a fresh-session fallback.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.

@@ -547,9 +547,27 @@ Launch and protocol requirements:
   treated as a fresh-session continuation.
 - `denied_actions` and `WAITING` MUST surface as input-required outcomes. They MUST NOT be
   auto-answered or treated as successful completion.
+- A native `SYSTEM / ERROR_MESSAGE` step MUST be accepted as terminal provider evidence rather than
+  rejected as an unknown step type. Before it leaves the adapter boundary, its message MUST be
+  bounded and redacted and the failure MUST be normalized to exactly one provider-neutral reason:
+  `provider_quota_exhausted`, `provider_auth_failed`, `provider_network_unreachable`,
+  `permission_denied`, `worker_crashed`, `worker_stalled`, `provider_protocol_error`, or
+  `unknown_terminal_failure`. Unknown or ambiguous messages MUST NOT be inferred to be quota.
+- Terminal evidence MUST correlate issue, attempt, backend, session, workspace, and a non-secret
+  binding ID. It MUST have a deterministic event ID and an atomic workspace receipt so duplicate
+  delivery is idempotent. Provider account identifiers, email addresses, tokens, and OAuth payloads
+  MUST NOT be retained.
 - Locally initiated timeout/cancellation is authoritative even if the observed native build reports
-  terminal `ERROR` rather than `INTERRUPTED`. Unsolicited native `ERROR` remains a provider failure.
-  Shutdown MUST bound escalation and verify that the owned process group is empty.
+  terminal `ERROR` rather than `INTERRUPTED`. Timeout evidence MUST preserve whether native progress
+  was observed instead of collapsing all silence and long-running work into one liveness claim.
+  Unsolicited native `ERROR` remains a provider failure. Shutdown MUST bound escalation and verify
+  that the owned process group is empty.
+- An externally selected launch binding MAY start a new attempt only after the previous task is down
+  and its terminal hold owns no live writer. The binding MUST keep the same backend and MAY override
+  only backend-reviewed launch options; AntiGravity accepts only a dedicated absolute
+  `profile_root`. The new attempt MUST reuse the same issue workspace and MUST NOT rerun
+  `after_create`. Symphony validates and executes the binding but MUST NOT select an account,
+  provider, model, pool order, cooldown, or failover policy.
 
 #### 5.3.8 `codex` (object)
 
@@ -809,7 +827,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (abnormal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - Schedule exponential-backoff retry.
+  - If the adapter emitted a valid typed terminal failure, hold the claimed issue without an
+    ordinary retry until an external policy selects a valid new-attempt binding.
+  - Otherwise schedule exponential-backoff retry.
 
 - `Codex Update Event`
   - Update live session fields, token counters, and rate limits.
@@ -829,6 +849,11 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
+- A valid active terminal receipt reconstructs a `terminal_failure` hold before ordinary dispatch.
+  If a corresponding resume receipt already exists but no live writer can be proven after restart,
+  recovery is ambiguous and MUST fail closed; it MUST NOT create a duplicate writer.
+- A successful attempt clears only the active terminal marker; immutable terminal and resume
+  receipts remain as lifecycle evidence until normal workspace cleanup.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation

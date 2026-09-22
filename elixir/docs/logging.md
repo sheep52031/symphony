@@ -15,9 +15,13 @@ When logging issue-related work, include both identifiers:
 - `issue_id`: Linear internal UUID (stable foreign key).
 - `issue_identifier`: human ticket key (for example `MT-620`).
 
-When logging Codex execution lifecycle events, include:
+When logging execution lifecycle events, include:
 
-- `session_id`: combined Codex thread/turn identifier.
+- `session_id`: the backend session identifier (combined Codex thread/turn identifier for Codex).
+- `backend`: the selected execution backend when the event is not inherently Codex-only.
+- `terminal_reason` and deterministic `event_id` for typed terminal failures.
+- `binding_id` for an externally selected new-attempt binding; never log its profile path,
+  credentials, account email, or provider payload.
 
 ## Message Design
 
