@@ -11,6 +11,12 @@ defmodule SymphonyElixir.TerminalFailure do
   @lock_retry_attempts 40
   @lock_retry_delay_ms 5
   @ownerless_lock_grace_seconds 2
+  @runtime_instance_key {__MODULE__, :runtime_instance}
+
+  if Mix.env() == :test do
+    @lock_test_overrides_key {__MODULE__, :lock_test_overrides}
+  end
+
   @required_evidence_keys MapSet.new([
                             "event_id",
                             "integrity_hash",
@@ -617,10 +623,10 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp strict_optional_evidence_fields?(decoded) do
     optional_field_valid?(decoded, "writer_id", &valid_hash?/1) and
-      optional_field_valid?(decoded, "public_attempt", &valid_raw_attempt?/1) and
-      optional_field_valid?(decoded, "provider_code", &(normalize_provider_code(&1) == &1)) and
-      optional_field_valid?(decoded, "http_status", &(normalize_http_status(&1) == &1)) and
-      optional_field_valid?(decoded, "reset_hint", &(normalize_reset_hint(&1) == &1)) and
+      optional_field_valid?(decoded, "public_attempt", &valid_present_attempt?/1) and
+      optional_field_valid?(decoded, "provider_code", &valid_present_provider_code?/1) and
+      optional_field_valid?(decoded, "http_status", &valid_present_http_status?/1) and
+      optional_field_valid?(decoded, "reset_hint", &valid_present_reset_hint?/1) and
       optional_field_valid?(decoded, "liveness", &(not is_nil(decode_liveness(&1))))
   end
 
@@ -637,7 +643,11 @@ defmodule SymphonyElixir.TerminalFailure do
     do: exact_nullable_bounded?(value, max_bytes) and value not in [nil, ""]
 
   defp valid_raw_attempt?(nil), do: true
-  defp valid_raw_attempt?(value), do: is_integer(value) and value >= 0
+  defp valid_raw_attempt?(value), do: valid_present_attempt?(value)
+  defp valid_present_attempt?(value), do: is_integer(value) and value >= 0
+  defp valid_present_provider_code?(value), do: not is_nil(value) and normalize_provider_code(value) == value
+  defp valid_present_http_status?(value), do: not is_nil(value) and normalize_http_status(value) == value
+  defp valid_present_reset_hint?(value), do: not is_nil(value) and normalize_reset_hint(value) == value
   defp valid_raw_optional_hash?(nil), do: true
   defp valid_raw_optional_hash?(value), do: valid_hash?(value)
 
@@ -1048,38 +1058,47 @@ defmodule SymphonyElixir.TerminalFailure do
     end
 
     @doc false
-    @spec lock_recovery_edges_for_test(Path.t()) :: map()
-    def lock_recovery_edges_for_test(root) do
-      cleanup_path = Path.join(root, "cleanup.lock")
-      File.mkdir_p!(cleanup_path)
-      File.write!(lock_owner_path(cleanup_path), "owner")
+    @spec with_lock_overrides_for_test(map(), (-> result)) :: result when result: term()
+    def with_lock_overrides_for_test(overrides, operation)
+        when is_map(overrides) and is_function(operation, 0) do
+      previous = Process.get(@lock_test_overrides_key)
+      Process.put(@lock_test_overrides_key, Map.merge(previous || %{}, overrides))
 
-      failed_owner_path = Path.join(root, "failed-owner.lock")
-      File.mkdir_p!(lock_owner_path(failed_owner_path))
-
-      invalid_owner = lock_owner(String.duplicate("a", 64)) |> Map.put("os_start_time", 42)
-      missing_lock_root = Path.join(root, "missing-lock-root")
-      invalid_lock_root = Path.join(root, "invalid-lock-root")
-      File.write!(invalid_lock_root, "not-a-directory")
-
-      %{
-        cleanup: cleanup_failed_lock(cleanup_path),
-        owner_failure: persist_lock_owner(failed_owner_path, String.duplicate("b", 64)),
-        invalid_owner: valid_lock_owner?(invalid_owner),
-        incomplete_owner: valid_lock_owner?(%{}),
-        missing: reclaim_stale_lock(Path.join(root, "missing.lock")),
-        missing_rmdir: normalize_ownerless_rmdir({:error, :enoent}),
-        denied_rmdir: normalize_ownerless_rmdir({:error, :eacces}),
-        denied_stat: reclaim_ownerless_lock_from_stat("unused", {:error, :eacces}, 0),
-        missing_namespace: recover_lock_namespace(missing_lock_root),
-        invalid_namespace: recover_lock_namespace(invalid_lock_root),
-        machine_fallback: machine_scope_from_read({:error, :enoent}, "test-boot"),
-        boot_fallback: boot_scope_from_read({:error, :enoent}),
-        short_stat: process_start_time_from_read({:ok, "1 (beam) S"}),
-        missing_stat: process_start_time_from_read({:error, :enoent}),
-        invalid_pid: decode_owner_pid(Base.encode64("not-an-erlang-term"))
-      }
+      try do
+        operation.()
+      after
+        if is_nil(previous),
+          do: Process.delete(@lock_test_overrides_key),
+          else: Process.put(@lock_test_overrides_key, previous)
+      end
     end
+  end
+
+  if Mix.env() == :test do
+    defp lock_override(key, fallback) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{^key => value} -> value
+        _overrides -> fallback.()
+      end
+    end
+
+    defp lock_process_read(pid) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{process_read: reader} when is_function(reader, 1) -> reader.(pid)
+        _overrides -> File.read("/proc/#{pid}/stat")
+      end
+    end
+
+    defp run_lock_directory_hook(lock_path) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{after_lock_directory: hook} when is_function(hook, 1) -> hook.(lock_path)
+        _overrides -> :ok
+      end
+    end
+  else
+    defp lock_override(_key, fallback), do: fallback.()
+    defp lock_process_read(pid), do: File.read("/proc/#{pid}/stat")
+    defp run_lock_directory_hook(_lock_path), do: :ok
   end
 
   defp with_active_marker_locks(paths, operation) do
@@ -1141,8 +1160,12 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp create_owned_lock_directory(lock_path, token) do
     case File.mkdir(lock_path) do
-      :ok -> persist_lock_owner(lock_path, token)
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        run_lock_directory_hook(lock_path)
+        persist_lock_owner(lock_path, token)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1178,11 +1201,36 @@ defmodule SymphonyElixir.TerminalFailure do
     %{
       "token" => token,
       "runtime_instance" => runtime_instance(),
-      "erlang_pid" => self() |> :erlang.term_to_binary() |> Base.encode64(),
-      "machine_scope" => machine_scope(),
-      "os_pid" => System.pid(),
-      "os_start_time" => os_process_start_time(System.pid())
+      "erlang_pid" => self() |> :erlang.term_to_binary() |> Base.encode64()
     }
+    |> Map.merge(lock_process_identity())
+  end
+
+  defp lock_process_identity do
+    with {:ok, os_pid} <- parse_positive_integer(System.pid()),
+         {:ok, machine_scope} <- machine_scope(),
+         {:ok, boot_scope} <- boot_scope(),
+         {:ok, pid_namespace_scope} <- pid_namespace_scope(),
+         {:ok, os_start_time} <- process_start_time(os_pid) do
+      %{
+        "probe_status" => "verified",
+        "machine_scope" => machine_scope,
+        "boot_scope" => boot_scope,
+        "pid_namespace_scope" => pid_namespace_scope,
+        "os_pid" => os_pid,
+        "os_start_time" => os_start_time
+      }
+    else
+      _unavailable ->
+        %{
+          "probe_status" => "unavailable",
+          "machine_scope" => nil,
+          "boot_scope" => nil,
+          "pid_namespace_scope" => nil,
+          "os_pid" => nil,
+          "os_start_time" => nil
+        }
+    end
   end
 
   defp lock_owner_path(lock_path), do: Path.join(lock_path, "owner.json")
@@ -1201,22 +1249,38 @@ defmodule SymphonyElixir.TerminalFailure do
   defp valid_lock_owner?(owner) when is_map(owner) do
     Enum.sort(Map.keys(owner)) ==
       [
+        "boot_scope",
         "erlang_pid",
         "machine_scope",
         "os_pid",
         "os_start_time",
+        "pid_namespace_scope",
+        "probe_status",
         "runtime_instance",
         "token"
       ] and
       valid_hash?(Map.get(owner, "token")) and
       valid_hash?(Map.get(owner, "runtime_instance")) and
-      valid_hash?(Map.get(owner, "machine_scope")) and
-      is_binary(Map.get(owner, "erlang_pid")) and
-      is_binary(Map.get(owner, "os_pid")) and
-      is_binary(Map.get(owner, "os_start_time"))
+      is_binary(Map.get(owner, "erlang_pid")) and valid_lock_probe?(owner)
   end
 
   defp valid_lock_owner?(_owner), do: false
+
+  defp valid_lock_probe?(%{"probe_status" => "verified"} = owner) do
+    Enum.all?(
+      ["machine_scope", "boot_scope", "pid_namespace_scope"],
+      &valid_hash?(Map.get(owner, &1))
+    ) and positive_integer?(owner["os_pid"]) and positive_integer?(owner["os_start_time"])
+  end
+
+  defp valid_lock_probe?(%{"probe_status" => "unavailable"} = owner) do
+    Enum.all?(
+      ["machine_scope", "boot_scope", "pid_namespace_scope", "os_pid", "os_start_time"],
+      &is_nil(Map.get(owner, &1))
+    )
+  end
+
+  defp valid_lock_probe?(_owner), do: false
 
   defp reclaim_stale_lock(lock_path) do
     case read_lock_owner(lock_path) do
@@ -1234,14 +1298,42 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp stale_lock_owner?(owner) do
-    if owner["runtime_instance"] == runtime_instance() do
-      case decode_owner_pid(owner["erlang_pid"]) do
-        {:ok, pid} -> not Process.alive?(pid)
-        :error -> false
+    if owner["runtime_instance"] == runtime_instance(),
+      do: same_runtime_owner_stale?(owner),
+      else: prior_runtime_owner_stale?(owner)
+  end
+
+  defp same_runtime_owner_stale?(owner) do
+    case decode_owner_pid(owner["erlang_pid"]) do
+      {:ok, pid} -> not Process.alive?(pid)
+      :error -> false
+    end
+  end
+
+  defp prior_runtime_owner_stale?(%{"probe_status" => "verified"} = owner) do
+    with {:ok, current_machine} <- machine_scope(),
+         true <- current_machine == owner["machine_scope"],
+         {:ok, current_boot} <- boot_scope() do
+      if current_boot != owner["boot_scope"],
+        do: true,
+        else: same_boot_owner_stale?(owner)
+    else
+      _unavailable_or_remote -> false
+    end
+  end
+
+  defp prior_runtime_owner_stale?(_owner), do: false
+
+  defp same_boot_owner_stale?(owner) do
+    with {:ok, current_namespace} <- pid_namespace_scope(),
+         true <- current_namespace == owner["pid_namespace_scope"] do
+      case process_start_time(owner["os_pid"]) do
+        :dead -> true
+        {:ok, current_start_time} -> current_start_time != owner["os_start_time"]
+        {:unavailable, _reason} -> false
       end
     else
-      owner["machine_scope"] == machine_scope() and
-        os_process_start_time(owner["os_pid"]) != owner["os_start_time"]
+      _unavailable_or_other_namespace -> false
     end
   end
 
@@ -1269,7 +1361,8 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp reclaim_ownerless_lock(lock_path) do
     stale_before = System.os_time(:second) - @ownerless_lock_grace_seconds
-    reclaim_ownerless_lock_from_stat(lock_path, File.stat(lock_path, time: :posix), stale_before)
+    stat_result = lock_override(:file_stat, fn -> File.stat(lock_path, time: :posix) end)
+    reclaim_ownerless_lock_from_stat(lock_path, stat_result, stale_before)
   end
 
   defp reclaim_ownerless_lock_from_stat(lock_path, stat_result, stale_before) do
@@ -1295,7 +1388,7 @@ defmodule SymphonyElixir.TerminalFailure do
     do: recover_lock_namespace(Path.join(state_root(), "locks"))
 
   defp recover_lock_namespace(lock_root) do
-    case File.ls(lock_root) do
+    case lock_override(:file_ls, fn -> File.ls(lock_root) end) do
       {:ok, entries} ->
         Enum.reduce_while(entries, :ok, &recover_lock_entry(lock_root, &1, &2))
 
@@ -1322,49 +1415,80 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
-  defp runtime_instance do
-    identity_hash(
-      Enum.join(
-        [machine_scope(), current_boot_scope(), System.pid(), os_process_start_time(System.pid())],
-        ":"
-      )
+  defp runtime_instance, do: initialize_runtime_instance()
+
+  defp initialize_runtime_instance do
+    :global.trans(
+      {@runtime_instance_key, self()},
+      fn ->
+        case :persistent_term.get(@runtime_instance_key, nil) do
+          nil ->
+            instance = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+            :persistent_term.put(@runtime_instance_key, instance)
+            instance
+
+          instance ->
+            instance
+        end
+      end,
+      [node()]
     )
   end
 
   defp machine_scope do
-    machine_scope_from_read(File.read("/etc/machine-id"), current_boot_scope())
+    read_result = lock_override(:machine_read, fn -> File.read("/etc/machine-id") end)
+    scope_from_read(read_result, :machine_scope_unavailable)
   end
 
-  defp machine_scope_from_read({:ok, machine_id}, _boot_scope),
-    do: identity_hash(String.trim(machine_id))
-
-  defp machine_scope_from_read({:error, _reason}, boot_scope),
-    do: identity_hash("unknown-machine:#{boot_scope}")
-
-  defp current_boot_scope do
-    boot_scope_from_read(File.read("/proc/sys/kernel/random/boot_id"))
+  defp boot_scope do
+    read_result = lock_override(:boot_read, fn -> File.read("/proc/sys/kernel/random/boot_id") end)
+    scope_from_read(read_result, :boot_scope_unavailable)
   end
 
-  defp boot_scope_from_read({:ok, boot_id}), do: String.trim(boot_id)
-  defp boot_scope_from_read({:error, _reason}), do: "unknown-boot"
+  defp pid_namespace_scope do
+    read_result = lock_override(:pid_namespace_read, fn -> File.read_link("/proc/self/ns/pid") end)
 
-  defp os_process_start_time(pid) when is_binary(pid) do
-    process_start_time_from_read(File.read("/proc/#{pid}/stat"))
-  end
-
-  defp process_start_time_from_read({:ok, stat}) do
-    stat
-    |> String.split(") ", parts: 2)
-    |> List.last()
-    |> String.split()
-    |> Enum.at(19)
-    |> case do
-      value when is_binary(value) -> value
-      _other -> "unavailable"
+    case read_result do
+      {:ok, namespace} when namespace != "" -> {:ok, identity_hash(namespace)}
+      {:ok, _empty} -> {:unavailable, :pid_namespace_unavailable}
+      {:error, reason} -> {:unavailable, {:pid_namespace_unavailable, reason}}
     end
   end
 
-  defp process_start_time_from_read({:error, _reason}), do: "unavailable"
+  defp scope_from_read({:ok, value}, error) do
+    case String.trim(value) do
+      "" -> {:unavailable, error}
+      normalized -> {:ok, identity_hash(normalized)}
+    end
+  end
+
+  defp scope_from_read({:error, reason}, error), do: {:unavailable, {error, reason}}
+
+  defp process_start_time(pid) when is_integer(pid) and pid > 0 do
+    process_start_time_from_read(lock_process_read(pid))
+  end
+
+  defp process_start_time_from_read({:ok, stat}) do
+    with [_prefix, fields] <- String.split(stat, ") ", parts: 2),
+         value when is_binary(value) <- fields |> String.split() |> Enum.at(19),
+         {:ok, start_time} <- parse_positive_integer(value) do
+      {:ok, start_time}
+    else
+      _malformed -> {:unavailable, :malformed_process_stat}
+    end
+  end
+
+  defp process_start_time_from_read({:error, :enoent}), do: :dead
+  defp process_start_time_from_read({:error, reason}), do: {:unavailable, reason}
+
+  defp parse_positive_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer > 0 -> {:ok, integer}
+      _invalid -> {:unavailable, :invalid_positive_integer}
+    end
+  end
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp persist_mirrored(paths, writer, error_tag) do
     {local_paths, global_paths} = Enum.split(paths, 2)

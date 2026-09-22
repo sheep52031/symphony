@@ -47,16 +47,17 @@ classifies one provider-neutral reason (`provider_quota_exhausted`, `provider_au
 `provider_network_unreachable`, `permission_denied`, `worker_crashed`, `worker_stalled`,
 `provider_protocol_error`, or `unknown_terminal_failure`) and retains only reviewed structured
 fields—never raw provider prose, account identifiers, tokens, OAuth payloads, or profile paths. It
-persists an immutable receipt whose strict schema and full accepted payload are integrity-hashed,
-plus a fail-closed active marker, with a workspace-root fallback and
+persists an immutable receipt whose strict schema rejects present-null optional fields and whose
+full accepted payload is integrity-hashed, plus a fail-closed active marker, with a workspace-root fallback and
 a workflow-scoped lifecycle index beside the configured log directory so workspace-root reloads
 cannot lose an active hold or collide with another tracker/repository instance. Active ownership is
 bound to the workflow, issue, workspace, event, binding, unique writer ID, monotonically reserved
 writer attempt, and an explicit predecessor event. Writer identity remains distinct from the public
 retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key
-lock that exists independently of marker files and carries recoverable runtime, process, and machine
-ownership. Dead owners are reclaimed safely; live, malformed, remote, or recent ownerless locks fail
-closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
+lock that exists independently of marker files and carries a VM-stable runtime identity plus strict
+machine, boot, PID-namespace, PID, and process-start ownership. Only a proven reboot, absent PID, or
+PID reuse is reclaimed; unavailable probes and live, malformed, remote, cross-namespace, or recent
+ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
 

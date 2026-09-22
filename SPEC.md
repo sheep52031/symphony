@@ -556,7 +556,8 @@ Launch and protocol requirements:
   `unknown_terminal_failure`. Unknown or ambiguous messages MUST NOT be inferred to be quota.
 - Terminal evidence MUST correlate issue, attempt, backend, session, workspace, and a non-secret
   binding ID. It MUST have a deterministic semantic event ID plus a separate integrity hash over
-  every accepted persisted field, reject unknown or malformed fields before normalization, retain
+  every accepted persisted field, reject unknown, malformed, or present-null optional fields before
+  normalization, retain
   an immutable create-once event receipt, and use a fail-closed active marker; if workspace metadata is unavailable, a workspace-root hold MUST retain
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
   active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
@@ -566,9 +567,11 @@ Launch and protocol requirements:
   attempt used by prompts, status, and backoff. Active-marker replacement and removal MUST verify
   workflow, issue, workspace, event, binding, attempt, and an explicit predecessor-event lineage
   while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
-  ownership MUST be durable and recoverable: same-runtime dead owners and same-machine dead or
-  PID-reused runtimes are reclaimed by ownership proof, while live, remote, malformed, or recent
-  ownerless locks fail closed; startup MUST probe and reconcile the lock namespace; a resumed event may transfer ownership
+  ownership MUST be durable and recoverable. Runtime identity is fixed for the VM. A prior runtime
+  is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
+  namespace reports the PID absent or a strictly parsed positive process-start time mismatch.
+  Unsupported, unreadable, malformed, cross-machine, cross-namespace, live, and recent ownerless
+  locks fail closed; startup MUST probe and reconcile the lock namespace; a resumed event may transfer ownership
   to exactly its authorized next terminal event, but unrelated, stale, cleared, or concurrent owners
   MUST fail closed. Collisions MUST accept
   byte-identical receipts or fail closed without rewriting history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
