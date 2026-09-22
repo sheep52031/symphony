@@ -163,6 +163,9 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert {:storage_fault, %{code: :incomplete_terminal_transaction}} =
              TerminalFailure.recovery_state_for_issue(evidence.issue_id)
 
+    assert {:error, {:incomplete_terminal_transaction, event_id}} =
+             TerminalFailure.storage_ready()
+
     assert {:ok, ^receipt} = TerminalFailure.persist(workspace, evidence)
     assert {:settled, %{event_id: ^event_id}} = TerminalFailure.recovery_state(workspace)
     assert :ok = TerminalFailure.settle_lifecycle(workspace, evidence.issue_id, event_id)
@@ -219,6 +222,10 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
     File.rm!(state_pending_root)
     File.mkdir_p!(state_pending_root)
+    malformed_global_pending = Path.join(state_pending_root, "malformed.json")
+    File.write!(malformed_global_pending, "not-json")
+    assert {:error, :invalid_terminal_pending_entry} = TerminalFailure.storage_ready()
+    File.rm!(malformed_global_pending)
   end
 
   test "partial resume mirrors recover as storage faults instead of authorized handoffs" do
@@ -1189,8 +1196,96 @@ defmodule SymphonyElixir.TerminalFailureTest do
   end
 
   test "lock namespace recovery fails closed on storage errors" do
-    {root, workspace, issue_id, _lock_path} = lock_fixture!("namespace")
+    {root, workspace, issue_id, lock_path} = lock_fixture!("namespace")
     on_exit(fn -> File.rm_rf!(root) end)
+
+    File.mkdir_p!(lock_path)
+    File.write!(Path.join(lock_path, "owner.json"), "{}")
+
+    assert {:error, {:active_marker_locked, ^lock_path, :unsupported_legacy_lock_directory}} =
+             TerminalFailure.storage_ready()
+
+    File.rm_rf!(lock_path)
+    candidate_path = "#{lock_path}.candidate-abandoned"
+    reclaim_path = "#{lock_path}.reclaim-abandoned"
+    File.write!(candidate_path, "candidate")
+    File.write!(reclaim_path, "reclaim")
+    assert :ok = TerminalFailure.storage_ready()
+    refute File.exists?(candidate_path)
+    refute File.exists?(reclaim_path)
+
+    File.mkdir!(candidate_path)
+
+    assert {:error, {:active_marker_locked, ^candidate_path, {:invalid_transient_lock_artifact, :directory}}} =
+             TerminalFailure.storage_ready()
+
+    File.rmdir!(candidate_path)
+    File.write!(candidate_path, "candidate")
+
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{lock_lstat: fn _path -> {:error, :enoent} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    File.rm!(candidate_path)
+    File.write!(candidate_path, "candidate")
+
+    assert {:error, {:active_marker_locked, ^candidate_path, :eacces}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{lock_lstat: fn _path -> {:error, :eacces} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, {:active_marker_locked, ^candidate_path, :eperm}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{transient_remove: fn _path -> {:error, :eperm} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    File.rm!(candidate_path)
+    invalid_target = Path.join(root, "invalid-lock-target")
+    File.write!(invalid_target, "target")
+    File.ln_s!(invalid_target, lock_path)
+
+    assert {:error, {:active_marker_locked, ^lock_path, {:invalid_lock_target, :symlink}}} =
+             TerminalFailure.storage_ready()
+
+    File.rm!(lock_path)
+    File.write!(lock_path, "published")
+
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{lock_lstat: fn _path -> {:error, :enoent} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, {:active_marker_locked, ^lock_path, :eacces}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{lock_lstat: fn _path -> {:error, :eacces} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    File.rm!(lock_path)
+
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{pending_ls: {:error, :enoent}},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, {:terminal_pending_namespace_unavailable, :eacces}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{pending_ls: {:error, :eacces}},
+               &TerminalFailure.storage_ready/0
+             )
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    unrelated_lock_entry = Path.join(state_root, "locks/operator-note")
+    File.write!(unrelated_lock_entry, "leave intact")
+    assert :ok = TerminalFailure.storage_ready()
+    assert File.regular?(unrelated_lock_entry)
+    File.rm!(unrelated_lock_entry)
 
     assert_raise ArgumentError, fn ->
       TerminalFailure.with_lock_overrides_for_test(%{unknown: :value}, fn -> :ok end)

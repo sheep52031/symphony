@@ -267,6 +267,14 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
     evidence = TerminalFailure.build(reason, Map.delete(details, :session_id), context)
 
+    if is_binary(evidence.predecessor_event_id) do
+      {:error, {:backend_terminal_failure_pending_cleanup, evidence}}
+    else
+      persist_terminal_failure(session, evidence, on_message)
+    end
+  end
+
+  defp persist_terminal_failure(session, evidence, on_message) do
     case TerminalFailure.persist(session.workspace, evidence) do
       {:ok, _path} ->
         on_message.(

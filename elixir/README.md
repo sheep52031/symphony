@@ -56,8 +56,9 @@ writer attempt, and an explicit predecessor event. Writer identity remains disti
 retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key
 lock that exists independently of marker files, is atomically published with a generation token,
 and carries a VM-stable runtime identity plus strict machine, boot, PID-namespace, PID, and
-process-start ownership. Stale reclamation fences the observed generation so it cannot delete a
-replacement lock. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
+process-start ownership. Stale reclamation fences the observed inode generation so it cannot delete
+a replacement lock. Startup removes only non-authoritative candidate/reclaim links and rejects the
+prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
 and live, malformed, remote, cross-namespace, or ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
@@ -81,7 +82,9 @@ session-start event from that authorized attempt completes the handoff; task cre
 cancelled and leaves the intent ambiguous. A proven resumed writer that later crashes or stalls is
 sealed as a new linked terminal hold instead of entering ordinary retry, but only after the
 AntiGravity cleanup guard acknowledges that the old native process group is empty. Missing or failed
-cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor. The new attempt
+cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor.
+The orchestrator registers that required acknowledgement before releasing the resumed task's start
+gate; required completion remains owned until explicit consumption rather than expiring by timer. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
@@ -92,7 +95,9 @@ immediately cancels queued retries and disables poll, timer, direct, and resume 
 operator repairs storage and restarts. Before event receipts are created, a workflow-scoped pending
 transaction is made durable; active publication owner-clears it under the same ownership lock, while
 a surviving pending transaction makes the receipt-before-active crash window a storage fault.
-Startup probes the actual event, pending, active, resume, fault, and lock namespaces and reclaims
+Startup enumerates and strictly validates every host-indexed pending entry before enabling any
+dispatch, independent of tracker visibility, then probes the actual event, pending, active, resume, fault, and lock
+namespaces and reclaims
 only provably dead owners; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
 reconciliation reread durable lifecycle evidence after the writer stops, then remove the exact
 recorded workspace before ownership-checked settlement of both the active and storage-fault marker

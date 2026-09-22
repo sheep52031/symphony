@@ -3,8 +3,6 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
 
   use GenServer
 
-  @retention_ms 5_000
-
   @type cleanup_result :: :ok | {:error, term()}
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -16,6 +14,12 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   @spec register(pid(), pid()) :: :ok | {:error, :cleanup_owner_already_registered}
   def register(owner_pid, guard_pid) when is_pid(owner_pid) and is_pid(guard_pid) do
     GenServer.call(__MODULE__, {:register, owner_pid, guard_pid})
+  end
+
+  @doc false
+  @spec require_ack(pid()) :: :ok
+  def require_ack(owner_pid) when is_pid(owner_pid) do
+    GenServer.call(__MODULE__, {:require_ack, owner_pid})
   end
 
   @doc false
@@ -44,32 +48,37 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   def handle_call({:register, owner_pid, guard_pid}, _from, state) do
     case Map.get(state, owner_pid) do
       nil ->
-        entry = %{guard_pid: guard_pid, result: nil, waiters: [], expiry_token: nil}
-        {:reply, :ok, Map.put(state, owner_pid, entry)}
+        {:reply, :ok, Map.put(state, owner_pid, new_entry(owner_pid, guard_pid, false))}
+
+      %{guard_pid: nil} = entry ->
+        {:reply, :ok, Map.put(state, owner_pid, %{entry | guard_pid: guard_pid})}
 
       %{guard_pid: ^guard_pid} ->
         {:reply, :ok, state}
-
-      %{result: result} when not is_nil(result) ->
-        entry = %{guard_pid: guard_pid, result: nil, waiters: [], expiry_token: nil}
-        {:reply, :ok, Map.put(state, owner_pid, entry)}
 
       _other ->
         {:reply, {:error, :cleanup_owner_already_registered}, state}
     end
   end
 
+  def handle_call({:require_ack, owner_pid}, _from, state) do
+    state =
+      case Map.fetch(state, owner_pid) do
+        {:ok, entry} -> Map.put(state, owner_pid, %{entry | required?: true})
+        :error -> Map.put(state, owner_pid, new_entry(owner_pid, nil, true))
+      end
+
+    {:reply, :ok, state}
+  end
+
   def handle_call({:complete, owner_pid, guard_pid, result}, _from, state) do
     case Map.get(state, owner_pid) do
       %{guard_pid: ^guard_pid, waiters: []} = entry ->
-        expiry_token = make_ref()
-        Process.send_after(self(), {:expire, owner_pid, guard_pid, expiry_token}, @retention_ms)
-        updated = %{entry | result: result, expiry_token: expiry_token}
-        {:reply, :ok, Map.put(state, owner_pid, updated)}
+        complete_without_waiter(owner_pid, result, entry, state)
 
-      %{guard_pid: ^guard_pid, waiters: waiters} ->
+      %{guard_pid: ^guard_pid, waiters: waiters} = entry ->
         Enum.each(waiters, &GenServer.reply(&1, result))
-        {:reply, :ok, Map.delete(state, owner_pid)}
+        {:reply, :ok, delete_entry(state, owner_pid, entry)}
 
       _other ->
         {:reply, :ok, state}
@@ -81,8 +90,8 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
       nil ->
         {:reply, {:error, :cleanup_not_registered}, state}
 
-      %{result: result} when not is_nil(result) ->
-        {:reply, result, Map.delete(state, owner_pid)}
+      %{result: result} = entry when not is_nil(result) ->
+        {:reply, result, delete_entry(state, owner_pid, entry)}
 
       %{waiters: waiters} = entry ->
         {:noreply, Map.put(state, owner_pid, %{entry | waiters: [from | waiters]})}
@@ -90,13 +99,46 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   end
 
   @impl true
-  def handle_info({:expire, owner_pid, guard_pid, expiry_token}, state) do
+  def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do
     state =
       case Map.get(state, owner_pid) do
-        %{guard_pid: ^guard_pid, expiry_token: ^expiry_token} -> Map.delete(state, owner_pid)
-        _other -> state
+        %{monitor_ref: ^monitor_ref, guard_pid: nil, required?: true, waiters: []} = entry ->
+          Map.put(state, owner_pid, %{entry | result: :ok})
+
+        %{monitor_ref: ^monitor_ref, guard_pid: nil, required?: true, waiters: waiters} = entry ->
+          Enum.each(waiters, &GenServer.reply(&1, :ok))
+          delete_entry(state, owner_pid, entry)
+
+        %{monitor_ref: ^monitor_ref, guard_pid: nil} = entry ->
+          delete_entry(state, owner_pid, entry)
+
+        _other ->
+          state
       end
 
     {:noreply, state}
+  end
+
+  defp new_entry(owner_pid, guard_pid, required?) do
+    %{
+      guard_pid: guard_pid,
+      result: nil,
+      waiters: [],
+      required?: required?,
+      monitor_ref: Process.monitor(owner_pid)
+    }
+  end
+
+  defp complete_without_waiter(owner_pid, result, %{required?: true} = entry, state) do
+    {:reply, :ok, Map.put(state, owner_pid, %{entry | result: result})}
+  end
+
+  defp complete_without_waiter(owner_pid, _result, %{required?: false} = entry, state) do
+    {:reply, :ok, delete_entry(state, owner_pid, entry)}
+  end
+
+  defp delete_entry(state, owner_pid, entry) do
+    Process.demonitor(entry.monitor_ref, [:flush])
+    Map.delete(state, owner_pid)
   end
 end

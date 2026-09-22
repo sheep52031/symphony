@@ -707,37 +707,46 @@ defmodule SymphonyElixir.Antigravity.Transport do
   defp close_process(session) do
     close_port(session.port)
 
-    if wait_for_process_group_exit(session, @graceful_close_ms) do
-      :ok
-    else
-      terminate_process_group(session)
+    case wait_for_process_group_exit(session, @graceful_close_ms) do
+      :dead -> :ok
+      :timeout -> terminate_process_group(session)
+      {:error, _reason} = error -> error
     end
   end
 
   defp terminate_process_group(session) do
-    signal_process_group(session, "TERM")
-
-    if wait_for_process_group_exit(session, @graceful_close_ms) do
-      :ok
-    else
-      kill_process_group(session)
+    with :ok <- signal_process_group(session, "TERM") do
+      case wait_for_process_group_exit(session, @graceful_close_ms) do
+        :dead -> :ok
+        :timeout -> kill_process_group(session)
+        {:error, _reason} = error -> error
+      end
     end
   end
 
   defp kill_process_group(session) do
-    signal_process_group(session, "KILL")
-
-    if wait_for_process_group_exit(session, @forced_close_ms),
-      do: :ok,
-      else: {:error, :antigravity_process_group_survived}
+    with :ok <- signal_process_group(session, "KILL") do
+      case wait_for_process_group_exit(session, @forced_close_ms) do
+        :dead -> :ok
+        :timeout -> {:error, :antigravity_process_group_survived}
+        {:error, _reason} = error -> error
+      end
+    end
   end
 
   defp signal_process_group(%{process_group_id: process_group_id}, signal)
        when is_integer(process_group_id) and process_group_id > 0 do
-    System.cmd(@kill_path, ["-#{signal}", "--", "-#{process_group_id}"], stderr_to_stdout: true)
-    :ok
+    case kill_command(["-#{signal}", "--", "-#{process_group_id}"]) do
+      {_output, 0} ->
+        :ok
+
+      {output, _status} ->
+        if no_such_process?(output),
+          do: :ok,
+          else: {:error, :antigravity_process_group_signal_failed}
+    end
   rescue
-    _error -> :ok
+    _error -> {:error, :antigravity_process_group_signal_failed}
   end
 
   defp wait_for_process_group_exit(session, timeout_ms) do
@@ -746,28 +755,43 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp do_wait_for_process_group_exit(session, deadline_ms) do
-    cond do
-      not process_group_alive?(session) ->
-        true
+    case process_group_status(session) do
+      :dead ->
+        :dead
 
-      monotonic_ms() >= deadline_ms ->
-        false
+      :alive ->
+        if monotonic_ms() >= deadline_ms do
+          :timeout
+        else
+          Process.sleep(10)
+          do_wait_for_process_group_exit(session, deadline_ms)
+        end
 
-      true ->
-        Process.sleep(10)
-        do_wait_for_process_group_exit(session, deadline_ms)
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp process_group_alive?(%{process_group_id: process_group_id})
+  defp process_group_status(%{process_group_id: process_group_id})
        when is_integer(process_group_id) and process_group_id > 0 do
-    match?(
-      {_output, 0},
-      System.cmd(@kill_path, ["-0", "--", "-#{process_group_id}"], stderr_to_stdout: true)
-    )
+    case kill_command(["-0", "--", "-#{process_group_id}"]) do
+      {_output, 0} ->
+        :alive
+
+      {output, _status} ->
+        if no_such_process?(output),
+          do: :dead,
+          else: {:error, :antigravity_process_group_probe_failed}
+    end
   rescue
-    _error -> false
+    _error -> {:error, :antigravity_process_group_probe_failed}
   end
+
+  defp kill_command(arguments) do
+    System.cmd(@kill_path, arguments, stderr_to_stdout: true, env: [{"LC_ALL", "C"}])
+  end
+
+  defp no_such_process?(output), do: String.contains?(output, "No such process")
 
   defp prepare_runtime_directory(workspace) do
     with :ok <- ensure_runtime_directory(Path.join(workspace, ".symphony"), false) do

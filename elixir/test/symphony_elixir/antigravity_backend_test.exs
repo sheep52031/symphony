@@ -573,6 +573,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       Process.exit(other_guard, :kill)
     end)
 
+    assert :ok = CleanupRegistry.require_ack(owner)
     assert :ok = CleanupRegistry.register(owner, self())
     assert :ok = CleanupRegistry.register(owner, self())
     assert {:error, :cleanup_owner_already_registered} = CleanupRegistry.register(owner, other_guard)
@@ -583,8 +584,20 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     completed_owner = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> Process.exit(completed_owner, :kill) end)
     assert :ok = CleanupRegistry.register(completed_owner, self())
+    assert :ok = CleanupRegistry.require_ack(completed_owner)
     assert :ok = CleanupRegistry.complete(completed_owner, self(), {:error, :cleanup_failed})
+
+    assert %{^completed_owner => %{required?: true, result: {:error, :cleanup_failed}}} =
+             :sys.get_state(CleanupRegistry)
+
     assert {:error, :cleanup_failed} = CleanupRegistry.await(completed_owner, 10)
+
+    reserved_owner = spawn(fn -> Process.sleep(:infinity) end)
+    assert :ok = CleanupRegistry.require_ack(reserved_owner)
+    reserved_ref = Process.monitor(reserved_owner)
+    Process.exit(reserved_owner, :kill)
+    assert_receive {:DOWN, ^reserved_ref, :process, ^reserved_owner, :killed}, 1_000
+    assert :ok = CleanupRegistry.await(reserved_owner, 1_000)
   end
 
   test "owner death acknowledges native process-group cleanup before resume can proceed" do
@@ -604,11 +617,128 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert_receive {:native_owner_ready, ^owner, child_pid}, 2_000
     assert process_alive?(child_pid)
+    assert :ok = CleanupRegistry.require_ack(owner)
     owner_ref = Process.monitor(owner)
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
     assert :ok = Transport.await_owner_cleanup(owner, 2_000)
     refute process_alive?(child_pid)
+    File.rm_rf!(root)
+  end
+
+  test "resumed terminal evidence remains unpublished until native cleanup is verified" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    issue = %{id: "issue-deferred-terminal", identifier: "JARVIS-936", title: "Deferred terminal"}
+
+    prior =
+      SymphonyElixir.TerminalFailure.build(:provider_quota_exhausted, %{}, %{
+        backend: :antigravity,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        attempt: 0,
+        session_id: "prior-session",
+        workspace: workspace,
+        binding_id: "slot-a"
+      })
+
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, prior)
+    assert {:ok, _receipt} = SymphonyElixir.TerminalFailure.record_resume(workspace, prior, "slot-b", 1)
+
+    binding = %{binding_id: "slot-b", backend: :antigravity, options: %{profile_root: profile}}
+
+    assert {:ok, session} =
+             Backend.start_session(workspace, launcher: &direct_launcher/5, binding: binding)
+
+    on_message = fn message -> send(self(), {:agy_message, message}) end
+
+    assert {:error, {:backend_terminal_failure_pending_cleanup, successor}} =
+             Backend.run_turn(session, "quota_error", issue,
+               on_message: on_message,
+               attempt: 1,
+               writer_attempt: 1,
+               writer_id: String.duplicate("a", 64),
+               predecessor_event_id: prior.event_id
+             )
+
+    assert {:ambiguous, %{event_id: prior_event_id}} =
+             SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
+
+    assert prior_event_id == prior.event_id
+    refute process_alive?(Integer.to_string(session.backend_process_pid))
+    refute_receive {:agy_message, %{event: :terminal_failure}}
+    assert :ok = Backend.stop_session(session)
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, successor)
+
+    assert {:settled, %{event_id: successor_event_id}} =
+             SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
+
+    assert successor_event_id == successor.event_id
+    File.rm_rf!(root)
+  end
+
+  test "AgentRunner publishes a resumed terminal hold only after backend cleanup" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+
+    configure_backend!(agy, profile,
+      workspace_root: Path.dirname(workspace),
+      max_turns: 1,
+      prompt: "quota_error"
+    )
+
+    issue = %Issue{
+      id: "issue-runner-deferred-terminal",
+      identifier: Path.basename(workspace),
+      title: "quota_error",
+      description: "Force a deferred terminal failure",
+      state: "In Progress",
+      url: "https://example.org/issues/deferred-terminal",
+      dispatchable: true
+    }
+
+    prior =
+      SymphonyElixir.TerminalFailure.build(:provider_quota_exhausted, %{}, %{
+        backend: :antigravity,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        attempt: 0,
+        session_id: "prior-session",
+        workspace: workspace,
+        binding_id: "slot-a"
+      })
+
+    assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, prior)
+    assert {:ok, _receipt} = SymphonyElixir.TerminalFailure.record_resume(workspace, prior, "slot-b", 1)
+    binding = %{binding_id: "slot-b", backend: :antigravity, options: %{profile_root: profile}}
+
+    assert_raise RuntimeError, ~r/backend_terminal_failure/, fn ->
+      SymphonyElixir.AgentRunner.run(
+        issue,
+        self(),
+        workspace_path: workspace,
+        max_turns: 1,
+        binding: binding,
+        attempt: 1,
+        writer_attempt: 1,
+        writer_id: String.duplicate("b", 64),
+        predecessor_event_id: prior.event_id,
+        issue_state_fetcher: fn _ids -> {:ok, [issue]} end
+      )
+    end
+
+    issue_id = issue.id
+
+    assert_receive {:codex_worker_update, ^issue_id, %{event: :session_started, backend_process_pid: native_pid}}
+
+    assert_receive {:codex_worker_update, ^issue_id, %{event: :terminal_failure, terminal_failure: successor}}
+
+    refute process_alive?(Integer.to_string(native_pid))
+    assert successor.predecessor_event_id == prior.event_id
+
+    assert {:settled, %{event_id: successor_event_id}} =
+             SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
+
+    assert successor_event_id == successor.event_id
     File.rm_rf!(root)
   end
 

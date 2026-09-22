@@ -568,8 +568,10 @@ Launch and protocol requirements:
   workflow, issue, workspace, event, binding, attempt, and an explicit predecessor-event lineage
   while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
   ownership MUST be atomically published with its generation token and recoverable. Reclamation
-  MUST fence the observed generation so a competing stale reclaimer cannot remove a replacement
-  owner's lock. Runtime identity is fixed for the VM. A prior runtime
+  MUST fence the observed inode generation so a competing stale reclaimer cannot remove a
+  replacement owner's lock. Startup MUST remove only non-authoritative candidate/reclaim links
+  before lock reconciliation and MUST fail closed on the prior directory-form lock format or any
+  unsupported lock target. Runtime identity is fixed for the VM. A prior runtime
   is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
   namespace reports the PID absent or a strictly parsed positive process-start time mismatch.
   Unsupported, unreadable, malformed, cross-machine, cross-namespace, live, and recent ownerless
@@ -586,6 +588,9 @@ Launch and protocol requirements:
   that the owned process group is empty. A crashed or stalled resumed writer MUST receive that
   native-cleanup acknowledgement before its successor terminal hold is persisted or exposed; an
   unavailable or failed acknowledgement is a service-wide lifecycle fault, not a resumable hold.
+  The orchestrator MUST durably require the acknowledgement before releasing a resumed AntiGravity
+  task's start gate; completed required acknowledgements remain owned until explicitly consumed,
+  without TTL-based semantic expiry.
 - An externally selected launch binding MAY start a new attempt only after the previous task is down
   and its terminal hold owns no live writer. The binding MUST keep the same backend and MAY override
   only backend-reviewed launch options; AntiGravity accepts only a dedicated absolute
@@ -897,8 +902,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
   resume-intent, fault, and lock namespaces under the host lifecycle state root before enabling
   dispatch. Terminal persistence MUST publish a host-indexed pending transaction before immutable
   receipts, then publish the active family and owner-clear the pending family under the same
-  ownership lock. A surviving pending transaction is a lifecycle-storage fault, including the
-  receipt-before-active crash window; historical receipts without a pending or active owner do not
+  ownership lock. Startup MUST enumerate and strictly validate every global pending entry before
+  enabling any dispatch, independent of tracker visibility or issue state. A surviving pending
+  transaction is a lifecycle-storage fault, including the receipt-before-active crash window;
+  historical receipts without a pending or active owner do not
   resurrect a legitimately settled lifecycle. Local/global mirrors are
   one evidence family: a partial family is a storage fault, never settled or authorized evidence.
   A runtime lifecycle-storage fault MUST latch through one service-wide transition immediately at

@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentBackend, AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Antigravity.Transport
+  alias SymphonyElixir.Antigravity.{CleanupRegistry, Transport}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -366,12 +366,9 @@ defmodule SymphonyElixir.Orchestrator do
       is_binary(Map.get(running_entry, :binding_id))
   end
 
-  defp verify_resumed_native_cleanup(running_entry, reason) do
+  defp verify_resumed_native_cleanup(running_entry, _reason) do
     cond do
-      reason == :normal ->
-        :ok
-
-      not resumed_attempt?(running_entry) ->
+      not resume_cleanup_required?(running_entry) ->
         :ok
 
       Map.get(running_entry, :backend) in [:antigravity, "antigravity"] ->
@@ -382,7 +379,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp resume_cleanup_required?(running_entry) do
+    match?(%{status: status} when status in [:pending, :proven], Map.get(running_entry, :resume_handoff))
+  end
+
   defp fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason) do
+    reject_pending_resume_on_cleanup_failure(running_entry)
+
     evidence =
       Map.get(running_entry, :terminal_failure) ||
         get_in(running_entry, [:resume_handoff, :blocked_entry, :terminal_failure])
@@ -417,6 +420,15 @@ defmodule SymphonyElixir.Orchestrator do
     )
     |> latch_lifecycle_storage_fault(failure)
   end
+
+  defp reject_pending_resume_on_cleanup_failure(%{
+         resume_handoff: %{status: :pending, from: from, timer_ref: timer_ref}
+       }) do
+    Process.cancel_timer(timer_ref)
+    GenServer.reply(from, {:error, :terminal_resume_cleanup_unavailable})
+  end
+
+  defp reject_pending_resume_on_cleanup_failure(_running_entry), do: :ok
 
   defp retry_metadata_from_entry(running_entry, overrides) do
     Map.merge(
@@ -1620,8 +1632,12 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     backend_name = binding_backend_name(binding, Config.settings!().agent.backend)
     writer_id = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+    predecessor_event_id = Map.get(binding || %{}, :predecessor_event_id)
+    start_token = if is_binary(predecessor_event_id), do: make_ref(), else: nil
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
+           await_resumed_dispatch_start(start_token)
+
            AgentRunner.run(
              issue,
              recipient,
@@ -1631,11 +1647,12 @@ defmodule SymphonyElixir.Orchestrator do
              worker_host: worker_host,
              backend: backend_name,
              binding: binding,
-             predecessor_event_id: Map.get(binding || %{}, :predecessor_event_id),
+             predecessor_event_id: predecessor_event_id,
              workspace_path: workspace_path
            )
          end) do
       {:ok, pid} ->
+        authorize_resumed_dispatch_start(pid, start_token, backend_name)
         ref = Process.monitor(pid)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
@@ -1694,6 +1711,25 @@ defmodule SymphonyElixir.Orchestrator do
           binding: binding,
           workspace_path: workspace_path
         })
+    end
+  end
+
+  defp authorize_resumed_dispatch_start(_pid, nil, _backend_name), do: :ok
+
+  defp authorize_resumed_dispatch_start(pid, start_token, backend_name) do
+    if backend_name in [:antigravity, "antigravity"] do
+      :ok = CleanupRegistry.require_ack(pid)
+    end
+
+    send(pid, {:start_resumed_dispatch, start_token})
+    :ok
+  end
+
+  defp await_resumed_dispatch_start(nil), do: :ok
+
+  defp await_resumed_dispatch_start(start_token) do
+    receive do
+      {:start_resumed_dispatch, ^start_token} -> :ok
     end
   end
 

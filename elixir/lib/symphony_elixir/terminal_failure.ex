@@ -21,9 +21,12 @@ defmodule SymphonyElixir.TerminalFailure do
                                :pid_namespace_read,
                                :process_read,
                                :file_ls,
+                               :pending_ls,
                                :owner_read,
+                               :lock_lstat,
                                :reclaim_link,
-                               :public_remove
+                               :public_remove,
+                               :transient_remove
                              ])
   end
 
@@ -384,10 +387,36 @@ defmodule SymphonyElixir.TerminalFailure do
 
   @spec storage_ready() :: :ok | {:error, term()}
   def storage_ready do
-    case probe_storage_namespaces(["events", "pending", "active", "resumes", "faults", "locks"]) do
-      :ok -> recover_lock_namespace()
-      {:error, _reason} = error -> error
+    with :ok <- probe_storage_namespaces(["events", "pending", "active", "resumes", "faults", "locks"]),
+         :ok <- verify_no_pending_transactions() do
+      recover_lock_namespace()
     end
+  end
+
+  defp verify_no_pending_transactions do
+    pending_root = Path.join(state_root(), "pending")
+
+    case lock_override(:pending_ls, fn -> File.ls(pending_root) end) do
+      {:ok, entries} -> Enum.reduce_while(entries, :ok, &verify_pending_entry(pending_root, &1, &2))
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:terminal_pending_namespace_unavailable, reason}}
+    end
+  end
+
+  defp verify_pending_entry(pending_root, entry, :ok) do
+    path = Path.join(pending_root, entry)
+
+    result =
+      with true <- String.ends_with?(entry, ".json"),
+           {:ok, contents} <- File.read(path),
+           {:ok, decoded} <- Jason.decode(contents),
+           {:ok, evidence} <- decode_evidence(decoded) do
+        {:error, {:incomplete_terminal_transaction, evidence.event_id}}
+      else
+        _other -> {:error, :invalid_terminal_pending_entry}
+      end
+
+    {:halt, result}
   end
 
   defp probe_storage_namespaces(namespaces) do
@@ -1208,13 +1237,13 @@ defmodule SymphonyElixir.TerminalFailure do
     end
 
     defp valid_lock_override?({key, operation})
-         when key in [:process_read, :owner_read, :public_remove],
+         when key in [:process_read, :owner_read, :lock_lstat, :public_remove, :transient_remove],
          do: is_function(operation, 1)
 
     defp valid_lock_override?({:reclaim_link, operation}), do: is_function(operation, 2)
 
     defp valid_lock_override?({key, result})
-         when key in [:machine_read, :boot_read, :pid_namespace_read, :file_ls],
+         when key in [:machine_read, :boot_read, :pid_namespace_read, :file_ls, :pending_ls],
          do: match?({:ok, _value}, result) or match?({:error, _reason}, result)
 
     defp valid_lock_override?(_entry), do: false
@@ -1255,6 +1284,20 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
 
+    defp lock_lstat(path) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{lock_lstat: operation} when is_function(operation, 1) -> operation.(path)
+        _overrides -> File.lstat(path)
+      end
+    end
+
+    defp remove_transient_lock(path) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{transient_remove: operation} when is_function(operation, 1) -> operation.(path)
+        _overrides -> File.rm(path)
+      end
+    end
+
     defp create_reclaim_link(source, destination) do
       case Process.get(@lock_test_overrides_key, %{}) do
         %{reclaim_link: operation} when is_function(operation, 2) ->
@@ -1282,6 +1325,8 @@ defmodule SymphonyElixir.TerminalFailure do
     defp lock_override(_key, fallback), do: fallback.()
     defp lock_process_read(pid), do: File.read("/proc/#{pid}/stat")
     defp read_lock_file(path), do: File.read(path)
+    defp lock_lstat(path), do: File.lstat(path)
+    defp remove_transient_lock(path), do: File.rm(path)
     defp create_reclaim_link(source, destination), do: File.ln(source, destination)
     defp remove_public_lock(path), do: File.rm(path)
     defp run_terminal_persist_hook(_phase), do: :ok
@@ -1520,7 +1565,8 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp remove_stale_owned_lock(lock_path, %{"token" => token}) do
-    reclaim_path = "#{lock_path}.reclaim-#{token}"
+    claim_id = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+    reclaim_path = "#{lock_path}.reclaim-#{token}-#{claim_id}"
 
     case create_reclaim_link(lock_path, reclaim_path) do
       :ok ->
@@ -1540,7 +1586,8 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp remove_fenced_stale_lock(lock_path, reclaim_path, token) do
-    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
+    with {:ok, %File.Stat{links: 2}} <- File.stat(reclaim_path),
+         {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
          {:ok, %{"token" => ^token}} <- read_lock_owner(reclaim_path),
          :ok <- remove_public_lock(lock_path) do
       :reclaimed
@@ -1555,7 +1602,9 @@ defmodule SymphonyElixir.TerminalFailure do
   defp recover_lock_namespace(lock_root) do
     case lock_override(:file_ls, fn -> File.ls(lock_root) end) do
       {:ok, entries} ->
-        Enum.reduce_while(entries, :ok, &recover_lock_entry(lock_root, &1, &2))
+        entries
+        |> Enum.sort_by(&lock_recovery_order/1)
+        |> Enum.reduce_while(:ok, &recover_lock_entry(lock_root, &1, &2))
 
       {:error, :enoent} ->
         :ok
@@ -1565,18 +1614,55 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  defp lock_recovery_order(entry), do: if(transient_lock_artifact?(entry), do: 0, else: 1)
+
   defp recover_lock_entry(lock_root, entry, :ok) do
     lock_path = Path.join(lock_root, entry)
 
     result =
-      if String.ends_with?(entry, ".lock") and File.regular?(lock_path),
-        do: reclaim_stale_lock(lock_path),
-        else: :reclaimed
+      cond do
+        transient_lock_artifact?(entry) -> recover_transient_lock_artifact(lock_path)
+        String.ends_with?(entry, ".lock") -> recover_published_lock(lock_path)
+        true -> :reclaimed
+      end
 
     case result do
       :reclaimed -> {:cont, :ok}
       :locked -> {:halt, {:error, {:active_marker_locked, lock_path, :eexist}}}
       {:error, reason} -> {:halt, {:error, {:active_marker_locked, lock_path, reason}}}
+    end
+  end
+
+  defp transient_lock_artifact?(entry) do
+    String.contains?(entry, ".lock.candidate-") or String.contains?(entry, ".lock.reclaim-")
+  end
+
+  defp recover_transient_lock_artifact(path) do
+    case lock_lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        normalize_transient_lock_removal(remove_transient_lock(path))
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:invalid_transient_lock_artifact, type}}
+
+      {:error, :enoent} ->
+        :reclaimed
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_transient_lock_removal(result) when result in [:ok, {:error, :enoent}], do: :reclaimed
+  defp normalize_transient_lock_removal({:error, reason}), do: {:error, reason}
+
+  defp recover_published_lock(path) do
+    case lock_lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> reclaim_stale_lock(path)
+      {:ok, %File.Stat{type: :directory}} -> {:error, :unsupported_legacy_lock_directory}
+      {:ok, %File.Stat{type: type}} -> {:error, {:invalid_lock_target, type}}
+      {:error, :enoent} -> :reclaimed
+      {:error, reason} -> {:error, reason}
     end
   end
 

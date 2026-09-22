@@ -137,6 +137,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         Process.put(stop_key, true)
         stop_backend!(backend, session)
+        result = finalize_deferred_terminal_failure(result, issue, codex_update_recipient)
 
         if result == :ok,
           do: settle_success_marker(workspace, issue, codex_update_recipient),
@@ -146,6 +147,51 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp finalize_deferred_terminal_failure(
+         {:error, {:backend_terminal_failure_pending_cleanup, evidence}},
+         issue,
+         recipient
+       ) do
+    case TerminalFailure.persist(evidence.workspace, evidence) do
+      {:ok, _path} ->
+        send_codex_update(recipient, issue, %{
+          event: :terminal_failure,
+          backend: :antigravity,
+          session_id: evidence.session_id,
+          terminal_failure: evidence,
+          terminal_failure_persisted: true,
+          timestamp: DateTime.utc_now()
+        })
+
+        {:error, {:backend_terminal_failure, evidence}}
+
+      {:error, persist_reason} ->
+        storage_failure = %{
+          event_id: evidence.event_id,
+          code: stable_error_code(persist_reason)
+        }
+
+        _ =
+          TerminalFailure.persist_storage_fault(
+            evidence.workspace,
+            evidence,
+            storage_failure.code
+          )
+
+        send_codex_update(recipient, issue, %{
+          event: :terminal_storage_failure,
+          backend: :antigravity,
+          session_id: evidence.session_id,
+          terminal_storage_failure: storage_failure,
+          timestamp: DateTime.utc_now()
+        })
+
+        {:error, {:backend_terminal_storage_failure, evidence.event_id}}
+    end
+  end
+
+  defp finalize_deferred_terminal_failure(result, _issue, _recipient), do: result
 
   defp resolve_workspace(issue, worker_host, opts) do
     case Keyword.get(opts, :workspace_path) do
