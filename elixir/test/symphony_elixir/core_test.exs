@@ -255,6 +255,17 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) == pid
     assert is_pid(Process.whereis(SymphonyElixir.TaskSupervisor))
     assert is_pid(Process.whereis(SymphonyElixir.Orchestrator))
+    cleanup_registry_pid = Process.whereis(SymphonyElixir.Antigravity.CleanupRegistry)
+    assert is_pid(cleanup_registry_pid)
+
+    Process.exit(Process.whereis(SymphonyElixir.Orchestrator), :kill)
+
+    assert eventually_value(fn ->
+             restarted_registry_pid = Process.whereis(SymphonyElixir.Antigravity.CleanupRegistry)
+
+             if is_pid(restarted_registry_pid) and restarted_registry_pid != cleanup_registry_pid,
+               do: restarted_registry_pid
+           end)
 
     GenServer.stop(pid)
   end

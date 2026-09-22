@@ -57,8 +57,9 @@ retry/continuation attempt used by prompts and backoff. It is changed under a st
 lock that exists independently of marker files, is atomically published with a generation token,
 and carries a VM-stable runtime identity plus strict machine, boot, PID-namespace, PID, and
 process-start ownership. Stale reclamation fences the observed inode generation so it cannot delete
-a replacement lock. Startup removes only non-authoritative candidate/reclaim links and rejects the
-prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
+a replacement lock. Reclaim publication and startup namespace recovery share a VM-wide serialization
+boundary, so startup removes only candidate/reclaim links that cannot belong to an in-progress local
+reclaimer, and rejects the prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
 and live, malformed, remote, cross-namespace, or ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
@@ -84,7 +85,11 @@ sealed as a new linked terminal hold instead of entering ordinary retry, but onl
 AntiGravity cleanup guard acknowledges that the old native process group is empty. Missing or failed
 cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor.
 The orchestrator registers that required acknowledgement before releasing the resumed task's start
-gate; required completion remains owned until explicit consumption rather than expiring by timer. The new attempt
+gate, and the transport registers its cleanup guard before opening the native port. Every forced
+resumed-task stop consumes cleanup proof before state settlement, reply, or workspace deletion.
+Cleanup registry, task supervisor, and orchestrator share one-for-all restart ownership; guard death
+is a failed acknowledgement. Required completion remains owned until explicit consumption rather
+than expiring by timer. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
@@ -94,7 +99,9 @@ clear failures are distinct lifecycle-storage blockers: the service schedules no
 immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
 operator repairs storage and restarts. Before event receipts are created, a workflow-scoped pending
 transaction is made durable; active publication owner-clears it under the same ownership lock, while
-a surviving pending transaction makes the receipt-before-active crash window a storage fault.
+a surviving pending transaction makes the receipt-before-active crash window a storage fault. On
+Linux, pending creation, receipt creation, active publication, and pending removal are separated by
+successful filesystem synchronization barriers so host-crash recovery preserves that ordering.
 Startup enumerates and strictly validates every host-indexed pending entry before enabling any
 dispatch, independent of tracker visibility, then probes the actual event, pending, active, resume, fault, and lock
 namespaces and reclaims

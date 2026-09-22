@@ -347,7 +347,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     agy = Path.join(root, "fake-agy")
     File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
-    File.write!(agy, "#!/bin/sh\nexit 42\n")
+    File.write!(agy, "#!/bin/sh\nIFS= read -r _line\nexit 42\n")
     File.chmod!(agy, 0o755)
 
     write_workflow_file!(Workflow.workflow_file_path(),

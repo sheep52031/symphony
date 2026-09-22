@@ -586,11 +586,15 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert :ok = CleanupRegistry.register(completed_owner, self())
     assert :ok = CleanupRegistry.require_ack(completed_owner)
     assert :ok = CleanupRegistry.complete(completed_owner, self(), {:error, :cleanup_failed})
-
-    assert %{^completed_owner => %{required?: true, result: {:error, :cleanup_failed}}} =
-             :sys.get_state(CleanupRegistry)
-
     assert {:error, :cleanup_failed} = CleanupRegistry.await(completed_owner, 10)
+
+    failed_guard_owner = spawn(fn -> Process.sleep(:infinity) end)
+    failed_guard = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(failed_guard_owner, :kill) end)
+    assert :ok = CleanupRegistry.require_ack(failed_guard_owner)
+    assert :ok = CleanupRegistry.register(failed_guard_owner, failed_guard)
+    Process.exit(failed_guard, :kill)
+    assert {:error, :cleanup_guard_failed} = CleanupRegistry.await(failed_guard_owner, 1_000)
 
     reserved_owner = spawn(fn -> Process.sleep(:infinity) end)
     assert :ok = CleanupRegistry.require_ack(reserved_owner)

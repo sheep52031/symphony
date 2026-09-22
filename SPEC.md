@@ -569,9 +569,10 @@ Launch and protocol requirements:
   while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
   ownership MUST be atomically published with its generation token and recoverable. Reclamation
   MUST fence the observed inode generation so a competing stale reclaimer cannot remove a
-  replacement owner's lock. Startup MUST remove only non-authoritative candidate/reclaim links
-  before lock reconciliation and MUST fail closed on the prior directory-form lock format or any
-  unsupported lock target. Runtime identity is fixed for the VM. A prior runtime
+  replacement owner's lock. Reclaim publication and startup lock-namespace recovery MUST share a
+  VM-wide serialization boundary, so startup removes only candidate/reclaim links that cannot belong
+  to an in-progress local reclaimer. Startup MUST fail closed on the prior directory-form lock format
+  or any unsupported lock target. Runtime identity is fixed for the VM. A prior runtime
   is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
   namespace reports the PID absent or a strictly parsed positive process-start time mismatch.
   Unsupported, unreadable, malformed, cross-machine, cross-namespace, live, and recent ownerless
@@ -589,7 +590,11 @@ Launch and protocol requirements:
   native-cleanup acknowledgement before its successor terminal hold is persisted or exposed; an
   unavailable or failed acknowledgement is a service-wide lifecycle fault, not a resumable hold.
   The orchestrator MUST durably require the acknowledgement before releasing a resumed AntiGravity
-  task's start gate; completed required acknowledgements remain owned until explicitly consumed,
+  task's start gate, and the transport MUST register its cleanup guard before opening the native port.
+  Every orchestrator-forced resumed-task termination MUST stop the task and consume cleanup proof
+  before replying, settling lifecycle state, or removing a workspace. Cleanup registry, task
+  supervisor, and orchestrator share one-for-all restart ownership; guard death is an explicit failed
+  acknowledgement. Completed required acknowledgements remain owned until explicitly consumed,
   without TTL-based semantic expiry.
 - An externally selected launch binding MAY start a new attempt only after the previous task is down
   and its terminal hold owns no live writer. The binding MUST keep the same backend and MAY override
@@ -902,7 +907,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
   resume-intent, fault, and lock namespaces under the host lifecycle state root before enabling
   dispatch. Terminal persistence MUST publish a host-indexed pending transaction before immutable
   receipts, then publish the active family and owner-clear the pending family under the same
-  ownership lock. Startup MUST enumerate and strictly validate every global pending entry before
+  ownership lock. On Linux, each pending-create, receipt-create, active-publication, and pending-clear
+  boundary MUST be separated by a successful filesystem synchronization so a later namespace entry
+  cannot survive a host crash after an earlier prerequisite entry was lost. Startup MUST enumerate and strictly validate every global pending entry before
   enabling any dispatch, independent of tracker visibility or issue state. A surviving pending
   transaction is a lifecycle-storage fault, including the receipt-before-active crash window;
   historical receipts without a pending or active owner do not

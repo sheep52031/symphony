@@ -18,16 +18,26 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
 
     orchestrator_name = Keyword.get(opts, :orchestrator_name, SymphonyElixir.Orchestrator)
 
-    children = [
-      Supervisor.child_spec(
-        {Task.Supervisor, name: task_supervisor_name},
-        id: task_supervisor_name
-      ),
-      Supervisor.child_spec(
-        {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
-        id: orchestrator_name
-      )
-    ]
+    cleanup_registry_children =
+      if task_supervisor_name == SymphonyElixir.TaskSupervisor and
+           orchestrator_name == SymphonyElixir.Orchestrator do
+        [SymphonyElixir.Antigravity.CleanupRegistry]
+      else
+        []
+      end
+
+    children =
+      cleanup_registry_children ++
+        [
+          Supervisor.child_spec(
+            {Task.Supervisor, name: task_supervisor_name},
+            id: task_supervisor_name
+          ),
+          Supervisor.child_spec(
+            {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
+            id: orchestrator_name
+          )
+        ]
 
     Supervisor.init(children, strategy: :one_for_all)
   end

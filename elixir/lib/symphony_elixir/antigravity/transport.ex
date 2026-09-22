@@ -115,7 +115,15 @@ defmodule SymphonyElixir.Antigravity.Transport do
          :ok <- trusted_system_executable(@setsid_path, "setsid"),
          :ok <- trusted_system_executable(@bash_path, "bash"),
          :ok <- trusted_system_executable(@kill_path, "kill"),
-         :ok <- trusted_system_executable(@ps_path, "ps") do
+         :ok <- trusted_system_executable(@ps_path, "ps"),
+         {:ok, guard_pid} <-
+           start_cleanup_guard(self(), %{
+             port: nil,
+             backend_process_pid: nil,
+             process_group_id: nil,
+             process_group_path: process_group_path,
+             stderr_path: stderr_path
+           }) do
       command = Enum.map_join([launch.executable | launch.args], " ", &shell_escape/1)
 
       grouped_command =
@@ -137,14 +145,16 @@ defmodule SymphonyElixir.Antigravity.Transport do
           ]
         )
 
-      finalize_started_port(port, launch, stderr_path, process_group_path)
+      send(guard_pid, {:antigravity_port_opened, port, port_os_pid(port)})
+      finalize_started_port(port, launch, stderr_path, process_group_path, guard_pid)
     end
   end
 
-  defp finalize_started_port(port, launch, stderr_path, process_group_path) do
+  defp finalize_started_port(port, launch, stderr_path, process_group_path, guard_pid) do
     process_group_id = read_process_group_id(process_group_path)
 
     if is_nil(process_group_id) do
+      send(guard_pid, :antigravity_launch_failed)
       close_port(port)
       {:error, :antigravity_process_group_setup_failed}
     else
@@ -175,16 +185,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
         launch: launch
       }
 
-      case start_cleanup_guard(owner_pid, base) do
-        {:ok, guard_pid} ->
-          {:ok, %{base | cleanup_guard_pid: guard_pid}}
-
-        {:error, reason} ->
-          close_process(base)
-          remove_runtime_files(base)
-          stop_state(state)
-          {:error, reason}
-      end
+      session = %{base | cleanup_guard_pid: guard_pid}
+      send(guard_pid, {:antigravity_session_ready, session})
+      {:ok, session}
     end
   end
 
@@ -679,20 +682,70 @@ defmodule SymphonyElixir.Antigravity.Transport do
     end
   end
 
-  defp cleanup_guard_loop(owner_pid, session) do
+  defp cleanup_guard_loop(owner_pid, launch_state) do
     owner_ref = Process.monitor(owner_pid)
+    cleanup_guard_receive(owner_pid, owner_ref, launch_state)
+  end
 
+  defp cleanup_guard_receive(owner_pid, owner_ref, launch_state) do
     receive do
+      {:antigravity_port_opened, port, backend_process_pid} ->
+        cleanup_guard_receive(owner_pid, owner_ref, %{
+          launch_state
+          | port: port,
+            backend_process_pid: backend_process_pid
+        })
+
+      {:antigravity_session_ready, session} ->
+        cleanup_guard_receive(owner_pid, owner_ref, session)
+
+      :antigravity_launch_failed ->
+        complete_guard_cleanup(owner_pid, launch_state)
+
       :antigravity_closed ->
         Process.demonitor(owner_ref, [:flush])
         :ok
 
       {:DOWN, ^owner_ref, :process, ^owner_pid, _reason} ->
-        process_result = close_process(session)
-        runtime_result = remove_runtime_files(session)
-        result = merge_cleanup_results(process_result, runtime_result)
-        :ok = CleanupRegistry.complete(owner_pid, self(), result)
+        complete_guard_cleanup(owner_pid, launch_state)
     end
+  end
+
+  defp complete_guard_cleanup(owner_pid, launch_state) do
+    result = cleanup_guard_launch(launch_state)
+    :ok = CleanupRegistry.complete(owner_pid, self(), result)
+  end
+
+  defp cleanup_guard_launch(%{process_group_id: process_group_id} = launch_state)
+       when is_integer(process_group_id) and process_group_id > 0 do
+    process_result = close_process(launch_state)
+    runtime_result = remove_runtime_files(launch_state)
+    merge_cleanup_results(process_result, runtime_result)
+  end
+
+  defp cleanup_guard_launch(launch_state) do
+    case read_process_group_id(launch_state.process_group_path) do
+      process_group_id when is_integer(process_group_id) and process_group_id > 0 ->
+        cleanup_guard_launch(Map.put(launch_state, :process_group_id, process_group_id))
+
+      _missing ->
+        cleanup_guard_from_port_process(launch_state)
+    end
+  end
+
+  defp cleanup_guard_from_port_process(%{backend_process_pid: backend_process_pid} = launch_state)
+       when is_integer(backend_process_pid) and backend_process_pid > 0 do
+    cleanup_guard_launch(Map.put(launch_state, :process_group_id, backend_process_pid))
+  end
+
+  defp cleanup_guard_from_port_process(launch_state) do
+    close_port(launch_state.port)
+    runtime_result = remove_runtime_files(launch_state)
+
+    merge_cleanup_results(
+      {:error, :antigravity_process_group_setup_unverified},
+      runtime_result
+    )
   end
 
   defp release_cleanup_guard(%{cleanup_guard_pid: guard_pid, owner_pid: owner_pid}, result)

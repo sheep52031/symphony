@@ -1125,6 +1125,39 @@ defmodule SymphonyElixir.TerminalFailureTest do
     on_exit(fn -> File.rm_rf!(root) end)
     {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
     kill_lock_holder!(holder)
+    parent = self()
+
+    reclaimer =
+      Task.async(fn ->
+        TerminalFailure.with_lock_overrides_for_test(
+          %{
+            reclaim_link: fn source, destination ->
+              send(parent, :reclaim_link_started)
+
+              receive do
+                :finish_reclaim_link -> File.ln(source, destination)
+              end
+            end
+          },
+          &TerminalFailure.storage_ready/0
+        )
+      end)
+
+    assert_receive :reclaim_link_started, 1_000
+
+    concurrent_startup =
+      Task.async(fn ->
+        send(parent, :concurrent_startup_called)
+        TerminalFailure.storage_ready()
+      end)
+
+    assert_receive :concurrent_startup_called, 1_000
+    assert nil == Task.yield(concurrent_startup, 0)
+    send(reclaimer.pid, :finish_reclaim_link)
+    assert :ok = Task.await(reclaimer, 1_000)
+    assert :ok = Task.await(concurrent_startup, 1_000)
+
+    File.write!(lock_path, Jason.encode!(owner))
 
     assert :ok =
              TerminalFailure.with_lock_overrides_for_test(
@@ -1279,6 +1312,31 @@ defmodule SymphonyElixir.TerminalFailureTest do
                %{pending_ls: {:error, :eacces}},
                &TerminalFailure.storage_ready/0
              )
+
+    assert {:error, :terminal_directory_sync_failed} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{directory_sync: fn _directory -> {"sync failed", 1} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, :terminal_directory_sync_failed} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{directory_sync: fn _directory -> raise "sync crashed" end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    aborted_transaction = %{namespace_transaction: fn _operation -> {:aborted, :forced} end}
+
+    assert {:error, {:terminal_lock_namespace_serialization_failed, :forced}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               aborted_transaction,
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, {:terminal_lock_namespace_serialization_failed, :forced}} =
+             TerminalFailure.with_lock_overrides_for_test(aborted_transaction, fn ->
+               TerminalFailure.clear_active(workspace, issue_id, String.duplicate("a", 64))
+             end)
 
     state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
     unrelated_lock_entry = Path.join(state_root, "locks/operator-note")

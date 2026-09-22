@@ -430,6 +430,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reject_pending_resume_on_cleanup_failure(_running_entry), do: :ok
 
+  defp reject_pending_resume_after_forced_stop(
+         %{
+           resume_handoff: %{status: :pending, from: from, timer_ref: timer_ref}
+         },
+         reason
+       ) do
+    Process.cancel_timer(timer_ref)
+    GenServer.reply(from, {:error, reason})
+  end
+
+  defp reject_pending_resume_after_forced_stop(_running_entry, _reason), do: :ok
+
   defp retry_metadata_from_entry(running_entry, overrides) do
     Map.merge(
       %{
@@ -854,23 +866,48 @@ defmodule SymphonyElixir.Orchestrator do
       nil ->
         release_issue_claim(state, issue_id)
 
-      %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+      %{identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
-        stop_running_task(pid, ref, state.task_supervisor)
 
-        if cleanup_workspace do
-          settle_running_terminal_issue(
-            state,
-            issue_id,
-            running_entry,
-            Map.get(running_entry, :issue, identifier)
-          )
-        else
-          release_terminated_running_issue(state, issue_id, cancellation_reason)
+        case stop_and_verify_running_task(running_entry, state.task_supervisor) do
+          :ok ->
+            complete_forced_termination(
+              state,
+              issue_id,
+              running_entry,
+              identifier,
+              cleanup_workspace,
+              cancellation_reason
+            )
+
+          {:error, cleanup_reason} ->
+            fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
         end
 
       _ ->
         release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp complete_forced_termination(
+         state,
+         issue_id,
+         running_entry,
+         identifier,
+         cleanup_workspace,
+         cancellation_reason
+       ) do
+    reject_pending_resume_after_forced_stop(running_entry, :terminal_resume_cancelled)
+
+    if cleanup_workspace do
+      settle_running_terminal_issue(
+        state,
+        issue_id,
+        running_entry,
+        Map.get(running_entry, :issue, identifier)
+      )
+    else
+      release_terminated_running_issue(state, issue_id, cancellation_reason)
     end
   end
 
@@ -1010,15 +1047,36 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
 
+      pending_resume_handoff?(running_entry) ->
+        Logger.warning(
+          "Pending resumed writer stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; verifying native cleanup before rejecting handoff"
+        )
+
+        cleanup_result = stop_and_verify_running_task(running_entry, state.task_supervisor)
+        state = record_session_completion_totals(state, running_entry)
+
+        case cleanup_result do
+          :ok ->
+            complete_pending_resume_failure(
+              state,
+              issue_id,
+              running_entry,
+              :terminal_resume_writer_not_proven
+            )
+
+          {:error, cleanup_reason} ->
+            fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
+        end
+
       resumed_attempt?(running_entry) ->
         Logger.warning(
           "Resumed writer stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; verifying native cleanup before terminal settlement"
         )
 
-        stop_running_task(running_entry.pid, running_entry.ref, state.task_supervisor)
+        cleanup_result = stop_and_verify_running_task(running_entry, state.task_supervisor)
         state = record_session_completion_totals(state, running_entry)
 
-        case verify_resumed_native_cleanup(running_entry, :worker_stalled) do
+        case cleanup_result do
           :ok ->
             settle_resumed_attempt(
               state,
@@ -1161,14 +1219,25 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
-  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
+  defp stop_and_verify_running_task(running_entry, task_supervisor) do
     stop_running_task(
       Map.get(running_entry, :pid),
       Map.get(running_entry, :ref),
-      state.task_supervisor
+      task_supervisor
     )
 
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    verify_resumed_native_cleanup(running_entry, :forced_termination)
+  end
+
+  defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
+    case stop_and_verify_running_task(running_entry, state.task_supervisor) do
+      :ok ->
+        reject_pending_resume_after_forced_stop(running_entry, :terminal_resume_blocked)
+        block_issue_from_entry(state, issue_id, running_entry, error)
+
+      {:error, cleanup_reason} ->
+        fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
+    end
   end
 
   defp block_issue_from_entry(
@@ -2510,9 +2579,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp fail_pending_resume(state, issue_id, token, reason) do
     case Map.get(state.running, issue_id) do
-      %{resume_handoff: %{status: :pending, token: ^token}, pid: pid, ref: ref} = running_entry ->
-        stop_running_task(pid, ref, state.task_supervisor)
-        complete_pending_resume_failure(state, issue_id, running_entry, reason)
+      %{resume_handoff: %{status: :pending, token: ^token}} = running_entry ->
+        case stop_and_verify_running_task(running_entry, state.task_supervisor) do
+          :ok -> complete_pending_resume_failure(state, issue_id, running_entry, reason)
+          {:error, cleanup_reason} -> fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
+        end
 
       _other ->
         state

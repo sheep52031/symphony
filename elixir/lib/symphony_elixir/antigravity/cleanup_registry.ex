@@ -51,7 +51,7 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
         {:reply, :ok, Map.put(state, owner_pid, new_entry(owner_pid, guard_pid, false))}
 
       %{guard_pid: nil} = entry ->
-        {:reply, :ok, Map.put(state, owner_pid, %{entry | guard_pid: guard_pid})}
+        {:reply, :ok, Map.put(state, owner_pid, attach_guard(entry, guard_pid))}
 
       %{guard_pid: ^guard_pid} ->
         {:reply, :ok, state}
@@ -74,9 +74,10 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   def handle_call({:complete, owner_pid, guard_pid, result}, _from, state) do
     case Map.get(state, owner_pid) do
       %{guard_pid: ^guard_pid, waiters: []} = entry ->
-        complete_without_waiter(owner_pid, result, entry, state)
+        complete_without_waiter(owner_pid, result, detach_guard_monitor(entry), state)
 
       %{guard_pid: ^guard_pid, waiters: waiters} = entry ->
+        entry = detach_guard_monitor(entry)
         Enum.each(waiters, &GenServer.reply(&1, result))
         {:reply, :ok, delete_entry(state, owner_pid, entry)}
 
@@ -99,34 +100,87 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   end
 
   @impl true
-  def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do
-    state =
-      case Map.get(state, owner_pid) do
-        %{monitor_ref: ^monitor_ref, guard_pid: nil, required?: true, waiters: []} = entry ->
-          Map.put(state, owner_pid, %{entry | result: :ok})
+  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+    monitored_entry =
+      Enum.find(state, fn {_owner_pid, entry} ->
+        entry.monitor_ref == monitor_ref or entry.guard_monitor_ref == monitor_ref
+      end)
 
-        %{monitor_ref: ^monitor_ref, guard_pid: nil, required?: true, waiters: waiters} = entry ->
-          Enum.each(waiters, &GenServer.reply(&1, :ok))
-          delete_entry(state, owner_pid, entry)
-
-        %{monitor_ref: ^monitor_ref, guard_pid: nil} = entry ->
-          delete_entry(state, owner_pid, entry)
-
-        _other ->
-          state
-      end
-
-    {:noreply, state}
+    {:noreply, handle_monitored_down(monitored_entry, monitor_ref, state)}
   end
+
+  defp handle_monitored_down(
+         {owner_pid, %{monitor_ref: monitor_ref, guard_pid: nil, required?: true, waiters: []} = entry},
+         monitor_ref,
+         state
+       ) do
+    Map.put(state, owner_pid, %{entry | result: :ok})
+  end
+
+  defp handle_monitored_down(
+         {owner_pid, %{monitor_ref: monitor_ref, guard_pid: nil, required?: true, waiters: waiters} = entry},
+         monitor_ref,
+         state
+       ) do
+    Enum.each(waiters, &GenServer.reply(&1, :ok))
+    delete_entry(state, owner_pid, entry)
+  end
+
+  defp handle_monitored_down(
+         {owner_pid, %{monitor_ref: monitor_ref, guard_pid: nil} = entry},
+         monitor_ref,
+         state
+       ) do
+    delete_entry(state, owner_pid, entry)
+  end
+
+  defp handle_monitored_down(
+         {owner_pid, %{guard_monitor_ref: monitor_ref, required?: true, waiters: []} = entry},
+         monitor_ref,
+         state
+       ) do
+    Map.put(state, owner_pid, %{entry | result: {:error, :cleanup_guard_failed}})
+  end
+
+  defp handle_monitored_down(
+         {owner_pid, %{guard_monitor_ref: monitor_ref, required?: true, waiters: waiters} = entry},
+         monitor_ref,
+         state
+       ) do
+    Enum.each(waiters, &GenServer.reply(&1, {:error, :cleanup_guard_failed}))
+    delete_entry(state, owner_pid, entry)
+  end
+
+  defp handle_monitored_down(
+         {owner_pid, %{guard_monitor_ref: monitor_ref} = entry},
+         monitor_ref,
+         state
+       ) do
+    delete_entry(state, owner_pid, entry)
+  end
+
+  defp handle_monitored_down(_monitored_entry, _monitor_ref, state), do: state
 
   defp new_entry(owner_pid, guard_pid, required?) do
     %{
       guard_pid: guard_pid,
+      guard_monitor_ref: if(is_pid(guard_pid), do: Process.monitor(guard_pid)),
       result: nil,
       waiters: [],
       required?: required?,
       monitor_ref: Process.monitor(owner_pid)
     }
+  end
+
+  defp attach_guard(entry, guard_pid) do
+    %{entry | guard_pid: guard_pid, guard_monitor_ref: Process.monitor(guard_pid)}
+  end
+
+  defp detach_guard_monitor(%{guard_monitor_ref: nil} = entry), do: entry
+
+  defp detach_guard_monitor(entry) do
+    Process.demonitor(entry.guard_monitor_ref, [:flush])
+    %{entry | guard_monitor_ref: nil}
   end
 
   defp complete_without_waiter(owner_pid, result, %{required?: true} = entry, state) do
@@ -139,6 +193,7 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
 
   defp delete_entry(state, owner_pid, entry) do
     Process.demonitor(entry.monitor_ref, [:flush])
+    detach_guard_monitor(entry)
     Map.delete(state, owner_pid)
   end
 end

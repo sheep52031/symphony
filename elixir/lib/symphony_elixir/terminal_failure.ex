@@ -11,6 +11,8 @@ defmodule SymphonyElixir.TerminalFailure do
   @lock_retry_attempts 40
   @lock_retry_delay_ms 5
   @runtime_instance_key {__MODULE__, :runtime_instance}
+  @lock_namespace_mutex {__MODULE__, :lock_namespace_mutex}
+  @sync_path "/usr/bin/sync"
 
   if Mix.env() == :test do
     @lock_test_overrides_key {__MODULE__, :lock_test_overrides}
@@ -26,7 +28,9 @@ defmodule SymphonyElixir.TerminalFailure do
                                :lock_lstat,
                                :reclaim_link,
                                :public_remove,
-                               :transient_remove
+                               :transient_remove,
+                               :directory_sync,
+                               :namespace_transaction
                              ])
   end
 
@@ -157,10 +161,14 @@ defmodule SymphonyElixir.TerminalFailure do
     with :ok <- validate_existing_receipts(receipt_paths, payload),
          :ok <- validate_existing_active_paths(active_paths, payload, evidence),
          {:ok, _pending_path} <- persist_pending(pending_paths, payload),
+         :ok <- sync_parent_directories(pending_paths),
          {:ok, receipt_path} <- persist_immutable_candidates(receipt_paths, payload),
+         :ok <- sync_parent_directories(receipt_paths),
          :ok <- run_terminal_persist_hook(:after_receipts),
          {:ok, _active_path} <- persist_active_candidates_locked(active_paths, payload, evidence),
-         :ok <- clear_pending_paths(pending_paths, evidence.event_id) do
+         :ok <- sync_parent_directories(active_paths),
+         :ok <- clear_pending_paths(pending_paths, evidence.event_id),
+         :ok <- sync_parent_directories(pending_paths) do
       {:ok, receipt_path}
     end
   end
@@ -388,8 +396,9 @@ defmodule SymphonyElixir.TerminalFailure do
   @spec storage_ready() :: :ok | {:error, term()}
   def storage_ready do
     with :ok <- probe_storage_namespaces(["events", "pending", "active", "resumes", "faults", "locks"]),
+         :ok <- sync_parent_directories([Path.join(state_root(), "storage-probe")]),
          :ok <- verify_no_pending_transactions() do
-      recover_lock_namespace()
+      with_lock_namespace_mutex(&recover_lock_namespace/0)
     end
   end
 
@@ -991,6 +1000,37 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
+  defp sync_parent_directories(paths) do
+    if :os.type() == {:unix, :linux}, do: sync_linux_parent_directories(paths), else: :ok
+  rescue
+    _error -> {:error, :terminal_directory_sync_failed}
+  end
+
+  defp sync_linux_parent_directories(paths) do
+    paths
+    |> Enum.map(&Path.dirname/1)
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.uniq()
+    |> directories_by_device()
+    |> Enum.reduce_while(:ok, &sync_linux_directory/2)
+  end
+
+  defp sync_linux_directory(directory, :ok) do
+    case run_directory_sync(directory) do
+      {_output, 0} -> {:cont, :ok}
+      {_output, _status} -> {:halt, {:error, :terminal_directory_sync_failed}}
+    end
+  end
+
+  defp directories_by_device(directories) do
+    directories
+    |> Enum.reduce(%{}, fn directory, devices ->
+      stat = File.stat!(directory)
+      Map.put_new(devices, {stat.major_device, stat.minor_device}, directory)
+    end)
+    |> Map.values()
+  end
+
   defp persist_pending(paths, payload) do
     {local_paths, global_paths} = Enum.split(paths, 2)
     writer = &atomic_create(&1, payload)
@@ -1237,10 +1277,18 @@ defmodule SymphonyElixir.TerminalFailure do
     end
 
     defp valid_lock_override?({key, operation})
-         when key in [:process_read, :owner_read, :lock_lstat, :public_remove, :transient_remove],
+         when key in [
+                :process_read,
+                :owner_read,
+                :lock_lstat,
+                :public_remove,
+                :transient_remove,
+                :directory_sync
+              ],
          do: is_function(operation, 1)
 
     defp valid_lock_override?({:reclaim_link, operation}), do: is_function(operation, 2)
+    defp valid_lock_override?({:namespace_transaction, operation}), do: is_function(operation, 1)
 
     defp valid_lock_override?({key, result})
          when key in [:machine_read, :boot_read, :pid_namespace_read, :file_ls, :pending_ls],
@@ -1315,6 +1363,23 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
 
+    defp run_lock_namespace_transaction(operation) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{namespace_transaction: transaction} when is_function(transaction, 1) ->
+          transaction.(operation)
+
+        _overrides ->
+          :global.trans({@lock_namespace_mutex, self()}, operation, [node()])
+      end
+    end
+
+    defp run_directory_sync(directory) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{directory_sync: operation} when is_function(operation, 1) -> operation.(directory)
+        _overrides -> System.cmd(@sync_path, ["-f", directory], stderr_to_stdout: true)
+      end
+    end
+
     defp run_terminal_persist_hook(phase) do
       case Process.get(@terminal_persist_hook_key) do
         hook when is_function(hook, 1) -> hook.(phase)
@@ -1329,13 +1394,21 @@ defmodule SymphonyElixir.TerminalFailure do
     defp remove_transient_lock(path), do: File.rm(path)
     defp create_reclaim_link(source, destination), do: File.ln(source, destination)
     defp remove_public_lock(path), do: File.rm(path)
+
+    defp run_lock_namespace_transaction(operation),
+      do: :global.trans({@lock_namespace_mutex, self()}, operation, [node()])
+
+    defp run_directory_sync(directory),
+      do: System.cmd(@sync_path, ["-f", directory], stderr_to_stdout: true)
+
     defp run_terminal_persist_hook(_phase), do: :ok
   end
 
   defp with_active_marker_locks(paths, operation) do
     lock_paths = [ownership_lock_path(paths)]
+    acquisition = with_lock_namespace_mutex(fn -> acquire_marker_locks(lock_paths, []) end)
 
-    case acquire_marker_locks(lock_paths, []) do
+    case acquisition do
       {:ok, acquired} ->
         try do
           operation.()
@@ -1346,6 +1419,16 @@ defmodule SymphonyElixir.TerminalFailure do
       {:error, reason, acquired} ->
         release_marker_locks(acquired)
         {:error, reason}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp with_lock_namespace_mutex(operation) do
+    case run_lock_namespace_transaction(operation) do
+      {:aborted, reason} -> {:error, {:terminal_lock_namespace_serialization_failed, reason}}
+      result -> result
     end
   end
 
