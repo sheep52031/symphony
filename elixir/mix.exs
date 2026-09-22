@@ -24,6 +24,7 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Orchestrator.State,
           SymphonyElixir.AgentRunner,
           SymphonyElixir.Antigravity.Backend,
+          SymphonyElixir.Antigravity.CleanupRegistry,
           SymphonyElixir.Antigravity.Launcher,
           SymphonyElixir.Antigravity.Transport,
           SymphonyElixir.Pi.Backend,

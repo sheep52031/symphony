@@ -121,6 +121,106 @@ defmodule SymphonyElixir.TerminalFailureTest do
     File.rm_rf!(Path.dirname(relocated_workspace))
   end
 
+  test "receipt-to-active crashes leave a durable pending transaction that fails closed" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-pending-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: "pending-transaction",
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    assert :simulated_crash =
+             catch_throw(
+               TerminalFailure.with_terminal_persist_hook_for_test(
+                 fn :after_receipts -> throw(:simulated_crash) end,
+                 fn -> TerminalFailure.persist(workspace, evidence) end
+               )
+             )
+
+    receipt = Path.join(workspace, ".symphony/terminal-events/#{evidence.event_id}.json")
+    assert File.regular?(receipt)
+    refute File.exists?(Path.join(workspace, ".symphony/terminal-failure.json"))
+
+    assert {:storage_fault, %{code: :incomplete_terminal_transaction, event_id: event_id}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    assert event_id == evidence.event_id
+
+    assert {:storage_fault, %{code: :incomplete_terminal_transaction}} =
+             TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    assert {:ok, ^receipt} = TerminalFailure.persist(workspace, evidence)
+    assert {:settled, %{event_id: ^event_id}} = TerminalFailure.recovery_state(workspace)
+    assert :ok = TerminalFailure.settle_lifecycle(workspace, evidence.issue_id, event_id)
+    assert :none = TerminalFailure.recovery_state(workspace, evidence.issue_id)
+    assert File.regular?(receipt)
+  end
+
+  test "pending transaction corruption and storage failures remain fail closed" do
+    {root, workspace, issue_id, _lock_path} = lock_fixture!("pending-errors")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    local_pending = Path.join(workspace, ".symphony/terminal-pending.json")
+    File.mkdir_p!(Path.dirname(local_pending))
+    File.write!(local_pending, "not-json")
+    assert {:error, :invalid_terminal_pending_marker} = TerminalFailure.recovery_state(workspace, issue_id)
+
+    File.write!(local_pending, Jason.encode!(evidence))
+
+    assert {:error, {:active_marker_owner_mismatch, ^local_pending}} =
+             TerminalFailure.settle_lifecycle(workspace, issue_id, String.duplicate("a", 64))
+
+    File.rm!(local_pending)
+    File.mkdir!(local_pending)
+
+    assert {:error, {^local_pending, :eisdir}} =
+             TerminalFailure.settle_lifecycle(workspace, issue_id, evidence.event_id)
+
+    File.rmdir!(local_pending)
+    fallback_pending_root = Path.join(root, ".symphony/terminal-holds/pending")
+    File.mkdir_p!(Path.dirname(fallback_pending_root))
+    File.write!(fallback_pending_root, "blocked")
+
+    assert {:error, {_path, :enotdir}} = TerminalFailure.recovery_state(workspace, issue_id)
+    File.rm!(fallback_pending_root)
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    state_pending_root = Path.join(state_root, "pending")
+    File.rm_rf!(state_pending_root)
+    File.write!(state_pending_root, "blocked")
+
+    assert {:error, {:pending_marker_unavailable, _path, :enotdir}} =
+             TerminalFailure.persist(workspace, evidence)
+
+    File.rm!(state_pending_root)
+    File.mkdir_p!(state_pending_root)
+  end
+
   test "partial resume mirrors recover as storage faults instead of authorized handoffs" do
     root =
       Path.join(
@@ -775,12 +875,21 @@ defmodule SymphonyElixir.TerminalFailureTest do
       )
 
     marker_lock = TerminalFailure.active_lock_path_for_test(workspace, context.issue_id)
-    File.mkdir!(marker_lock)
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        TerminalFailure.hold_active_lock_for_test(workspace, context.issue_id, parent)
+      end)
+
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
 
     assert {:error, {:active_marker_locked, ^marker_lock, :eexist}} =
              TerminalFailure.persist(workspace, second)
 
-    File.rmdir!(marker_lock)
+    holder_ref = Process.monitor(holder)
+    send(holder, :release_active_lock)
+    assert_receive {:DOWN, ^holder_ref, :process, ^holder, :normal}, 1_000
 
     stale_writer =
       TerminalFailure.build(
@@ -869,99 +978,69 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert event_id == evidence.event_id
   end
 
-  test "lock recovery fails closed for live or malformed owners and reclaims proven dead runtimes" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-terminal-lock-recovery-#{System.unique_integer([:positive])}"
-      )
-
-    workspace = Path.join(root, "JARVIS-936")
-    File.mkdir_p!(workspace)
+  test "lock recovery requires positive same-host owner proof" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("owner-proof")
     on_exit(fn -> File.rm_rf!(root) end)
-    issue_id = "lock-recovery"
-    lock_path = TerminalFailure.active_lock_path_for_test(workspace, issue_id)
-    owner_path = Path.join(lock_path, "owner.json")
-    parent = self()
 
-    start_holder = fn ->
-      spawn(fn -> TerminalFailure.hold_active_lock_for_test(workspace, issue_id, parent) end)
-    end
-
-    holder = start_holder.()
-    assert_receive {:active_lock_acquired, ^holder}, 1_000
-    owner = owner_path |> File.read!() |> Jason.decode!()
-    ref = Process.monitor(holder)
-    Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
-
-    File.write!(owner_path, Jason.encode!(Map.put(owner, "erlang_pid", "not-base64")))
+    {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
     assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+    kill_lock_holder!(holder)
 
-    File.write!(owner_path, Jason.encode!(Map.put(owner, "erlang_pid", Base.encode64("not-a-term"))))
-    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+    prior_owner = Map.put(owner, "runtime_instance", String.duplicate("d", 64))
+    File.write!(lock_path, Jason.encode!(prior_owner))
 
-    File.write!(owner_path, Jason.encode!(owner))
-    assert :ok = TerminalFailure.storage_ready()
+    unavailable = [
+      %{machine_read: {:error, :eacces}},
+      %{boot_read: {:ok, ""}},
+      %{pid_namespace_read: {:error, :eacces}},
+      %{pid_namespace_read: {:ok, ""}},
+      %{process_read: fn _pid -> {:error, :eacces} end},
+      %{process_read: fn _pid -> {:ok, "malformed"} end},
+      %{process_read: fn _pid -> {:ok, process_stat("x")} end}
+    ]
 
-    holder = start_holder.()
-    assert_receive {:active_lock_acquired, ^holder}, 1_000
-    owner = owner_path |> File.read!() |> Jason.decode!()
-    ref = Process.monitor(holder)
-    Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
-
-    assert owner["probe_status"] == "verified"
-    prior_runtime_owner = Map.put(owner, "runtime_instance", String.duplicate("d", 64))
-    File.write!(owner_path, Jason.encode!(prior_runtime_owner))
-
-    for overrides <- [
-          %{machine_read: {:error, :eacces}},
-          %{machine_read: {:ok, ""}},
-          %{boot_read: {:ok, ""}},
-          %{pid_namespace_read: {:error, :eacces}},
-          %{pid_namespace_read: {:ok, ""}},
-          %{process_read: fn _pid -> {:ok, "malformed"} end},
-          %{
-            process_read: fn _pid ->
-              {:ok, "999 (beam) " <> Enum.join(["S"] ++ List.duplicate("0", 18) ++ ["x"], " ")}
-            end
-          }
-        ] do
+    for overrides <- unavailable do
       assert {:error, {:active_marker_locked, ^lock_path, :eexist}} =
-               TerminalFailure.with_lock_overrides_for_test(
-                 overrides,
-                 &TerminalFailure.storage_ready/0
-               )
+               TerminalFailure.with_lock_overrides_for_test(overrides, &TerminalFailure.storage_ready/0)
     end
-
-    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} =
-             TerminalFailure.with_lock_overrides_for_test(
-               %{process_read: fn _pid -> {:error, :eacces} end},
-               &TerminalFailure.storage_ready/0
-             )
 
     assert :ok =
              TerminalFailure.with_lock_overrides_for_test(
                %{process_read: fn _pid -> {:error, :enoent} end},
                &TerminalFailure.storage_ready/0
              )
+  end
 
-    holder = start_holder.()
-    assert_receive {:active_lock_acquired, ^holder}, 1_000
-    owner = owner_path |> File.read!() |> Jason.decode!()
-    ref = Process.monitor(holder)
-    Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+  test "lock recovery distinguishes PID reuse, namespaces, reboots, and unsupported owners" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("owner-generations")
+    on_exit(fn -> File.rm_rf!(root) end)
 
-    reused_pid_owner = Map.put(owner, "runtime_instance", String.duplicate("e", 64))
-    File.write!(owner_path, Jason.encode!(reused_pid_owner))
+    {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
+    kill_lock_holder!(holder)
+    assert owner["probe_status"] == "verified"
 
-    reused_start_time = owner["os_start_time"] + 1
+    other_namespace =
+      owner
+      |> Map.put("runtime_instance", String.duplicate("a", 64))
+      |> Map.put("pid_namespace_scope", String.duplicate("b", 64))
 
-    reused_stat =
-      "999 (beam) " <>
-        Enum.join(["S"] ++ List.duplicate("0", 18) ++ [Integer.to_string(reused_start_time)], " ")
+    File.write!(lock_path, Jason.encode!(other_namespace))
+    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+
+    rebooted =
+      owner
+      |> Map.put("runtime_instance", String.duplicate("a", 64))
+      |> Map.put("boot_scope", String.duplicate("b", 64))
+
+    File.write!(lock_path, Jason.encode!(rebooted))
+    assert :ok = TerminalFailure.storage_ready()
+
+    {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
+    kill_lock_holder!(holder)
+    File.write!(lock_path, Jason.encode!(Map.put(owner, "runtime_instance", String.duplicate("e", 64))))
+
+    reused_start = owner["os_start_time"] + 1
+    reused_stat = process_stat(reused_start)
 
     assert :ok =
              TerminalFailure.with_lock_overrides_for_test(
@@ -969,87 +1048,26 @@ defmodule SymphonyElixir.TerminalFailureTest do
                &TerminalFailure.storage_ready/0
              )
 
-    holder = start_holder.()
-    assert_receive {:active_lock_acquired, ^holder}, 1_000
-    owner = owner_path |> File.read!() |> Jason.decode!()
-    ref = Process.monitor(holder)
-    Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
-
-    other_namespace_owner =
-      owner
-      |> Map.put("runtime_instance", String.duplicate("a", 64))
-      |> Map.put("pid_namespace_scope", String.duplicate("b", 64))
-
-    File.write!(owner_path, Jason.encode!(other_namespace_owner))
-    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
-
-    rebooted_owner =
-      owner
-      |> Map.put("runtime_instance", String.duplicate("a", 64))
-      |> Map.put("boot_scope", String.duplicate("b", 64))
-
-    File.write!(owner_path, Jason.encode!(rebooted_owner))
-    assert :ok = TerminalFailure.storage_ready()
-
-    File.mkdir!(lock_path)
-
     unavailable_owner =
       owner
       |> Map.put("runtime_instance", String.duplicate("f", 64))
-      |> Map.put("probe_status", "unavailable")
-      |> Map.put("machine_scope", nil)
-      |> Map.put("boot_scope", nil)
-      |> Map.put("pid_namespace_scope", nil)
-      |> Map.put("os_pid", nil)
-      |> Map.put("os_start_time", nil)
+      |> Map.merge(%{
+        "probe_status" => "unavailable",
+        "machine_scope" => nil,
+        "boot_scope" => nil,
+        "pid_namespace_scope" => nil,
+        "os_pid" => nil,
+        "os_start_time" => nil
+      })
 
-    File.write!(owner_path, Jason.encode!(unavailable_owner))
-
-    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} =
-             TerminalFailure.with_lock_overrides_for_test(
-               %{process_read: fn _pid -> {:error, :enoent} end},
-               &TerminalFailure.storage_ready/0
-             )
-
-    File.write!(owner_path, "[]")
-
-    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
-             TerminalFailure.storage_ready()
-
-    File.write!(owner_path, "{}")
-
-    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
-             TerminalFailure.storage_ready()
-
-    File.write!(owner_path, Jason.encode!(Map.put(owner, "probe_status", "invalid")))
-
-    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
-             TerminalFailure.storage_ready()
-
-    File.write!(owner_path, Jason.encode!(Map.put(owner, "token", "short")))
-
-    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
-             TerminalFailure.storage_ready()
-
-    File.rm!(owner_path)
-    old_time = System.os_time(:second) - 5
-    assert :ok = File.touch(lock_path, old_time)
-    assert :ok = TerminalFailure.storage_ready()
-
-    File.mkdir!(lock_path)
-    unexpected = Path.join(lock_path, "unexpected")
-    File.write!(unexpected, "occupied")
-    assert :ok = File.touch(lock_path, old_time)
+    File.write!(lock_path, Jason.encode!(unavailable_owner))
     assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
-    File.rm!(unexpected)
-    File.rmdir!(lock_path)
+  end
 
-    holder = start_holder.()
-    assert_receive {:active_lock_acquired, ^holder}, 1_000
-    ref = Process.monitor(holder)
-    Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+  test "atomic lock claims preserve live generations and reject malformed owners" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("atomic-claim")
+    on_exit(fn -> File.rm_rf!(root) end)
+    {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
 
     evidence =
       TerminalFailure.build(:worker_crashed, %{}, %{
@@ -1062,17 +1080,29 @@ defmodule SymphonyElixir.TerminalFailureTest do
         binding_id: nil
       })
 
-    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
-    assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
+    original_bytes = File.read!(lock_path)
+    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.persist(workspace, evidence)
+    assert File.read!(lock_path) == original_bytes
+    assert Path.wildcard("#{lock_path}.candidate-*") == []
+    assert Process.alive?(holder)
+    kill_lock_holder!(holder)
 
-    File.mkdir!(lock_path)
-    File.write!(owner_path, "not-json")
+    for encoded_pid <- ["not-base64", Base.encode64("not-a-term")] do
+      File.write!(lock_path, Jason.encode!(Map.put(owner, "erlang_pid", encoded_pid)))
+      assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+    end
 
-    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
-             TerminalFailure.persist(workspace, evidence)
+    File.write!(lock_path, Jason.encode!(owner))
+    assert :ok = TerminalFailure.storage_ready()
 
-    File.rm!(owner_path)
-    File.rmdir!(lock_path)
+    for malformed <- ["[]", "{}", Jason.encode!(Map.put(owner, "probe_status", "invalid"))] do
+      File.write!(lock_path, malformed)
+
+      assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
+               TerminalFailure.storage_ready()
+    end
+
+    File.rm!(lock_path)
 
     assert {:ok, _path} =
              TerminalFailure.with_lock_overrides_for_test(
@@ -1081,38 +1111,94 @@ defmodule SymphonyElixir.TerminalFailureTest do
              )
 
     assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
+  end
 
-    assert {:error, {:active_marker_locked, failed_lock_path, :invalid_lock_owner}} =
-             TerminalFailure.with_lock_overrides_for_test(
-               %{
-                 after_lock_directory: fn created_lock_path ->
-                   File.mkdir!(Path.join(created_lock_path, "owner.json"))
-                 end
-               },
-               fn -> TerminalFailure.persist(workspace, evidence) end
-             )
-
-    File.rmdir!(Path.join(failed_lock_path, "owner.json"))
-    File.rmdir!(failed_lock_path)
-
-    File.mkdir!(lock_path)
+  test "lock reclamation fencing handles contention, disappearance, and cleanup races" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("reclaim-fence")
+    on_exit(fn -> File.rm_rf!(root) end)
+    {holder, owner} = start_lock_holder!(workspace, issue_id, lock_path)
+    kill_lock_holder!(holder)
 
     assert :ok =
              TerminalFailure.with_lock_overrides_for_test(
-               %{file_stat: {:error, :enoent}},
+               %{reclaim_link: fn _source, _destination -> {:error, :enoent} end},
                &TerminalFailure.storage_ready/0
              )
 
-    File.rmdir!(lock_path)
-    File.mkdir!(lock_path)
+    for reason <- [:eexist, :eacces] do
+      expected_reason = if reason == :eexist, do: :eexist, else: :eacces
+
+      assert {:error, {:active_marker_locked, ^lock_path, ^expected_reason}} =
+               TerminalFailure.with_lock_overrides_for_test(
+                 %{reclaim_link: fn _source, _destination -> {:error, reason} end},
+                 &TerminalFailure.storage_ready/0
+               )
+    end
+
+    failed_evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
 
     assert {:error, {:active_marker_locked, ^lock_path, :eacces}} =
              TerminalFailure.with_lock_overrides_for_test(
-               %{file_stat: {:error, :eacces}},
+               %{reclaim_link: fn _source, _destination -> {:error, :eacces} end},
+               fn -> TerminalFailure.persist(workspace, failed_evidence) end
+             )
+
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{owner_read: fn _path -> {:error, :enoent} end},
                &TerminalFailure.storage_ready/0
              )
 
-    File.rmdir!(lock_path)
+    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{public_remove: fn _path -> {:error, :eacces} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    assert {:ok, _receipt} = TerminalFailure.persist(workspace, evidence)
+    assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
+
+    {holder, _live_owner} = start_lock_holder!(workspace, issue_id, lock_path)
+    replacement = Map.put(owner, "token", String.duplicate("b", 64))
+    File.write!(lock_path, Jason.encode!(replacement))
+    holder_ref = Process.monitor(holder)
+    send(holder, :release_active_lock)
+    assert_receive {:DOWN, ^holder_ref, :process, ^holder, :normal}, 1_000
+    assert File.regular?(lock_path)
+    File.rm!(lock_path)
+  end
+
+  test "lock namespace recovery fails closed on storage errors" do
+    {root, workspace, issue_id, _lock_path} = lock_fixture!("namespace")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert_raise ArgumentError, fn ->
+      TerminalFailure.with_lock_overrides_for_test(%{unknown: :value}, fn -> :ok end)
+    end
+
+    assert_raise ArgumentError, fn ->
+      TerminalFailure.with_lock_overrides_for_test(%{process_read: :not_a_function}, fn -> :ok end)
+    end
 
     assert :ok =
              TerminalFailure.with_lock_overrides_for_test(
@@ -1131,6 +1217,17 @@ defmodule SymphonyElixir.TerminalFailureTest do
                &TerminalFailure.storage_ready/0
              )
 
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
     state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
     lock_root = Path.join(state_root, "locks")
     File.rm_rf!(lock_root)
@@ -1140,7 +1237,6 @@ defmodule SymphonyElixir.TerminalFailureTest do
              TerminalFailure.persist(workspace, evidence)
 
     assert reason in [:eexist, :enotdir]
-
     File.rm!(lock_root)
     File.mkdir_p!(lock_root)
   end
@@ -1409,5 +1505,37 @@ defmodule SymphonyElixir.TerminalFailureTest do
         workspace: 42
       })
     end
+  end
+
+  defp lock_fixture!(name) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-lock-#{name}-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    issue_id = "lock-#{name}"
+    {root, workspace, issue_id, TerminalFailure.active_lock_path_for_test(workspace, issue_id)}
+  end
+
+  defp start_lock_holder!(workspace, issue_id, lock_path) do
+    parent = self()
+    holder = spawn(fn -> TerminalFailure.hold_active_lock_for_test(workspace, issue_id, parent) end)
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
+    {holder, lock_path |> File.read!() |> Jason.decode!()}
+  end
+
+  defp kill_lock_holder!(holder) do
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+    :ok
+  end
+
+  defp process_stat(start_time) do
+    encoded_start_time = if is_integer(start_time), do: Integer.to_string(start_time), else: start_time
+    "999 (beam) " <> Enum.join(["S"] ++ List.duplicate("0", 18) ++ [encoded_start_time], " ")
   end
 end

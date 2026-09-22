@@ -8,11 +8,13 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentBackend, AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Antigravity.Transport
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @resume_handoff_timeout_ms 10_000
+  @native_cleanup_timeout_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @assistant_text_bytes 65_536
@@ -144,7 +146,11 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state =
+          case verify_resumed_native_cleanup(running_entry, reason) do
+            :ok -> handle_agent_down(reason, state, issue_id, running_entry, session_id)
+            {:error, cleanup_reason} -> fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -358,6 +364,58 @@ defmodule SymphonyElixir.Orchestrator do
     match?(%{status: :proven}, Map.get(running_entry, :resume_handoff)) and
       is_map(Map.get(running_entry, :binding)) and
       is_binary(Map.get(running_entry, :binding_id))
+  end
+
+  defp verify_resumed_native_cleanup(running_entry, reason) do
+    cond do
+      reason == :normal ->
+        :ok
+
+      not resumed_attempt?(running_entry) ->
+        :ok
+
+      Map.get(running_entry, :backend) in [:antigravity, "antigravity"] ->
+        Transport.await_owner_cleanup(Map.fetch!(running_entry, :pid), @native_cleanup_timeout_ms)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason) do
+    evidence =
+      Map.get(running_entry, :terminal_failure) ||
+        get_in(running_entry, [:resume_handoff, :blocked_entry, :terminal_failure])
+
+    failure = %{
+      code: :native_process_cleanup_unverified,
+      event_id: if(is_map(evidence), do: Map.get(evidence, :event_id)),
+      workspace: Map.get(running_entry, :workspace_path)
+    }
+
+    if is_map(evidence) and is_binary(failure.workspace) do
+      _ =
+        SymphonyElixir.TerminalFailure.persist_storage_fault(
+          failure.workspace,
+          evidence,
+          failure.code
+        )
+    end
+
+    Logger.error(
+      "Resumed writer native cleanup could not be verified issue_id=#{issue_id} code=#{stable_terminal_error(cleanup_reason)}; disabling all dispatch until operator restart after cleanup verification"
+    )
+
+    running_entry = Map.put(running_entry, :terminal_storage_failure, failure)
+
+    state
+    |> block_issue_from_entry(
+      issue_id,
+      running_entry,
+      "native process cleanup unverified: #{stable_terminal_error(cleanup_reason)}",
+      :terminal_storage_failure
+    )
+    |> latch_lifecycle_storage_fault(failure)
   end
 
   defp retry_metadata_from_entry(running_entry, overrides) do
@@ -941,17 +999,26 @@ defmodule SymphonyElixir.Orchestrator do
         |> stop_and_block_issue(issue_id, running_entry, error)
 
       resumed_attempt?(running_entry) ->
-        Logger.warning("Resumed writer stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; settling terminal hold without ordinary retry")
-        stop_running_task(running_entry.pid, running_entry.ref, state.task_supervisor)
-
-        state
-        |> record_session_completion_totals(running_entry)
-        |> settle_resumed_attempt(
-          issue_id,
-          running_entry,
-          :worker_stalled,
-          "resumed writer stalled before successful settlement"
+        Logger.warning(
+          "Resumed writer stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; verifying native cleanup before terminal settlement"
         )
+
+        stop_running_task(running_entry.pid, running_entry.ref, state.task_supervisor)
+        state = record_session_completion_totals(state, running_entry)
+
+        case verify_resumed_native_cleanup(running_entry, :worker_stalled) do
+          :ok ->
+            settle_resumed_attempt(
+              state,
+              issue_id,
+              running_entry,
+              :worker_stalled,
+              "resumed writer stalled before successful settlement"
+            )
+
+          {:error, cleanup_reason} ->
+            fail_resumed_native_cleanup(state, issue_id, running_entry, cleanup_reason)
+        end
 
       true ->
         Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")

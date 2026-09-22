@@ -567,7 +567,9 @@ Launch and protocol requirements:
   attempt used by prompts, status, and backoff. Active-marker replacement and removal MUST verify
   workflow, issue, workspace, event, binding, attempt, and an explicit predecessor-event lineage
   while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
-  ownership MUST be durable and recoverable. Runtime identity is fixed for the VM. A prior runtime
+  ownership MUST be atomically published with its generation token and recoverable. Reclamation
+  MUST fence the observed generation so a competing stale reclaimer cannot remove a replacement
+  owner's lock. Runtime identity is fixed for the VM. A prior runtime
   is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
   namespace reports the PID absent or a strictly parsed positive process-start time mismatch.
   Unsupported, unreadable, malformed, cross-machine, cross-namespace, live, and recent ownerless
@@ -581,7 +583,9 @@ Launch and protocol requirements:
   terminal `ERROR` rather than `INTERRUPTED`. Timeout evidence MUST preserve whether native progress
   was observed instead of collapsing all silence and long-running work into one liveness claim.
   Unsolicited native `ERROR` remains a provider failure. Shutdown MUST bound escalation and verify
-  that the owned process group is empty.
+  that the owned process group is empty. A crashed or stalled resumed writer MUST receive that
+  native-cleanup acknowledgement before its successor terminal hold is persisted or exposed; an
+  unavailable or failed acknowledgement is a service-wide lifecycle fault, not a resumable hold.
 - An externally selected launch binding MAY start a new attempt only after the previous task is down
   and its terminal hold owns no live writer. The binding MUST keep the same backend and MAY override
   only backend-reviewed launch options; AntiGravity accepts only a dedicated absolute
@@ -889,8 +893,13 @@ Distinct terminal reasons are important because retry logic and logs differ.
   failure, MUST hold without continuation, and MUST disable further dispatch in that service
   instance. Immutable terminal and resume receipts remain as lifecycle evidence until normal
   workspace cleanup.
-- The service MUST verify the actual immutable-event, active-marker, resume-intent, and fault
-  namespaces under the host lifecycle state root before enabling dispatch. Local/global mirrors are
+- The service MUST verify the actual immutable-event, pending-transaction, active-marker,
+  resume-intent, fault, and lock namespaces under the host lifecycle state root before enabling
+  dispatch. Terminal persistence MUST publish a host-indexed pending transaction before immutable
+  receipts, then publish the active family and owner-clear the pending family under the same
+  ownership lock. A surviving pending transaction is a lifecycle-storage fault, including the
+  receipt-before-active crash window; historical receipts without a pending or active owner do not
+  resurrect a legitimately settled lifecycle. Local/global mirrors are
   one evidence family: a partial family is a storage fault, never settled or authorized evidence.
   A runtime lifecycle-storage fault MUST latch through one service-wide transition immediately at
   the update or cleanup boundary, cancel queued retries, and gate poll, timer, direct-dispatch, and

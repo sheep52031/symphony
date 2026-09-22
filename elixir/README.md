@@ -54,10 +54,11 @@ cannot lose an active hold or collide with another tracker/repository instance. 
 bound to the workflow, issue, workspace, event, binding, unique writer ID, monotonically reserved
 writer attempt, and an explicit predecessor event. Writer identity remains distinct from the public
 retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key
-lock that exists independently of marker files and carries a VM-stable runtime identity plus strict
-machine, boot, PID-namespace, PID, and process-start ownership. Only a proven reboot, absent PID, or
-PID reuse is reclaimed; unavailable probes and live, malformed, remote, cross-namespace, or recent
-ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
+lock that exists independently of marker files, is atomically published with a generation token,
+and carries a VM-stable runtime identity plus strict machine, boot, PID-namespace, PID, and
+process-start ownership. Stale reclamation fences the observed generation so it cannot delete a
+replacement lock. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
+and live, malformed, remote, cross-namespace, or ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
 
@@ -78,7 +79,9 @@ non-secret resume-intent receipt. Resume advances the public retry attempt indep
 receipt and terminal evidence use only the next reserved writer attempt. Only a backend-native
 session-start event from that authorized attempt completes the handoff; task creation, a queued retry, or any other unproven dispatch is
 cancelled and leaves the intent ambiguous. A proven resumed writer that later crashes or stalls is
-sealed as a new linked terminal hold instead of entering ordinary retry. The new attempt
+sealed as a new linked terminal hold instead of entering ordinary retry, but only after the
+AntiGravity cleanup guard acknowledges that the old native process group is empty. Missing or failed
+cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
@@ -86,8 +89,11 @@ terminal marker reconstructs the hold; a marker that already has a resume receip
 fails closed instead of creating a duplicate writer. Terminal-receipt persistence and active-marker
 clear failures are distinct lifecycle-storage blockers: the service schedules no ordinary retry and
 immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
-operator repairs storage and restarts. Startup probes the actual event, active, resume, fault, and
-lock namespaces and reclaims only provably dead owners; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
+operator repairs storage and restarts. Before event receipts are created, a workflow-scoped pending
+transaction is made durable; active publication owner-clears it under the same ownership lock, while
+a surviving pending transaction makes the receipt-before-active crash window a storage fault.
+Startup probes the actual event, pending, active, resume, fault, and lock namespaces and reclaims
+only provably dead owners; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
 reconciliation reread durable lifecycle evidence after the writer stops, then remove the exact
 recorded workspace before ownership-checked settlement of both the active and storage-fault marker
 families. Successful AgentRunner completion uses that same dual-family settlement operation. The JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or

@@ -10,11 +10,21 @@ defmodule SymphonyElixir.TerminalFailure do
   @max_hint_bytes 128
   @lock_retry_attempts 40
   @lock_retry_delay_ms 5
-  @ownerless_lock_grace_seconds 2
   @runtime_instance_key {__MODULE__, :runtime_instance}
 
   if Mix.env() == :test do
     @lock_test_overrides_key {__MODULE__, :lock_test_overrides}
+    @terminal_persist_hook_key {__MODULE__, :terminal_persist_hook}
+    @lock_test_override_keys MapSet.new([
+                               :machine_read,
+                               :boot_read,
+                               :pid_namespace_read,
+                               :process_read,
+                               :file_ls,
+                               :owner_read,
+                               :reclaim_link,
+                               :public_remove
+                             ])
   end
 
   @required_evidence_keys MapSet.new([
@@ -121,23 +131,33 @@ defmodule SymphonyElixir.TerminalFailure do
   @spec persist(Path.t(), evidence()) :: {:ok, Path.t()} | {:error, term()}
   def persist(workspace, %{event_id: event_id} = evidence)
       when is_binary(workspace) and is_binary(event_id) do
-    with {:ok, payload} <- Jason.encode(json_safe(evidence), pretty: true),
-         {:ok, receipt_path} <-
-           persist_immutable_candidates(
-             event_receipt_paths(
-               workspace,
-               evidence.issue_id,
-               event_id,
-               evidence.workflow_scope
-             ),
-             payload
-           ),
-         {:ok, _active_path} <-
-           persist_active_candidates(
-             active_paths(workspace, evidence.issue_id, evidence.workflow_scope),
-             payload,
-             evidence
-           ) do
+    active_paths = active_paths(workspace, evidence.issue_id, evidence.workflow_scope)
+
+    with {:ok, payload} <- Jason.encode(json_safe(evidence), pretty: true) do
+      with_active_marker_locks(active_paths, fn ->
+        persist_lifecycle_transaction(workspace, evidence, payload, active_paths)
+      end)
+    end
+  end
+
+  defp persist_lifecycle_transaction(workspace, evidence, payload, active_paths) do
+    pending_paths = pending_paths(workspace, evidence.issue_id, evidence.workflow_scope)
+
+    receipt_paths =
+      event_receipt_paths(
+        workspace,
+        evidence.issue_id,
+        evidence.event_id,
+        evidence.workflow_scope
+      )
+
+    with :ok <- validate_existing_receipts(receipt_paths, payload),
+         :ok <- validate_existing_active_paths(active_paths, payload, evidence),
+         {:ok, _pending_path} <- persist_pending(pending_paths, payload),
+         {:ok, receipt_path} <- persist_immutable_candidates(receipt_paths, payload),
+         :ok <- run_terminal_persist_hook(:after_receipts),
+         {:ok, _active_path} <- persist_active_candidates_locked(active_paths, payload, evidence),
+         :ok <- clear_pending_paths(pending_paths, evidence.event_id) do
       {:ok, receipt_path}
     end
   end
@@ -169,13 +189,35 @@ defmodule SymphonyElixir.TerminalFailure do
           | {:storage_fault, map()}
           | {:error, term()}
   def recovery_state_for_issue(issue_id) when is_binary(issue_id) do
-    case read_storage_fault([global_storage_fault_path(issue_id)], nil) do
-      :none -> read_active([global_active_path(issue_id)], nil, nil)
-      result -> result
+    case read_pending([global_pending_path(issue_id)], nil) do
+      :none ->
+        case read_storage_fault([global_storage_fault_path(issue_id)], nil) do
+          :none -> read_active([global_active_path(issue_id)], nil, nil)
+          result -> result
+        end
+
+      result ->
+        result
     end
   end
 
   defp read_recovery_state(workspace, issue_id) do
+    case read_pending(pending_paths(workspace, issue_id), workspace) do
+      :none ->
+        read_fault_or_active(workspace, issue_id)
+
+      {:error, {_path, _reason}} = pending_error ->
+        case read_storage_fault(storage_fault_paths(workspace, issue_id), nil) do
+          :none -> pending_error
+          result -> result
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp read_fault_or_active(workspace, issue_id) do
     case read_storage_fault(storage_fault_paths(workspace, issue_id), nil) do
       :none -> read_active(active_paths(workspace, issue_id), workspace, nil)
       result -> result
@@ -250,17 +292,37 @@ defmodule SymphonyElixir.TerminalFailure do
     paths = active_paths(workspace, issue_id, scope)
 
     with_active_marker_locks(paths, fn ->
-      case clear_paths(paths, expected_event_id) do
-        :ok ->
-          clear_fault_paths(
-            storage_fault_paths(workspace, issue_id, scope),
-            expected_event_id
-          )
-
-        {:error, _reason} = error ->
-          error
+      with :ok <- clear_paths(paths, expected_event_id),
+           :ok <- clear_pending_paths(pending_paths(workspace, issue_id, scope), expected_event_id) do
+        clear_fault_paths(
+          storage_fault_paths(workspace, issue_id, scope),
+          expected_event_id
+        )
       end
     end)
+  end
+
+  defp clear_pending_paths(paths, expected_event_id) do
+    {local_paths, global_paths} = Enum.split(paths, 2)
+
+    with :ok <- clear_local_pending_paths(local_paths, expected_event_id) do
+      clear_paths(global_paths, expected_event_id)
+    end
+  end
+
+  defp clear_local_pending_paths(paths, expected_event_id) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      clear_local_pending_path(path, expected_event_id)
+    end)
+  end
+
+  defp clear_local_pending_path(path, expected_event_id) do
+    case read_active_event_id(path) do
+      {:ok, ^expected_event_id} -> remove_active_marker(path)
+      {:ok, _other_event_id} -> {:halt, {:error, {:active_marker_owner_mismatch, path}}}
+      {:error, reason} when reason in [:enoent, :enotdir] -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, {path, reason}}}
+    end
   end
 
   defp clear_paths(paths, expected_event_id) do
@@ -322,7 +384,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
   @spec storage_ready() :: :ok | {:error, term()}
   def storage_ready do
-    case probe_storage_namespaces(["events", "active", "resumes", "faults", "locks"]) do
+    case probe_storage_namespaces(["events", "pending", "active", "resumes", "faults", "locks"]) do
       :ok -> recover_lock_namespace()
       {:error, _reason} = error -> error
     end
@@ -428,6 +490,25 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp valid_reason?(reason, category), do: reason in @reasons and category == category(reason)
   defp valid_backend?(backend), do: is_atom(backend) and not is_nil(backend)
+
+  defp read_pending([], _workspace), do: :none
+
+  defp read_pending([path | rest], workspace) do
+    case File.read(path) do
+      {:ok, contents} -> decode_pending(contents)
+      {:error, :enoent} -> read_pending(rest, workspace)
+      {:error, reason} -> {:error, {path, reason}}
+    end
+  end
+
+  defp decode_pending(contents) do
+    with {:ok, decoded} <- Jason.decode(contents),
+         {:ok, evidence} <- decode_evidence(decoded) do
+      {:storage_fault, storage_fault(evidence, :incomplete_terminal_transaction)}
+    else
+      {:error, _reason} -> {:error, :invalid_terminal_pending_marker}
+    end
+  end
 
   defp read_storage_fault([], nil), do: :none
   defp read_storage_fault([], error), do: {:error, error}
@@ -775,6 +856,21 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  defp pending_paths(workspace, issue_id, scope \\ nil) do
+    scope = scope || lifecycle_scope()
+
+    local_paths = [
+      Path.join(workspace, ".symphony/terminal-pending.json"),
+      Path.join(fallback_root(workspace), "pending/#{workspace_hash(workspace)}.json")
+    ]
+
+    if is_binary(issue_id) and issue_id != "" do
+      local_paths ++ [global_pending_path(issue_id, scope)]
+    else
+      local_paths
+    end
+  end
+
   defp active_paths(workspace, issue_id, scope \\ nil) do
     scope = scope || lifecycle_scope()
 
@@ -834,6 +930,9 @@ defmodule SymphonyElixir.TerminalFailure do
       |> Path.join("terminal-holds")
   end
 
+  defp global_pending_path(issue_id, scope \\ nil),
+    do: Path.join(state_root(), "pending/#{scoped_identity(issue_id, scope)}.json")
+
   defp global_active_path(issue_id, scope \\ nil),
     do: Path.join(state_root(), "active/#{scoped_identity(issue_id, scope)}.json")
 
@@ -863,17 +962,42 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
+  defp persist_pending(paths, payload) do
+    {local_paths, global_paths} = Enum.split(paths, 2)
+    writer = &atomic_create(&1, payload)
+
+    case persist_required(global_paths, writer, :pending_marker_unavailable) do
+      :ok -> persist_candidates(local_paths, writer, :pending_marker_unavailable)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_existing_receipts(paths, payload) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      validate_existing_receipt(path, payload)
+    end)
+  end
+
+  defp validate_existing_receipt(path, payload) do
+    if File.regular?(path) do
+      case existing_receipt_result(path, payload) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    else
+      {:cont, :ok}
+    end
+  end
+
   defp persist_immutable_candidates(paths, payload),
     do: persist_mirrored(paths, &atomic_create(&1, payload), :immutable_receipt_unavailable)
 
-  defp persist_active_candidates(paths, payload, evidence) do
-    with_active_marker_locks(paths, fn ->
-      with :ok <- validate_existing_active_paths(paths, payload, evidence),
-           {:ok, selected_path} <- persist_local_active_paths(paths, payload, evidence),
-           :ok <- persist_global_active_paths(paths, payload, evidence) do
-        {:ok, selected_path}
-      end
-    end)
+  defp persist_active_candidates_locked(paths, payload, evidence) do
+    with :ok <- validate_existing_active_paths(paths, payload, evidence),
+         {:ok, selected_path} <- persist_local_active_paths(paths, payload, evidence),
+         :ok <- persist_global_active_paths(paths, payload, evidence) do
+      {:ok, selected_path}
+    end
   end
 
   defp validate_existing_active_paths(paths, payload, evidence) do
@@ -1061,6 +1185,7 @@ defmodule SymphonyElixir.TerminalFailure do
     @spec with_lock_overrides_for_test(map(), (-> result)) :: result when result: term()
     def with_lock_overrides_for_test(overrides, operation)
         when is_map(overrides) and is_function(operation, 0) do
+      validate_lock_overrides!(overrides)
       previous = Process.get(@lock_test_overrides_key)
       Process.put(@lock_test_overrides_key, Map.merge(previous || %{}, overrides))
 
@@ -1070,6 +1195,40 @@ defmodule SymphonyElixir.TerminalFailure do
         if is_nil(previous),
           do: Process.delete(@lock_test_overrides_key),
           else: Process.put(@lock_test_overrides_key, previous)
+      end
+    end
+
+    defp validate_lock_overrides!(overrides) do
+      keys = Map.keys(overrides) |> MapSet.new()
+
+      unless Enum.all?(overrides, &valid_lock_override?/1) and
+               MapSet.subset?(keys, @lock_test_override_keys) do
+        raise ArgumentError, "invalid terminal lock test override"
+      end
+    end
+
+    defp valid_lock_override?({key, operation})
+         when key in [:process_read, :owner_read, :public_remove],
+         do: is_function(operation, 1)
+
+    defp valid_lock_override?({:reclaim_link, operation}), do: is_function(operation, 2)
+
+    defp valid_lock_override?({key, result})
+         when key in [:machine_read, :boot_read, :pid_namespace_read, :file_ls],
+         do: match?({:ok, _value}, result) or match?({:error, _reason}, result)
+
+    defp valid_lock_override?(_entry), do: false
+
+    @doc false
+    @spec with_terminal_persist_hook_for_test((atom() -> term()), (-> result)) :: result when result: term()
+    def with_terminal_persist_hook_for_test(hook, operation)
+        when is_function(hook, 1) and is_function(operation, 0) do
+      Process.put(@terminal_persist_hook_key, hook)
+
+      try do
+        operation.()
+      after
+        Process.delete(@terminal_persist_hook_key)
       end
     end
   end
@@ -1089,16 +1248,43 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
 
-    defp run_lock_directory_hook(lock_path) do
+    defp read_lock_file(path) do
       case Process.get(@lock_test_overrides_key, %{}) do
-        %{after_lock_directory: hook} when is_function(hook, 1) -> hook.(lock_path)
-        _overrides -> :ok
+        %{owner_read: reader} when is_function(reader, 1) -> reader.(path)
+        _overrides -> File.read(path)
+      end
+    end
+
+    defp create_reclaim_link(source, destination) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{reclaim_link: operation} when is_function(operation, 2) ->
+          operation.(source, destination)
+
+        _overrides ->
+          File.ln(source, destination)
+      end
+    end
+
+    defp remove_public_lock(path) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{public_remove: operation} when is_function(operation, 1) -> operation.(path)
+        _overrides -> File.rm(path)
+      end
+    end
+
+    defp run_terminal_persist_hook(phase) do
+      case Process.get(@terminal_persist_hook_key) do
+        hook when is_function(hook, 1) -> hook.(phase)
+        _other -> :ok
       end
     end
   else
     defp lock_override(_key, fallback), do: fallback.()
     defp lock_process_read(pid), do: File.read("/proc/#{pid}/stat")
-    defp run_lock_directory_hook(_lock_path), do: :ok
+    defp read_lock_file(path), do: File.read(path)
+    defp create_reclaim_link(source, destination), do: File.ln(source, destination)
+    defp remove_public_lock(path), do: File.rm(path)
+    defp run_terminal_persist_hook(_phase), do: :ok
   end
 
   defp with_active_marker_locks(paths, operation) do
@@ -1152,47 +1338,33 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp create_owned_lock(lock_path, token) do
-    case File.mkdir_p(Path.dirname(lock_path)) do
-      :ok -> create_owned_lock_directory(lock_path, token)
-      {:error, reason} -> {:error, {:lock_namespace_unavailable, reason}}
-    end
-  end
+    candidate_path = "#{lock_path}.candidate-#{token}"
 
-  defp create_owned_lock_directory(lock_path, token) do
-    case File.mkdir(lock_path) do
-      :ok ->
-        run_lock_directory_hook(lock_path)
-        persist_lock_owner(lock_path, token)
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp persist_lock_owner(lock_path, token) do
-    with {:ok, payload} <- Jason.encode(lock_owner(token)),
-         :ok <- File.write(lock_owner_path(lock_path), payload, [:exclusive, :sync]) do
+    with :ok <- lock_namespace_ready(lock_path),
+         {:ok, payload} <- Jason.encode(lock_owner(token)),
+         :ok <- File.write(candidate_path, payload, [:exclusive, :sync]),
+         :ok <- File.ln(candidate_path, lock_path) do
+      File.rm(candidate_path)
       :ok
     else
-      {:error, _reason} = error ->
-        cleanup_failed_lock(lock_path)
-        error
+      {:error, reason} = error ->
+        File.rm(candidate_path)
+        if reason == :enotdir, do: {:error, {:lock_namespace_unavailable, reason}}, else: error
     end
   end
 
-  defp cleanup_failed_lock(lock_path) do
-    File.rm(lock_owner_path(lock_path))
-    File.rmdir(lock_path)
-    :ok
+  defp lock_namespace_ready(lock_path) do
+    case File.mkdir_p(Path.dirname(lock_path)) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:lock_namespace_unavailable, reason}}
+    end
   end
 
   defp release_marker_locks(locks), do: Enum.each(locks, &release_owned_lock/1)
 
   defp release_owned_lock({lock_path, token}) do
-    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
-         :ok <- File.rm(lock_owner_path(lock_path)) do
-      File.rmdir(lock_path)
-    else
+    case read_lock_owner(lock_path) do
+      {:ok, %{"token" => ^token}} -> remove_public_lock(lock_path)
       _other -> :ok
     end
   end
@@ -1233,10 +1405,8 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
-  defp lock_owner_path(lock_path), do: Path.join(lock_path, "owner.json")
-
   defp read_lock_owner(lock_path) do
-    with {:ok, contents} <- File.read(lock_owner_path(lock_path)),
+    with {:ok, contents} <- read_lock_file(lock_path),
          {:ok, owner} <- Jason.decode(contents),
          true <- valid_lock_owner?(owner) do
       {:ok, owner}
@@ -1290,7 +1460,7 @@ defmodule SymphonyElixir.TerminalFailure do
           else: :locked
 
       {:error, :owner_missing} ->
-        reclaim_ownerless_lock(lock_path)
+        :reclaimed
 
       {:error, reason} ->
         {:error, reason}
@@ -1350,39 +1520,34 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp remove_stale_owned_lock(lock_path, %{"token" => token}) do
-    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
-         :ok <- File.rm(lock_owner_path(lock_path)),
-         :ok <- File.rmdir(lock_path) do
-      :reclaimed
-    else
-      _other -> :locked
-    end
-  end
+    reclaim_path = "#{lock_path}.reclaim-#{token}"
 
-  defp reclaim_ownerless_lock(lock_path) do
-    stale_before = System.os_time(:second) - @ownerless_lock_grace_seconds
-    stat_result = lock_override(:file_stat, fn -> File.stat(lock_path, time: :posix) end)
-    reclaim_ownerless_lock_from_stat(lock_path, stat_result, stale_before)
-  end
-
-  defp reclaim_ownerless_lock_from_stat(lock_path, stat_result, stale_before) do
-    case stat_result do
-      {:ok, %{mtime: modified_at}} when is_integer(modified_at) and modified_at <= stale_before ->
-        normalize_ownerless_rmdir(File.rmdir(lock_path))
-
-      {:ok, _stat} ->
-        :locked
+    case create_reclaim_link(lock_path, reclaim_path) do
+      :ok ->
+        result = remove_fenced_stale_lock(lock_path, reclaim_path, token)
+        File.rm(reclaim_path)
+        result
 
       {:error, :enoent} ->
         :reclaimed
+
+      {:error, :eexist} ->
+        :locked
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp normalize_ownerless_rmdir(result) when result in [:ok, {:error, :enoent}], do: :reclaimed
-  defp normalize_ownerless_rmdir({:error, _reason}), do: :locked
+  defp remove_fenced_stale_lock(lock_path, reclaim_path, token) do
+    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
+         {:ok, %{"token" => ^token}} <- read_lock_owner(reclaim_path),
+         :ok <- remove_public_lock(lock_path) do
+      :reclaimed
+    else
+      _other -> :locked
+    end
+  end
 
   defp recover_lock_namespace,
     do: recover_lock_namespace(Path.join(state_root(), "locks"))
@@ -1404,7 +1569,7 @@ defmodule SymphonyElixir.TerminalFailure do
     lock_path = Path.join(lock_root, entry)
 
     result =
-      if String.ends_with?(entry, ".lock") and File.dir?(lock_path),
+      if String.ends_with?(entry, ".lock") and File.regular?(lock_path),
         do: reclaim_stale_lock(lock_path),
         else: :reclaimed
 
@@ -1519,7 +1684,6 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp candidate_result(:ok, path, _error_tag), do: {:halt, {:ok, path}}
-  defp candidate_result({:error, :receipt_conflict} = error, _path, _error_tag), do: {:halt, error}
 
   defp candidate_result({:error, reason} = error, path, error_tag) do
     if fail_closed_active_error?(reason),
@@ -1528,7 +1692,7 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp fail_closed_active_error?(reason) do
-    reason == :active_marker_owner_mismatch or
+    reason in [:receipt_conflict, :active_marker_owner_mismatch] or
       match?({:active_marker_invalid, _reason}, reason) or
       match?({:active_marker_replace_failed, _reason}, reason)
   end

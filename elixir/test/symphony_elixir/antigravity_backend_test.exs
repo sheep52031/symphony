@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.{AgentBackend, Config.Schema}
-  alias SymphonyElixir.Antigravity.{Backend, Launcher}
+  alias SymphonyElixir.Antigravity.{Backend, CleanupRegistry, Launcher, Transport}
 
   setup do
     case System.get_env("HOME") do
@@ -560,6 +560,54 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     child_pid = workspace |> Path.join("child.pid") |> File.read!() |> String.trim()
     assert process_alive?(child_pid)
     assert :ok = Backend.stop_session(session)
+    refute process_alive?(child_pid)
+    File.rm_rf!(root)
+  end
+
+  test "cleanup acknowledgement registry fails closed and preserves completed results" do
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    other_guard = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      Process.exit(owner, :kill)
+      Process.exit(other_guard, :kill)
+    end)
+
+    assert :ok = CleanupRegistry.register(owner, self())
+    assert :ok = CleanupRegistry.register(owner, self())
+    assert {:error, :cleanup_owner_already_registered} = CleanupRegistry.register(owner, other_guard)
+    assert {:error, :cleanup_ack_timeout} = CleanupRegistry.await(owner, 10)
+    assert :ok = CleanupRegistry.complete(owner, self(), :ok)
+    assert {:error, :cleanup_not_registered} = CleanupRegistry.await(owner, 10)
+
+    completed_owner = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(completed_owner, :kill) end)
+    assert :ok = CleanupRegistry.register(completed_owner, self())
+    assert :ok = CleanupRegistry.complete(completed_owner, self(), {:error, :cleanup_failed})
+    assert {:error, :cleanup_failed} = CleanupRegistry.await(completed_owner, 10)
+  end
+
+  test "owner death acknowledges native process-group cleanup before resume can proceed" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    parent = self()
+    issue = %{id: "issue-owner-death", identifier: "JARVIS-907", title: "Owner cleanup"}
+
+    owner =
+      spawn(fn ->
+        {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+        {:ok, _turn} = Backend.run_turn(session, "descendant", issue, [])
+        child_pid = workspace |> Path.join("child.pid") |> File.read!() |> String.trim()
+        send(parent, {:native_owner_ready, self(), child_pid})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:native_owner_ready, ^owner, child_pid}, 2_000
+    assert process_alive?(child_pid)
+    owner_ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    assert :ok = Transport.await_owner_cleanup(owner, 2_000)
     refute process_alive?(child_pid)
     File.rm_rf!(root)
   end

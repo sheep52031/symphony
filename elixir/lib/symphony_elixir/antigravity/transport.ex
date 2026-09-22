@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Antigravity.Transport do
   @moduledoc false
 
-  alias SymphonyElixir.Antigravity.Launcher
+  alias SymphonyElixir.Antigravity.{CleanupRegistry, Launcher}
 
   @line_bytes 1_048_576
   @max_identity_bytes 256
@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
           process_group_id: non_neg_integer(),
           os_pid: non_neg_integer() | nil,
           cleanup_guard_pid: pid() | nil,
+          owner_pid: pid(),
           launch: Launcher.launch()
         }
 
@@ -81,10 +82,16 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @spec close(session()) :: :ok | {:error, term()}
   def close(session) do
     process_result = close_process(session)
-    release_cleanup_guard(session)
     runtime_result = remove_runtime_files(session)
+    result = merge_cleanup_results(process_result, runtime_result)
+    release_cleanup_guard(session, result)
     stop_state(session.state)
-    merge_cleanup_results(process_result, runtime_result)
+    result
+  end
+
+  @spec await_owner_cleanup(pid(), timeout()) :: :ok | {:error, term()}
+  def await_owner_cleanup(owner_pid, timeout_ms) when is_pid(owner_pid) do
+    CleanupRegistry.await(owner_pid, timeout_ms)
   end
 
   @spec stderr(session()) :: {:ok, String.t()} | {:error, term()}
@@ -153,6 +160,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
           }
         end)
 
+      owner_pid = self()
+
       base = %{
         port: port,
         state: state,
@@ -162,10 +171,20 @@ defmodule SymphonyElixir.Antigravity.Transport do
         process_group_id: process_group_id,
         os_pid: port_os_pid(port),
         cleanup_guard_pid: nil,
+        owner_pid: owner_pid,
         launch: launch
       }
 
-      {:ok, %{base | cleanup_guard_pid: start_cleanup_guard(self(), base)}}
+      case start_cleanup_guard(owner_pid, base) do
+        {:ok, guard_pid} ->
+          {:ok, %{base | cleanup_guard_pid: guard_pid}}
+
+        {:error, reason} ->
+          close_process(base)
+          remove_runtime_files(base)
+          stop_state(state)
+          {:error, reason}
+      end
     end
   end
 
@@ -642,27 +661,48 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp start_cleanup_guard(owner_pid, session) do
-    spawn(fn ->
-      owner_ref = Process.monitor(owner_pid)
+    guard_pid =
+      spawn(fn ->
+        receive do
+          {:monitor_owner, ^owner_pid} -> cleanup_guard_loop(owner_pid, session)
+        end
+      end)
 
-      receive do
-        :antigravity_closed ->
-          Process.demonitor(owner_ref, [:flush])
-          :ok
+    case CleanupRegistry.register(owner_pid, guard_pid) do
+      :ok ->
+        send(guard_pid, {:monitor_owner, owner_pid})
+        {:ok, guard_pid}
 
-        {:DOWN, ^owner_ref, :process, ^owner_pid, _reason} ->
-          close_process(session)
-          remove_runtime_files(session)
-      end
-    end)
+      {:error, reason} ->
+        Process.exit(guard_pid, :kill)
+        {:error, reason}
+    end
   end
 
-  defp release_cleanup_guard(%{cleanup_guard_pid: guard_pid}) when is_pid(guard_pid) do
+  defp cleanup_guard_loop(owner_pid, session) do
+    owner_ref = Process.monitor(owner_pid)
+
+    receive do
+      :antigravity_closed ->
+        Process.demonitor(owner_ref, [:flush])
+        :ok
+
+      {:DOWN, ^owner_ref, :process, ^owner_pid, _reason} ->
+        process_result = close_process(session)
+        runtime_result = remove_runtime_files(session)
+        result = merge_cleanup_results(process_result, runtime_result)
+        :ok = CleanupRegistry.complete(owner_pid, self(), result)
+    end
+  end
+
+  defp release_cleanup_guard(%{cleanup_guard_pid: guard_pid, owner_pid: owner_pid}, result)
+       when is_pid(guard_pid) and is_pid(owner_pid) do
+    :ok = CleanupRegistry.complete(owner_pid, guard_pid, result)
     send(guard_pid, :antigravity_closed)
     :ok
   end
 
-  defp release_cleanup_guard(_session), do: :ok
+  defp release_cleanup_guard(_session, _result), do: :ok
 
   defp close_process(session) do
     close_port(session.port)

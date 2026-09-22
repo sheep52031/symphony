@@ -221,6 +221,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       )
 
     assert settled_snapshot.retrying == []
+    refute os_process_alive?(resumed_writer_pid)
     GenServer.stop(pid, :normal)
     recovery_name = Module.concat(__MODULE__, :TerminalRecoveryOrchestrator)
     {:ok, recovery_pid} = Orchestrator.start_link(name: recovery_name)
