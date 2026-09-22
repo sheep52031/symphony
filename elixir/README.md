@@ -50,7 +50,9 @@ fields—never raw provider prose, account identifiers, tokens, OAuth payloads, 
 persists an immutable receipt plus a fail-closed active marker, with a workspace-root fallback and
 a workflow-scoped lifecycle index beside the configured log directory so workspace-root reloads
 cannot lose an active hold or collide with another tracker/repository instance. Active ownership is
-bound to the terminal event; stale events cannot overwrite or clear a newer hold. Codex remains the default and rollback path;
+bound to the workflow, issue, workspace, event, binding, attempt, and resume lineage and is changed
+under an exclusive marker lock; stale or concurrent events cannot overwrite or clear a newer hold.
+Codex remains the default and rollback path;
 Pi remains supported.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
@@ -66,17 +68,21 @@ the orchestrator moves the issue to a `terminal_failure` hold, and no ordinary r
 A policy owner may call the narrow `Orchestrator.resume_terminal_attempt/3` seam with an opaque,
 validated launch binding. The backend must remain unchanged; for AntiGravity the only binding option
 is a dedicated absolute `profile_root`. Before any writer starts, Symphony durably records a
-non-secret resume-intent receipt. Only creation of a running task completes the handoff; a queued
-retry or any other unproven dispatch is cancelled and leaves the intent ambiguous. The new attempt
+non-secret resume-intent receipt. Only a backend-native session-start event from that authorized
+attempt completes the handoff; task creation, a queued retry, or any other unproven dispatch is
+cancelled and leaves the intent ambiguous. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
 terminal marker reconstructs the hold; a marker that already has a resume receipt is ambiguous and
 fails closed instead of creating a duplicate writer. Terminal-receipt persistence and active-marker
 clear failures are distinct lifecycle-storage blockers: the service schedules no ordinary retry and
-disables all further dispatch until an operator repairs storage and restarts. Startup probes the
-host lifecycle state root, and terminal cleanup removes the exact recorded workspace before
-ownership-checked marker removal.
+immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
+operator repairs storage and restarts. Startup probes the actual event, active, resume, and fault
+namespaces; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
+reconciliation remove the exact recorded workspace before ownership-checked marker removal. The
+JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or
+provider secrets.
 
 ## How to use it
 

@@ -271,6 +271,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "strict recorded cleanup rejects a workspace owned by another issue" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-recorded-workspace-owner-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-OTHER")
+    File.mkdir_p!(workspace)
+
+    try do
+      issue = %{id: "issue-936", identifier: "JARVIS-936"}
+
+      assert {:error, {:recorded_workspace_issue_mismatch, ^workspace, "JARVIS-936"}, ""} =
+               Workspace.remove_recorded_for_issue(workspace, issue, nil)
+
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(

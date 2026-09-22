@@ -95,6 +95,179 @@ defmodule SymphonyElixir.TerminalFailureTest do
     File.rm_rf!(Path.dirname(relocated_workspace))
   end
 
+  test "partial resume mirrors recover as storage faults instead of authorized handoffs" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-partial-resume-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    evidence =
+      TerminalFailure.build(:provider_quota_exhausted, %{}, %{
+        backend: :antigravity,
+        issue_id: "partial-resume",
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: "prior-session",
+        workspace: workspace,
+        binding_id: "slot-a"
+      })
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
+    issue_hash = :crypto.hash(:sha256, evidence.issue_id) |> Base.encode16(case: :lower)
+
+    global_resume =
+      Path.join(
+        Application.fetch_env!(:symphony_elixir, :terminal_state_root),
+        "resumes/#{evidence.workflow_scope}-#{issue_hash}-#{evidence.event_id}.json"
+      )
+
+    File.mkdir_p!(global_resume)
+
+    assert {:error, {:immutable_receipt_unavailable, ^global_resume, :invalid_receipt_target}} =
+             TerminalFailure.record_resume(workspace, evidence, "slot-b", 1)
+
+    assert {:storage_fault, %{code: :incomplete_resume_mirror}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    local_resume = Path.join(workspace, ".symphony/terminal-resumes/#{evidence.event_id}.json")
+    bytes = File.read!(local_resume)
+    File.rm_rf!(global_resume)
+    File.write!(global_resume, bytes)
+    File.rm!(local_resume)
+
+    assert {:storage_fault, %{code: :incomplete_resume_mirror}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    File.write!(local_resume, bytes)
+
+    assert {:ambiguous, %{event_id: event_id}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    assert event_id == evidence.event_id
+  end
+
+  test "storage faults and partial terminal mirrors fail closed and clear by owner" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-storage-faults-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    evidence =
+      TerminalFailure.build(:provider_quota_exhausted, %{}, %{
+        backend: :antigravity,
+        issue_id: "storage-fault-owner",
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: "storage-session",
+        workspace: workspace,
+        binding_id: "slot-a"
+      })
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    issue_hash = :crypto.hash(:sha256, evidence.issue_id) |> Base.encode16(case: :lower)
+    scoped_identity = "#{evidence.workflow_scope}-#{issue_hash}"
+    global_fault = Path.join(state_root, "faults/#{scoped_identity}.json")
+    local_fault = Path.join(workspace, ".symphony/terminal-storage-fault.json")
+
+    assert {:ok, _path} =
+             TerminalFailure.persist_storage_fault(workspace, evidence, :active_marker_unavailable)
+
+    assert {:storage_fault, %{event_id: event_id}} =
+             TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    assert event_id == evidence.event_id
+
+    assert {:error, {:storage_fault_owner_mismatch, ^local_fault}} =
+             TerminalFailure.clear_storage_fault(workspace, evidence.issue_id, String.duplicate("0", 64))
+
+    assert :ok = TerminalFailure.clear_active(workspace, evidence.issue_id)
+    assert :none = TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    assert {:ok, _path} =
+             TerminalFailure.persist_storage_fault(workspace, evidence, :active_marker_unavailable)
+
+    fault_parent = Path.dirname(local_fault)
+    File.chmod!(fault_parent, 0o500)
+
+    assert {:error, {^local_fault, :eacces}} =
+             TerminalFailure.clear_storage_fault(workspace, evidence.issue_id, evidence.event_id)
+
+    File.chmod!(fault_parent, 0o700)
+    assert :ok = TerminalFailure.clear_storage_fault(workspace, evidence.issue_id, evidence.event_id)
+
+    File.mkdir_p!(global_fault)
+
+    assert {:error, {^global_fault, :eisdir}} =
+             TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    File.rm_rf!(global_fault)
+    File.mkdir_p!(local_fault)
+
+    assert {:error, {^local_fault, :eisdir}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    assert {:error, {^local_fault, :eisdir}} =
+             TerminalFailure.clear_storage_fault(workspace, evidence.issue_id, evidence.event_id)
+
+    File.rm_rf!(local_fault)
+    File.write!(local_fault, "{}")
+
+    assert {:error, {^local_fault, :invalid_terminal_storage_fault}} =
+             TerminalFailure.clear_storage_fault(workspace, evidence.issue_id, evidence.event_id)
+
+    File.rm!(local_fault)
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
+    global_event = Path.join(state_root, "events/#{scoped_identity}-#{evidence.event_id}.json")
+    global_active = Path.join(state_root, "active/#{scoped_identity}.json")
+    event_bytes = File.read!(global_event)
+    active_bytes = File.read!(global_active)
+
+    File.rm!(global_event)
+
+    assert {:storage_fault, %{code: :incomplete_terminal_mirror}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    File.write!(global_event, event_bytes)
+    File.rm!(global_active)
+
+    assert {:storage_fault, %{code: :incomplete_terminal_mirror}} =
+             TerminalFailure.recovery_state(workspace, evidence.issue_id)
+
+    File.write!(global_active, active_bytes)
+    local_active = Path.join(workspace, ".symphony/terminal-failure.json")
+
+    fallback_active =
+      Path.join(
+        root,
+        ".symphony/terminal-holds/active/#{:crypto.hash(:sha256, Path.expand(workspace)) |> Base.encode16(case: :lower)}.json"
+      )
+
+    File.rm(local_active)
+    File.rm(fallback_active)
+
+    assert {:storage_fault, %{code: :incomplete_terminal_mirror}} =
+             TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    File.write!(local_active, active_bytes)
+
+    assert {:settled, %{event_id: event_id}} =
+             TerminalFailure.recovery_state_for_issue(evidence.issue_id)
+
+    assert event_id == evidence.event_id
+    assert :ok = TerminalFailure.clear_active(workspace, evidence.issue_id, evidence.event_id)
+  end
+
   test "provider-neutral receipts decode known backends and liveness states" do
     root =
       Path.join(
@@ -269,7 +442,7 @@ defmodule SymphonyElixir.TerminalFailureTest do
     metadata_dir = Path.join(clear_workspace, ".symphony")
     File.chmod!(metadata_dir, 0o500)
 
-    assert {:error, {_path, :eacces}} =
+    assert {:error, {:active_marker_locked, _lock_path, :eacces}} =
              TerminalFailure.clear_active(
                clear_workspace,
                clear_evidence.issue_id,
@@ -301,7 +474,10 @@ defmodule SymphonyElixir.TerminalFailureTest do
     end)
 
     Application.put_env(:symphony_elixir, :terminal_state_root, blocked_root)
-    assert {:error, {:terminal_state_root_unavailable, reason}} = TerminalFailure.storage_ready()
+
+    assert {:error, {:terminal_state_namespace_unavailable, "events", reason}} =
+             TerminalFailure.storage_ready()
+
     assert reason in [:eexist, :enotdir]
   end
 
@@ -510,7 +686,7 @@ defmodule SymphonyElixir.TerminalFailureTest do
         %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
       )
 
-    assert {:error, {:active_marker_replace_failed, :eacces}} =
+    assert {:error, {:active_marker_locked, _lock_path, :eacces}} =
              TerminalFailure.persist(workspace, second)
 
     File.chmod!(metadata_dir, 0o700)
@@ -549,7 +725,158 @@ defmodule SymphonyElixir.TerminalFailureTest do
         %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
       )
 
+    marker_lock = Path.join(workspace, ".symphony/terminal-failure.json.lock")
+    File.mkdir!(marker_lock)
+
+    assert {:error, {:active_marker_locked, ^marker_lock, :eexist}} =
+             TerminalFailure.persist(workspace, second)
+
+    File.rmdir!(marker_lock)
+
+    stale_writer =
+      TerminalFailure.build(
+        :provider_network_unreachable,
+        %{},
+        %{context | attempt: 1, session_id: "stale-session", binding_id: "slot-c"}
+      )
+
+    assert {:error, :active_marker_owner_mismatch} =
+             TerminalFailure.persist(workspace, stale_writer)
+
+    wrong_attempt =
+      TerminalFailure.build(
+        :provider_network_unreachable,
+        %{},
+        %{context | attempt: 2, session_id: "wrong-attempt", binding_id: "slot-b"}
+      )
+
+    assert {:error, :active_marker_owner_mismatch} =
+             TerminalFailure.persist(workspace, wrong_attempt)
+
     assert {:ok, _path} = TerminalFailure.persist(workspace, second)
+    assert {:settled, %{event_id: event_id}} = TerminalFailure.recovery_state(workspace, context.issue_id)
+    assert event_id == second.event_id
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)
+  end
+
+  test "active marker IO failures fail closed during clear, validation, and transfer" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-active-io-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "active-io",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, first)
+    active_marker = Path.join(workspace, ".symphony/terminal-failure.json")
+    active_parent = Path.dirname(active_marker)
+    File.chmod!(active_parent, 0o500)
+
+    assert {:error, {^active_marker, :eacces}} =
+             TerminalFailure.remove_active_marker_for_test(active_marker)
+
+    File.chmod!(active_parent, 0o700)
+    removable = Path.join(root, "removable-active.json")
+    File.write!(removable, "marker")
+    assert :ok = TerminalFailure.remove_active_marker_for_test(removable)
+    refute File.exists?(removable)
+    assert {:ok, _path} = TerminalFailure.record_resume(workspace, first, "slot-b", 1)
+    File.chmod!(active_marker, 0o000)
+
+    second =
+      TerminalFailure.build(
+        :provider_auth_failed,
+        %{},
+        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+      )
+
+    assert {:error, {:active_marker_invalid, :eacces}} =
+             TerminalFailure.active_transfer_allowed_for_test(active_marker, "different", second)
+
+    File.chmod!(active_marker, 0o600)
+    File.chmod!(active_parent, 0o500)
+    successor_payload = Jason.encode!(second, pretty: true)
+
+    assert {:error, {:active_marker_replace_failed, :enoent}} =
+             TerminalFailure.persist_active_paths_for_test(
+               [Path.join(root, "missing-active.json")],
+               successor_payload
+             )
+
+    assert {:error, {:active_marker_replace_failed, :eacces}} =
+             TerminalFailure.persist_active_paths_for_test([active_marker], successor_payload)
+
+    File.chmod!(active_parent, 0o700)
+
+    for reason <- [
+          :active_marker_owner_mismatch,
+          {:active_marker_invalid, :eacces},
+          {:active_marker_replace_failed, :eacces}
+        ] do
+      assert {:error, ^reason} = TerminalFailure.classify_candidate_error_for_test(reason)
+    end
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace, second)
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)
+  end
+
+  test "fallback marker ownership is transferred in place after storage recovers" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-fallback-transfer-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    preferred_marker = Path.join(workspace, ".symphony/terminal-failure.json")
+    File.mkdir_p!(preferred_marker)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "fallback-transfer",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _receipt_path} = TerminalFailure.persist(workspace, first)
+    workspace_hash = :crypto.hash(:sha256, Path.expand(workspace)) |> Base.encode16(case: :lower)
+
+    fallback_marker =
+      Path.join(root, ".symphony/terminal-holds/active/#{workspace_hash}.json")
+
+    assert File.regular?(fallback_marker)
+    assert {:ok, _path} = TerminalFailure.record_resume(workspace, first, "slot-b", 1)
+    File.rm_rf!(preferred_marker)
+
+    second =
+      TerminalFailure.build(
+        :provider_auth_failed,
+        %{},
+        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+      )
+
+    assert {:ok, _receipt_path} = TerminalFailure.persist(workspace, second)
+    assert Jason.decode!(File.read!(fallback_marker))["event_id"] == second.event_id
+    refute File.exists?(preferred_marker)
     assert {:settled, %{event_id: event_id}} = TerminalFailure.recovery_state(workspace, context.issue_id)
     assert event_id == second.event_id
     assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)

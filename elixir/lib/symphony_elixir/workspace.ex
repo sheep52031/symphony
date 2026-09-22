@@ -184,6 +184,24 @@ defmodule SymphonyElixir.Workspace do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
   end
 
+  @doc false
+  @spec remove_recorded_for_issue(Path.t(), map() | String.t(), worker_host()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded_for_issue(workspace, issue_or_identifier, nil) when is_binary(workspace) do
+    expected_key = workspace_key(issue_or_identifier)
+
+    if Path.basename(workspace) == expected_key do
+      remove_recorded(workspace, nil)
+    else
+      {:error, {:recorded_workspace_issue_mismatch, workspace, expected_key}, ""}
+    end
+  end
+
+  def remove_recorded_for_issue(workspace, _issue_or_identifier, worker_host)
+      when is_binary(worker_host) do
+    {:error, {:recorded_workspace_remote_cleanup_unsupported, workspace, worker_host}, ""}
+  end
+
   defp remove_local_workspace(workspace) do
     maybe_run_before_remove_hook(workspace, nil)
     File.rm_rf(workspace)
@@ -243,6 +261,52 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  @doc false
+  @spec remove_issue_workspaces_strict(term()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_strict(issue_or_identifier),
+    do: remove_issue_workspaces_strict(issue_or_identifier, nil)
+
+  @spec remove_issue_workspaces_strict(term(), worker_host()) :: :ok | {:error, term()}
+  def remove_issue_workspaces_strict(issue_or_identifier, worker_host)
+      when is_binary(worker_host) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), worker_host),
+         {:ok, _removed} <- remove(workspace, worker_host) do
+      :ok
+    else
+      {:error, reason, output} -> {:error, {:workspace_remove_failed, reason, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def remove_issue_workspaces_strict(issue_or_identifier, nil) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        remove_local_issue_workspace_strict(issue_or_identifier)
+
+      worker_hosts ->
+        remove_remote_issue_workspaces_strict(issue_or_identifier, worker_hosts)
+    end
+  end
+
+  defp remove_remote_issue_workspaces_strict(issue_or_identifier, worker_hosts) do
+    Enum.reduce_while(worker_hosts, :ok, fn worker_host, :ok ->
+      case remove_issue_workspaces_strict(issue_or_identifier, worker_host) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp remove_local_issue_workspace_strict(issue_or_identifier) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue_or_identifier), nil),
+         {:ok, _removed} <- remove(workspace, nil) do
+      :ok
+    else
+      {:error, reason, output} -> {:error, {:workspace_remove_failed, reason, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}

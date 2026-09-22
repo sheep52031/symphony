@@ -560,10 +560,11 @@ Launch and protocol requirements:
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
   active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
   include a stable workflow scope as well as issue identity so unrelated repositories and tracker
-  instances cannot collide. Active-marker replacement and removal MUST verify event ownership; a
-  resumed event may transfer ownership to its next terminal event, but unrelated or stale owners
-  MUST fail closed. Collisions MUST accept byte-identical receipts or fail closed without rewriting
-  history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
+  instances cannot collide. Active-marker replacement and removal MUST verify workflow, issue,
+  workspace, event, binding, attempt, and resume-lineage ownership while holding an exclusive
+  marker lock; a resumed event may transfer ownership to exactly its authorized next terminal
+  event, but unrelated, stale, or concurrent owners MUST fail closed. Collisions MUST accept
+  byte-identical receipts or fail closed without rewriting history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
   liveness fields MAY accompany the normalized reason. Raw messages, provider account identifiers,
   email addresses, tokens, OAuth payloads, usernames, and profile paths MUST NOT be retained.
 - Locally initiated timeout/cancellation is authoritative even if the observed native build reports
@@ -577,9 +578,10 @@ Launch and protocol requirements:
   `profile_root`. A create-once resume-intent receipt MUST be durable before dispatch. The new
   attempt MUST open the exact recorded issue workspace even if configuration reload changed the
   workspace root, preserve its existing bytes/branch, and MUST NOT rerun `after_create`. A failed
-  intent write MUST launch no writer; after an intent is written, only a proven running task is a
-  successful handoff. A queued retry or any other unproven dispatch MUST be cancelled, marked
-  ambiguous, and require explicit recovery. Symphony validates and executes the binding but MUST NOT select an account,
+  intent write MUST launch no writer; after an intent is written, only backend-native session proof
+  from the authorized attempt is a successful handoff. Creating an orchestration task, queueing a
+  retry, or any other unproven dispatch MUST be cancelled, marked ambiguous, and require explicit
+  recovery. Symphony validates and executes the binding but MUST NOT select an account,
   provider, model, pool order, cooldown, or failover policy.
 
 #### 5.3.8 `codex` (object)
@@ -874,11 +876,16 @@ Distinct terminal reasons are important because retry logic and logs differ.
   failure, MUST hold without continuation, and MUST disable further dispatch in that service
   instance. Immutable terminal and resume receipts remain as lifecycle evidence until normal
   workspace cleanup.
-- The service MUST verify the host lifecycle state root is writable before enabling dispatch. A
-  runtime lifecycle-storage fault remains latched until an operator repairs storage and restarts.
-- Startup terminal cleanup removes each recorded stale workspace for an issue already in a terminal
-  state before clearing that issue's ownership-checked active markers. Cleanup or marker settlement
-  failure MUST stop startup rather than permit dispatch.
+- The service MUST verify the actual immutable-event, active-marker, resume-intent, and fault
+  namespaces under the host lifecycle state root before enabling dispatch. Local/global mirrors are
+  one evidence family: a partial family is a storage fault, never settled or authorized evidence.
+  A runtime lifecycle-storage fault MUST latch immediately at the update boundary, cancel queued
+  retries, and gate poll, timer, direct-dispatch, and resume paths until an operator repairs storage
+  and restarts.
+- Startup terminal cleanup and running-issue reconciliation remove each exact recorded workspace
+  for an issue already in a terminal state before clearing that issue's ownership-checked active
+  markers. Cleanup or marker settlement failure MUST stop startup or latch dispatch rather than
+  silently release ownership.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

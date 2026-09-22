@@ -40,8 +40,10 @@ defmodule SymphonyElixir.AgentBackend do
               {:ok, turn_result()} | {:error, term()}
   @callback stop_session(session()) :: :ok
   @callback validate_binding(map(), SymphonyElixir.Config.Schema.t()) :: :ok | {:error, term()}
+  @callback preflight_binding(map(), Path.t(), SymphonyElixir.Config.Schema.t()) ::
+              :ok | {:error, term()}
 
-  @optional_callbacks validate_binding: 2
+  @optional_callbacks validate_binding: 2, preflight_binding: 3
 
   @spec supported_names() :: [String.t()]
   def supported_names, do: @backends |> Map.keys() |> Enum.sort()
@@ -81,6 +83,24 @@ defmodule SymphonyElixir.AgentBackend do
 
   def validate_launch_binding(_expected_backend, _binding, _settings),
     do: {:error, :invalid_launch_binding}
+
+  @spec preflight_launch_binding(
+          String.t() | atom(),
+          term(),
+          Path.t(),
+          SymphonyElixir.Config.Schema.t()
+        ) :: {:ok, launch_binding()} | {:error, term()}
+  def preflight_launch_binding(expected_backend, binding, workspace, settings)
+      when is_binary(workspace) do
+    with {:ok, normalized} <- validate_launch_binding(expected_backend, binding, settings),
+         {:ok, _backend_id, module} <- resolve(expected_backend),
+         :ok <- preflight_backend_binding(module, normalized.options, workspace, settings) do
+      {:ok, normalized}
+    end
+  end
+
+  def preflight_launch_binding(_expected_backend, _binding, _workspace, _settings),
+    do: {:error, :invalid_launch_binding_workspace}
 
   @spec validate_update(term()) :: :ok | {:error, contract_error()}
   def validate_update(%{event: event, timestamp: %DateTime{}})
@@ -140,6 +160,14 @@ defmodule SymphonyElixir.AgentBackend do
       module.validate_binding(options, settings)
     else
       if options == %{}, do: :ok, else: {:error, :launch_binding_options_unsupported}
+    end
+  end
+
+  defp preflight_backend_binding(module, options, workspace, settings) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :preflight_binding, 3) do
+      module.preflight_binding(options, workspace, settings)
+    else
+      :ok
     end
   end
 end

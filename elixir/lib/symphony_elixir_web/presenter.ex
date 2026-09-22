@@ -29,6 +29,7 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
+        |> maybe_put_lifecycle_health(Map.get(snapshot, :lifecycle_storage_fault))
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
@@ -175,7 +176,42 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
+    |> maybe_put_lifecycle_fields(entry)
   end
+
+  defp maybe_put_lifecycle_health(payload, nil), do: payload
+
+  defp maybe_put_lifecycle_health(payload, failure) when is_map(failure) do
+    Map.put(payload, :lifecycle_health, %{
+      status: :storage_fault,
+      code: Map.get(failure, :code),
+      event_id: Map.get(failure, :event_id)
+    })
+  end
+
+  defp maybe_put_lifecycle_fields(payload, entry) do
+    if Map.get(entry, :terminal_failure) || Map.get(entry, :terminal_storage_failure) ||
+         Map.get(entry, :recovery_state) do
+      Map.merge(payload, %{
+        recovery_state: Map.get(entry, :recovery_state),
+        binding_id: Map.get(entry, :binding_id),
+        terminal_failure: terminal_failure_payload(Map.get(entry, :terminal_failure)),
+        terminal_storage_failure: terminal_storage_failure_payload(Map.get(entry, :terminal_storage_failure))
+      })
+    else
+      payload
+    end
+  end
+
+  defp terminal_failure_payload(%{reason: reason, event_id: event_id}),
+    do: %{reason: reason, event_id: event_id}
+
+  defp terminal_failure_payload(_failure), do: nil
+
+  defp terminal_storage_failure_payload(%{} = failure),
+    do: Map.take(failure, [:code, :event_id])
+
+  defp terminal_storage_failure_payload(_failure), do: nil
 
   defp running_issue_payload(running) do
     %{
@@ -207,7 +243,13 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp held_entry?(%{disposition: disposition})
-       when disposition in [:normal_completion_hold, :attempt_limit_hold],
+       when disposition in [
+              :normal_completion_hold,
+              :attempt_limit_hold,
+              :terminal_failure,
+              :terminal_failure_recovery,
+              :terminal_storage_failure
+            ],
        do: true
 
   defp held_entry?(_entry), do: false
@@ -226,6 +268,7 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(Map.get(blocked, :last_codex_message)),
       last_event_at: iso8601(Map.get(blocked, :last_codex_timestamp))
     }
+    |> maybe_put_lifecycle_fields(blocked)
   end
 
   defp workspace_path(issue_identifier, running, retry, blocked) do

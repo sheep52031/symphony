@@ -155,28 +155,41 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp settle_success_marker(workspace, issue, recipient) do
+    recovery =
+      if is_binary(issue.id),
+        do: TerminalFailure.recovery_state(workspace, issue.id),
+        else: TerminalFailure.recovery_state(workspace)
+
     case TerminalFailure.clear_active(workspace, issue.id) do
       :ok ->
         :ok
 
       {:error, reason} ->
-        send_marker_storage_failure(recipient, issue, workspace, reason)
+        send_marker_storage_failure(recipient, issue, workspace, recovery, reason)
         {:error, {:terminal_marker_clear_failed, stable_error_code(reason)}}
     end
   end
 
-  defp send_marker_storage_failure(recipient, issue, workspace, reason) do
-    event_id =
-      case TerminalFailure.recovery_state(workspace, issue.id) do
-        {disposition, evidence} when disposition in [:settled, :ambiguous] -> evidence.event_id
+  defp send_marker_storage_failure(recipient, issue, workspace, recovery, reason) do
+    evidence =
+      case recovery do
+        {disposition, recovered} when disposition in [:settled, :ambiguous] -> recovered
         _other -> nil
       end
+
+    if evidence do
+      TerminalFailure.persist_storage_fault(
+        workspace,
+        evidence,
+        stable_error_code(reason)
+      )
+    end
 
     send_codex_update(recipient, issue, %{
       event: :terminal_storage_failure,
       terminal_storage_failure: %{
         code: stable_error_code(reason),
-        event_id: event_id
+        event_id: if(evidence, do: evidence.event_id)
       },
       timestamp: DateTime.utc_now()
     })

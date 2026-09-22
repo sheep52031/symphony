@@ -110,6 +110,16 @@ defmodule SymphonyElixir.AgentBackendContractTest do
              )
   end
 
+  test "launch binding preflight rejects a non-path workspace" do
+    assert {:error, :invalid_launch_binding_workspace} =
+             AgentBackend.preflight_launch_binding(
+               :antigravity,
+               %{backend: :antigravity},
+               :not_a_path,
+               %{}
+             )
+  end
+
   test "parses provider-neutral and Pi lifecycle deadlines" do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: 321)
     assert Config.agent_stall_timeout_ms() == 321

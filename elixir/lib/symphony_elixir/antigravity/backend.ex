@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
   @behaviour SymphonyElixir.AgentBackend
 
   require Logger
-  alias SymphonyElixir.{Antigravity.Transport, Config, TerminalFailure}
+  alias SymphonyElixir.{Antigravity.Launcher, Antigravity.Transport, Config, TerminalFailure}
 
   @impl true
   def validate_config(%{worker: %{ssh_hosts: hosts}, antigravity: antigravity}) when is_list(hosts) do
@@ -40,6 +40,25 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
       true ->
         :ok
+    end
+  end
+
+  @impl true
+  @spec preflight_binding(map(), Path.t(), SymphonyElixir.Config.Schema.t()) ::
+          :ok | {:error, term()}
+  def preflight_binding(options, workspace, settings)
+      when is_map(options) and is_binary(workspace) do
+    profile_root = Map.get(options, :profile_root) || Map.get(options, "profile_root")
+
+    case Launcher.build(
+           workspace,
+           settings.antigravity.executable,
+           profile_root,
+           settings.antigravity.turn_timeout_ms,
+           []
+         ) do
+      {:ok, _launch} -> :ok
+      {:error, _reason} = error -> error
     end
   end
 
@@ -262,7 +281,17 @@ defmodule SymphonyElixir.Antigravity.Backend do
           code: stable_storage_error(persist_reason)
         }
 
-        Logger.error("Terminal evidence storage unavailable event_id=#{evidence.event_id} reason=#{storage_failure.code}; stopping lifecycle dispatch fail-closed")
+        fault_persisted =
+          case TerminalFailure.persist_storage_fault(
+                 session.workspace,
+                 evidence,
+                 storage_failure.code
+               ) do
+            {:ok, _path} -> true
+            {:error, _reason} -> false
+          end
+
+        Logger.error("Terminal evidence storage unavailable event_id=#{evidence.event_id} reason=#{storage_failure.code} fault_persisted=#{fault_persisted}; stopping lifecycle dispatch fail-closed")
 
         on_message.(
           session

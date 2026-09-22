@@ -645,6 +645,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
                     }}
 
     refute_receive {:agy_message, %{event: :terminal_failure}}
+
+    assert {:storage_fault, %{event_id: ^event_id}} =
+             SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
+
     assert :ok = Backend.stop_session(session)
   end
 

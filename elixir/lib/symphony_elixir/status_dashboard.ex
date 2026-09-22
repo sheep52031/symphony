@@ -349,30 +349,39 @@ defmodule SymphonyElixir.StatusDashboard do
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
 
+        lifecycle_rows =
+          case Map.get(snapshot, :lifecycle_storage_fault) do
+            nil -> []
+            fault -> [format_lifecycle_health(fault)]
+          end
+
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
            colorize("│ Agents: ", @ansi_bold) <>
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
              colorize("#{max_agents}", @ansi_gray),
-           colorize("│ Holds: ", @ansi_bold) <> colorize("#{held_count}", @ansi_magenta),
-           colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
-           colorize("│ Runtime: ", @ansi_bold) <>
-             colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
-           colorize("│ Tokens: ", @ansi_bold) <>
-             colorize("in #{format_count(codex_input_tokens)}", @ansi_yellow) <>
-             colorize(" | ", @ansi_gray) <>
-             colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
-             colorize(" | ", @ansi_gray) <>
-             colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
-           colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
-           project_link_lines,
-           project_refresh_line,
-           colorize("├─ Running", @ansi_bold),
-           "│",
-           running_table_header_row(running_event_width),
-           running_table_separator_row(running_event_width)
+           colorize("│ Holds: ", @ansi_bold) <> colorize("#{held_count}", @ansi_magenta)
          ] ++
+           lifecycle_rows ++
+           [
+             colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
+             colorize("│ Runtime: ", @ansi_bold) <>
+               colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
+             colorize("│ Tokens: ", @ansi_bold) <>
+               colorize("in #{format_count(codex_input_tokens)}", @ansi_yellow) <>
+               colorize(" | ", @ansi_gray) <>
+               colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
+               colorize(" | ", @ansi_gray) <>
+               colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
+             colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+             project_link_lines,
+             project_refresh_line,
+             colorize("├─ Running", @ansi_bold),
+             "│",
+             running_table_header_row(running_event_width),
+             running_table_separator_row(running_event_width)
+           ] ++
            running_rows ++
            running_to_backoff_spacer ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
@@ -567,7 +576,8 @@ defmodule SymphonyElixir.StatusDashboard do
              blocked: Map.get(snapshot, :blocked, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
+             polling: Map.get(snapshot, :polling),
+             lifecycle_storage_fault: Map.get(snapshot, :lifecycle_storage_fault)
            }}
 
         _ ->
@@ -580,12 +590,27 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp held_count(blocked) when is_list(blocked) do
     Enum.count(blocked, fn
-      %{disposition: disposition} when disposition in [:normal_completion_hold, :attempt_limit_hold] -> true
-      _ -> false
+      %{disposition: disposition}
+      when disposition in [
+             :normal_completion_hold,
+             :attempt_limit_hold,
+             :terminal_failure,
+             :terminal_failure_recovery,
+             :terminal_storage_failure
+           ] ->
+        true
+
+      _other ->
+        false
     end)
   end
 
   defp held_count(_blocked), do: 0
+
+  defp format_lifecycle_health(%{code: code}) do
+    colorize("│ Lifecycle Storage: ", @ansi_bold) <>
+      colorize("blocked (#{code})", @ansi_red)
+  end
 
   defp format_running_rows(running, running_event_width) do
     if running == [] do
