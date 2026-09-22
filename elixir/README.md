@@ -47,13 +47,16 @@ classifies one provider-neutral reason (`provider_quota_exhausted`, `provider_au
 `provider_network_unreachable`, `permission_denied`, `worker_crashed`, `worker_stalled`,
 `provider_protocol_error`, or `unknown_terminal_failure`) and retains only reviewed structured
 fields—never raw provider prose, account identifiers, tokens, OAuth payloads, or profile paths. It
-persists an immutable receipt plus a fail-closed active marker, with a workspace-root fallback and
+persists an immutable receipt whose strict schema and full accepted payload are integrity-hashed,
+plus a fail-closed active marker, with a workspace-root fallback and
 a workflow-scoped lifecycle index beside the configured log directory so workspace-root reloads
 cannot lose an active hold or collide with another tracker/repository instance. Active ownership is
 bound to the workflow, issue, workspace, event, binding, unique writer ID, monotonically reserved
 writer attempt, and an explicit predecessor event. Writer identity remains distinct from the public
-retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key lock that exists independently
-of marker files; stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
+retry/continuation attempt used by prompts and backoff. It is changed under a stable ownership-key
+lock that exists independently of marker files and carries recoverable runtime, process, and machine
+ownership. Dead owners are reclaimed safely; live, malformed, remote, or recent ownerless locks fail
+closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
 
@@ -70,8 +73,9 @@ the orchestrator moves the issue to a `terminal_failure` hold, and no ordinary r
 A policy owner may call the narrow `Orchestrator.resume_terminal_attempt/3` seam with an opaque,
 validated launch binding. The backend must remain unchanged; for AntiGravity the only binding option
 is a dedicated absolute `profile_root`. Before any writer starts, Symphony durably records a
-non-secret resume-intent receipt. Only a backend-native session-start event from that authorized
-attempt completes the handoff; task creation, a queued retry, or any other unproven dispatch is
+non-secret resume-intent receipt. Resume advances the public retry attempt independently while the
+receipt and terminal evidence use only the next reserved writer attempt. Only a backend-native
+session-start event from that authorized attempt completes the handoff; task creation, a queued retry, or any other unproven dispatch is
 cancelled and leaves the intent ambiguous. A proven resumed writer that later crashes or stalls is
 sealed as a new linked terminal hold instead of entering ordinary retry. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
@@ -81,8 +85,8 @@ terminal marker reconstructs the hold; a marker that already has a resume receip
 fails closed instead of creating a duplicate writer. Terminal-receipt persistence and active-marker
 clear failures are distinct lifecycle-storage blockers: the service schedules no ordinary retry and
 immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
-operator repairs storage and restarts. Startup probes the actual event, active, resume, and fault
-namespaces; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
+operator repairs storage and restarts. Startup probes the actual event, active, resume, fault, and
+lock namespaces and reclaims only provably dead owners; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
 reconciliation reread durable lifecycle evidence after the writer stops, then remove the exact
 recorded workspace before ownership-checked settlement of both the active and storage-fault marker
 families. Successful AgentRunner completion uses that same dual-family settlement operation. The JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or

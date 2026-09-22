@@ -423,6 +423,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       assert evidence.issue_id == issue.id
       assert evidence.issue_identifier == issue.identifier
       assert evidence.attempt == 2
+      assert evidence.public_attempt == 7
       assert evidence.writer_id == String.duplicate("c", 64)
       assert evidence.session_id == "agy-session"
       assert Map.get(evidence, :provider_code) == provider_code

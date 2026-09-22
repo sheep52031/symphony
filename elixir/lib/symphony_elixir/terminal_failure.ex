@@ -8,6 +8,33 @@ defmodule SymphonyElixir.TerminalFailure do
   """
 
   @max_hint_bytes 128
+  @lock_retry_attempts 40
+  @lock_retry_delay_ms 5
+  @ownerless_lock_grace_seconds 2
+  @required_evidence_keys MapSet.new([
+                            "event_id",
+                            "integrity_hash",
+                            "workflow_scope",
+                            "reason",
+                            "category",
+                            "backend",
+                            "issue_id",
+                            "issue_identifier",
+                            "attempt",
+                            "session_id",
+                            "workspace",
+                            "binding_id",
+                            "predecessor_event_id",
+                            "occurred_at"
+                          ])
+  @optional_evidence_keys MapSet.new([
+                            "writer_id",
+                            "public_attempt",
+                            "provider_code",
+                            "http_status",
+                            "reset_hint",
+                            "liveness"
+                          ])
   @reasons [
     :provider_quota_exhausted,
     :provider_auth_failed,
@@ -31,6 +58,7 @@ defmodule SymphonyElixir.TerminalFailure do
 
   @type evidence :: %{
           required(:event_id) => String.t(),
+          required(:integrity_hash) => String.t(),
           required(:workflow_scope) => String.t(),
           required(:reason) => reason(),
           required(:category) => String.t(),
@@ -39,6 +67,7 @@ defmodule SymphonyElixir.TerminalFailure do
           required(:issue_identifier) => String.t() | nil,
           required(:attempt) => non_neg_integer() | nil,
           optional(:writer_id) => String.t(),
+          optional(:public_attempt) => non_neg_integer(),
           required(:session_id) => String.t() | nil,
           required(:workspace) => Path.t(),
           required(:binding_id) => String.t() | nil,
@@ -73,12 +102,14 @@ defmodule SymphonyElixir.TerminalFailure do
     evidence =
       evidence
       |> maybe_put(:writer_id, normalize_writer_id(Map.get(context, :writer_id)))
+      |> maybe_put(:public_attempt, normalize_attempt(Map.get(context, :public_attempt)))
       |> maybe_put(:provider_code, normalize_provider_code(Map.get(details, :provider_code)))
       |> maybe_put(:http_status, normalize_http_status(Map.get(details, :http_status)))
       |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(details, :reset_hint)))
       |> maybe_put(:liveness, normalize_liveness(Map.get(details, :liveness)))
 
-    Map.put(evidence, :event_id, event_id(evidence))
+    evidence = Map.put(evidence, :event_id, event_id(evidence))
+    Map.put(evidence, :integrity_hash, integrity_hash(evidence))
   end
 
   @spec persist(Path.t(), evidence()) :: {:ok, Path.t()} | {:error, term()}
@@ -285,7 +316,14 @@ defmodule SymphonyElixir.TerminalFailure do
 
   @spec storage_ready() :: :ok | {:error, term()}
   def storage_ready do
-    Enum.reduce_while(["events", "active", "resumes", "faults"], :ok, fn namespace, :ok ->
+    case probe_storage_namespaces(["events", "active", "resumes", "faults", "locks"]) do
+      :ok -> recover_lock_namespace()
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp probe_storage_namespaces(namespaces) do
+    Enum.reduce_while(namespaces, :ok, fn namespace, :ok ->
       case probe_storage_namespace(namespace) do
         :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
@@ -344,6 +382,7 @@ defmodule SymphonyElixir.TerminalFailure do
   def valid?(
         %{
           event_id: event_id,
+          integrity_hash: integrity_hash,
           reason: reason,
           category: category,
           backend: backend,
@@ -351,8 +390,9 @@ defmodule SymphonyElixir.TerminalFailure do
           occurred_at: occurred_at
         } = evidence
       ) do
-    valid_event_id?(event_id, evidence) and valid_hash?(Map.get(evidence, :workflow_scope)) and
-      valid_optional_hashes?(evidence) and valid_reason?(reason, category) and
+    valid_event_id?(event_id, evidence) and valid_integrity_hash?(integrity_hash, evidence) and
+      valid_hash?(Map.get(evidence, :workflow_scope)) and valid_optional_hashes?(evidence) and
+      valid_reason?(reason, category) and
       valid_backend?(backend) and
       is_binary(workspace) and workspace != "" and is_binary(occurred_at)
   end
@@ -362,14 +402,22 @@ defmodule SymphonyElixir.TerminalFailure do
   defp valid_hash?(value), do: is_binary(value) and byte_size(value) == 64
 
   defp valid_event_id?(value, evidence) do
-    valid_hash?(value) and value == event_id(Map.delete(evidence, :event_id))
+    valid_hash?(value) and value == event_id(evidence)
+  end
+
+  defp valid_integrity_hash?(value, evidence) do
+    valid_hash?(value) and value == integrity_hash(evidence)
   end
 
   defp valid_optional_hashes?(evidence) do
-    Enum.all?([:predecessor_event_id, :writer_id], fn key ->
-      value = Map.get(evidence, key)
-      is_nil(value) or valid_hash?(value)
-    end)
+    hashes_valid? =
+      Enum.all?([:predecessor_event_id, :writer_id], fn key ->
+        value = Map.get(evidence, key)
+        is_nil(value) or valid_hash?(value)
+      end)
+
+    public_attempt = Map.get(evidence, :public_attempt)
+    hashes_valid? and (is_nil(public_attempt) or valid_raw_attempt?(public_attempt))
   end
 
   defp valid_reason?(reason, category), do: reason in @reasons and category == category(reason)
@@ -537,13 +585,72 @@ defmodule SymphonyElixir.TerminalFailure do
       Enum.all?(global_paths, &resume_receipt_matches_prior?(&1, evidence))
   end
 
+  defp strict_evidence_payload?(decoded) do
+    keys = Map.keys(decoded) |> MapSet.new()
+    allowed_keys = MapSet.union(@required_evidence_keys, @optional_evidence_keys)
+
+    MapSet.subset?(@required_evidence_keys, keys) and MapSet.subset?(keys, allowed_keys) and
+      strict_required_evidence_fields?(decoded) and strict_optional_evidence_fields?(decoded)
+  end
+
+  defp strict_required_evidence_fields?(decoded) do
+    strict_evidence_identity_fields?(decoded) and strict_evidence_correlation_fields?(decoded)
+  end
+
+  defp strict_evidence_identity_fields?(decoded) do
+    Enum.all?(["event_id", "integrity_hash", "workflow_scope"], &valid_hash?(Map.get(decoded, &1))) and
+      not is_nil(decode_reason(Map.get(decoded, "reason"))) and
+      is_binary(Map.get(decoded, "category")) and
+      not is_nil(decode_backend(Map.get(decoded, "backend"))) and
+      is_binary(Map.get(decoded, "occurred_at"))
+  end
+
+  defp strict_evidence_correlation_fields?(decoded) do
+    exact_nullable_bounded?(Map.get(decoded, "issue_id"), 256) and
+      exact_nullable_bounded?(Map.get(decoded, "issue_identifier"), 256) and
+      valid_raw_attempt?(Map.get(decoded, "attempt")) and
+      exact_nullable_bounded?(Map.get(decoded, "session_id"), 256) and
+      exact_required_bounded?(Map.get(decoded, "workspace"), 4_096) and
+      exact_nullable_bounded?(Map.get(decoded, "binding_id"), 256) and
+      valid_raw_optional_hash?(Map.get(decoded, "predecessor_event_id"))
+  end
+
+  defp strict_optional_evidence_fields?(decoded) do
+    optional_field_valid?(decoded, "writer_id", &valid_hash?/1) and
+      optional_field_valid?(decoded, "public_attempt", &valid_raw_attempt?/1) and
+      optional_field_valid?(decoded, "provider_code", &(normalize_provider_code(&1) == &1)) and
+      optional_field_valid?(decoded, "http_status", &(normalize_http_status(&1) == &1)) and
+      optional_field_valid?(decoded, "reset_hint", &(normalize_reset_hint(&1) == &1)) and
+      optional_field_valid?(decoded, "liveness", &(not is_nil(decode_liveness(&1))))
+  end
+
+  defp optional_field_valid?(decoded, key, validator) do
+    not Map.has_key?(decoded, key) or validator.(Map.get(decoded, key))
+  end
+
+  defp exact_nullable_bounded?(nil, _max_bytes), do: true
+
+  defp exact_nullable_bounded?(value, max_bytes),
+    do: is_binary(value) and String.valid?(value) and byte_size(value) <= max_bytes
+
+  defp exact_required_bounded?(value, max_bytes),
+    do: exact_nullable_bounded?(value, max_bytes) and value not in [nil, ""]
+
+  defp valid_raw_attempt?(nil), do: true
+  defp valid_raw_attempt?(value), do: is_integer(value) and value >= 0
+  defp valid_raw_optional_hash?(nil), do: true
+  defp valid_raw_optional_hash?(value), do: valid_hash?(value)
+
   defp decode_evidence(decoded) when is_map(decoded) do
+    if not strict_evidence_payload?(decoded), do: throw(:invalid_evidence_payload)
+
     reason = decode_reason(Map.get(decoded, "reason"))
     backend = decode_backend(Map.get(decoded, "backend"))
     liveness = decode_liveness(Map.get(decoded, "liveness"))
 
     evidence = %{
       event_id: Map.get(decoded, "event_id"),
+      integrity_hash: Map.get(decoded, "integrity_hash"),
       workflow_scope: Map.get(decoded, "workflow_scope"),
       reason: reason,
       category: Map.get(decoded, "category"),
@@ -561,6 +668,7 @@ defmodule SymphonyElixir.TerminalFailure do
     evidence =
       evidence
       |> maybe_put(:writer_id, normalize_writer_id(Map.get(decoded, "writer_id")))
+      |> maybe_put(:public_attempt, normalize_attempt(Map.get(decoded, "public_attempt")))
       |> maybe_put(:provider_code, normalize_provider_code(Map.get(decoded, "provider_code")))
       |> maybe_put(:http_status, normalize_http_status(Map.get(decoded, "http_status")))
       |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(decoded, "reset_hint")))
@@ -569,8 +677,8 @@ defmodule SymphonyElixir.TerminalFailure do
     if valid?(evidence) and event_id(evidence) == evidence.event_id,
       do: {:ok, evidence},
       else: {:error, :invalid_terminal_failure_receipt}
-  rescue
-    ArgumentError -> {:error, :invalid_terminal_failure_receipt}
+  catch
+    :invalid_evidence_payload -> {:error, :invalid_terminal_failure_receipt}
   end
 
   defp decode_evidence(_decoded), do: {:error, :invalid_terminal_failure_receipt}
@@ -602,7 +710,18 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp event_id(evidence) do
     evidence
-    |> Map.drop([:occurred_at, :event_id])
+    |> Map.drop([:occurred_at, :event_id, :integrity_hash])
+    |> canonical_hash()
+  end
+
+  defp integrity_hash(evidence) do
+    evidence
+    |> Map.delete(:integrity_hash)
+    |> canonical_hash()
+  end
+
+  defp canonical_hash(value) do
+    value
     |> json_safe()
     |> Jason.encode!()
     |> then(&:crypto.hash(:sha256, &1))
@@ -915,6 +1034,52 @@ defmodule SymphonyElixir.TerminalFailure do
       |> active_paths(issue_id)
       |> ownership_lock_path()
     end
+
+    @doc false
+    @spec hold_active_lock_for_test(Path.t(), String.t(), pid()) :: :ok | {:error, term()}
+    def hold_active_lock_for_test(workspace, issue_id, parent) do
+      with_active_marker_locks(active_paths(workspace, issue_id), fn ->
+        send(parent, {:active_lock_acquired, self()})
+
+        receive do
+          :release_active_lock -> :ok
+        end
+      end)
+    end
+
+    @doc false
+    @spec lock_recovery_edges_for_test(Path.t()) :: map()
+    def lock_recovery_edges_for_test(root) do
+      cleanup_path = Path.join(root, "cleanup.lock")
+      File.mkdir_p!(cleanup_path)
+      File.write!(lock_owner_path(cleanup_path), "owner")
+
+      failed_owner_path = Path.join(root, "failed-owner.lock")
+      File.mkdir_p!(lock_owner_path(failed_owner_path))
+
+      invalid_owner = lock_owner(String.duplicate("a", 64)) |> Map.put("os_start_time", 42)
+      missing_lock_root = Path.join(root, "missing-lock-root")
+      invalid_lock_root = Path.join(root, "invalid-lock-root")
+      File.write!(invalid_lock_root, "not-a-directory")
+
+      %{
+        cleanup: cleanup_failed_lock(cleanup_path),
+        owner_failure: persist_lock_owner(failed_owner_path, String.duplicate("b", 64)),
+        invalid_owner: valid_lock_owner?(invalid_owner),
+        incomplete_owner: valid_lock_owner?(%{}),
+        missing: reclaim_stale_lock(Path.join(root, "missing.lock")),
+        missing_rmdir: normalize_ownerless_rmdir({:error, :enoent}),
+        denied_rmdir: normalize_ownerless_rmdir({:error, :eacces}),
+        denied_stat: reclaim_ownerless_lock_from_stat("unused", {:error, :eacces}, 0),
+        missing_namespace: recover_lock_namespace(missing_lock_root),
+        invalid_namespace: recover_lock_namespace(invalid_lock_root),
+        machine_fallback: machine_scope_from_read({:error, :enoent}, "test-boot"),
+        boot_fallback: boot_scope_from_read({:error, :enoent}),
+        short_stat: process_start_time_from_read({:ok, "1 (beam) S"}),
+        missing_stat: process_start_time_from_read({:error, :enoent}),
+        invalid_pid: decode_owner_pid(Base.encode64("not-an-erlang-term"))
+      }
+    end
   end
 
   defp with_active_marker_locks(paths, operation) do
@@ -939,25 +1104,267 @@ defmodule SymphonyElixir.TerminalFailure do
     Path.join(state_root(), "locks/#{ownership_key}.lock")
   end
 
-  defp acquire_marker_locks(paths, acquired), do: acquire_marker_locks(paths, acquired, 40)
+  defp acquire_marker_locks(paths, acquired),
+    do: acquire_marker_locks(paths, acquired, @lock_retry_attempts)
 
   defp acquire_marker_locks([], acquired, _attempts_left), do: {:ok, acquired}
 
   defp acquire_marker_locks([lock_path | rest] = paths, acquired, attempts_left) do
-    with :ok <- File.mkdir_p(Path.dirname(lock_path)),
-         :ok <- File.mkdir(lock_path) do
-      acquire_marker_locks(rest, [lock_path | acquired], 40)
-    else
+    token = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+
+    case create_owned_lock(lock_path, token) do
+      :ok ->
+        acquire_marker_locks(rest, [{lock_path, token} | acquired], @lock_retry_attempts)
+
       {:error, :eexist} when attempts_left > 0 ->
-        Process.sleep(5)
+        Process.sleep(@lock_retry_delay_ms)
         acquire_marker_locks(paths, acquired, attempts_left - 1)
+
+      {:error, :eexist} ->
+        case reclaim_stale_lock(lock_path) do
+          :reclaimed -> acquire_marker_locks(paths, acquired, @lock_retry_attempts)
+          :locked -> {:error, {:active_marker_locked, lock_path, :eexist}, acquired}
+          {:error, reason} -> {:error, {:active_marker_locked, lock_path, reason}, acquired}
+        end
 
       {:error, reason} ->
         {:error, {:active_marker_locked, lock_path, reason}, acquired}
     end
   end
 
-  defp release_marker_locks(lock_paths), do: Enum.each(lock_paths, &File.rmdir/1)
+  defp create_owned_lock(lock_path, token) do
+    case File.mkdir_p(Path.dirname(lock_path)) do
+      :ok -> create_owned_lock_directory(lock_path, token)
+      {:error, reason} -> {:error, {:lock_namespace_unavailable, reason}}
+    end
+  end
+
+  defp create_owned_lock_directory(lock_path, token) do
+    case File.mkdir(lock_path) do
+      :ok -> persist_lock_owner(lock_path, token)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_lock_owner(lock_path, token) do
+    with {:ok, payload} <- Jason.encode(lock_owner(token)),
+         :ok <- File.write(lock_owner_path(lock_path), payload, [:exclusive, :sync]) do
+      :ok
+    else
+      {:error, _reason} = error ->
+        cleanup_failed_lock(lock_path)
+        error
+    end
+  end
+
+  defp cleanup_failed_lock(lock_path) do
+    File.rm(lock_owner_path(lock_path))
+    File.rmdir(lock_path)
+    :ok
+  end
+
+  defp release_marker_locks(locks), do: Enum.each(locks, &release_owned_lock/1)
+
+  defp release_owned_lock({lock_path, token}) do
+    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
+         :ok <- File.rm(lock_owner_path(lock_path)) do
+      File.rmdir(lock_path)
+    else
+      _other -> :ok
+    end
+  end
+
+  defp lock_owner(token) do
+    %{
+      "token" => token,
+      "runtime_instance" => runtime_instance(),
+      "erlang_pid" => self() |> :erlang.term_to_binary() |> Base.encode64(),
+      "machine_scope" => machine_scope(),
+      "os_pid" => System.pid(),
+      "os_start_time" => os_process_start_time(System.pid())
+    }
+  end
+
+  defp lock_owner_path(lock_path), do: Path.join(lock_path, "owner.json")
+
+  defp read_lock_owner(lock_path) do
+    with {:ok, contents} <- File.read(lock_owner_path(lock_path)),
+         {:ok, owner} <- Jason.decode(contents),
+         true <- valid_lock_owner?(owner) do
+      {:ok, owner}
+    else
+      {:error, :enoent} -> {:error, :owner_missing}
+      _other -> {:error, :invalid_lock_owner}
+    end
+  end
+
+  defp valid_lock_owner?(owner) when is_map(owner) do
+    Enum.sort(Map.keys(owner)) ==
+      [
+        "erlang_pid",
+        "machine_scope",
+        "os_pid",
+        "os_start_time",
+        "runtime_instance",
+        "token"
+      ] and
+      valid_hash?(Map.get(owner, "token")) and
+      valid_hash?(Map.get(owner, "runtime_instance")) and
+      valid_hash?(Map.get(owner, "machine_scope")) and
+      is_binary(Map.get(owner, "erlang_pid")) and
+      is_binary(Map.get(owner, "os_pid")) and
+      is_binary(Map.get(owner, "os_start_time"))
+  end
+
+  defp valid_lock_owner?(_owner), do: false
+
+  defp reclaim_stale_lock(lock_path) do
+    case read_lock_owner(lock_path) do
+      {:ok, owner} ->
+        if stale_lock_owner?(owner),
+          do: remove_stale_owned_lock(lock_path, owner),
+          else: :locked
+
+      {:error, :owner_missing} ->
+        reclaim_ownerless_lock(lock_path)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp stale_lock_owner?(owner) do
+    if owner["runtime_instance"] == runtime_instance() do
+      case decode_owner_pid(owner["erlang_pid"]) do
+        {:ok, pid} -> not Process.alive?(pid)
+        :error -> false
+      end
+    else
+      owner["machine_scope"] == machine_scope() and
+        os_process_start_time(owner["os_pid"]) != owner["os_start_time"]
+    end
+  end
+
+  defp decode_owner_pid(encoded_pid) do
+    with {:ok, binary} <- Base.decode64(encoded_pid),
+         pid when is_pid(pid) <- :erlang.binary_to_term(binary, [:safe]),
+         true <- node(pid) == node() do
+      {:ok, pid}
+    else
+      _other -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp remove_stale_owned_lock(lock_path, %{"token" => token}) do
+    with {:ok, %{"token" => ^token}} <- read_lock_owner(lock_path),
+         :ok <- File.rm(lock_owner_path(lock_path)),
+         :ok <- File.rmdir(lock_path) do
+      :reclaimed
+    else
+      _other -> :locked
+    end
+  end
+
+  defp reclaim_ownerless_lock(lock_path) do
+    stale_before = System.os_time(:second) - @ownerless_lock_grace_seconds
+    reclaim_ownerless_lock_from_stat(lock_path, File.stat(lock_path, time: :posix), stale_before)
+  end
+
+  defp reclaim_ownerless_lock_from_stat(lock_path, stat_result, stale_before) do
+    case stat_result do
+      {:ok, %{mtime: modified_at}} when is_integer(modified_at) and modified_at <= stale_before ->
+        normalize_ownerless_rmdir(File.rmdir(lock_path))
+
+      {:ok, _stat} ->
+        :locked
+
+      {:error, :enoent} ->
+        :reclaimed
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_ownerless_rmdir(result) when result in [:ok, {:error, :enoent}], do: :reclaimed
+  defp normalize_ownerless_rmdir({:error, _reason}), do: :locked
+
+  defp recover_lock_namespace,
+    do: recover_lock_namespace(Path.join(state_root(), "locks"))
+
+  defp recover_lock_namespace(lock_root) do
+    case File.ls(lock_root) do
+      {:ok, entries} ->
+        Enum.reduce_while(entries, :ok, &recover_lock_entry(lock_root, &1, &2))
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:terminal_lock_namespace_unavailable, reason}}
+    end
+  end
+
+  defp recover_lock_entry(lock_root, entry, :ok) do
+    lock_path = Path.join(lock_root, entry)
+
+    result =
+      if String.ends_with?(entry, ".lock") and File.dir?(lock_path),
+        do: reclaim_stale_lock(lock_path),
+        else: :reclaimed
+
+    case result do
+      :reclaimed -> {:cont, :ok}
+      :locked -> {:halt, {:error, {:active_marker_locked, lock_path, :eexist}}}
+      {:error, reason} -> {:halt, {:error, {:active_marker_locked, lock_path, reason}}}
+    end
+  end
+
+  defp runtime_instance do
+    identity_hash(
+      Enum.join(
+        [machine_scope(), current_boot_scope(), System.pid(), os_process_start_time(System.pid())],
+        ":"
+      )
+    )
+  end
+
+  defp machine_scope do
+    machine_scope_from_read(File.read("/etc/machine-id"), current_boot_scope())
+  end
+
+  defp machine_scope_from_read({:ok, machine_id}, _boot_scope),
+    do: identity_hash(String.trim(machine_id))
+
+  defp machine_scope_from_read({:error, _reason}, boot_scope),
+    do: identity_hash("unknown-machine:#{boot_scope}")
+
+  defp current_boot_scope do
+    boot_scope_from_read(File.read("/proc/sys/kernel/random/boot_id"))
+  end
+
+  defp boot_scope_from_read({:ok, boot_id}), do: String.trim(boot_id)
+  defp boot_scope_from_read({:error, _reason}), do: "unknown-boot"
+
+  defp os_process_start_time(pid) when is_binary(pid) do
+    process_start_time_from_read(File.read("/proc/#{pid}/stat"))
+  end
+
+  defp process_start_time_from_read({:ok, stat}) do
+    stat
+    |> String.split(") ", parts: 2)
+    |> List.last()
+    |> String.split()
+    |> Enum.at(19)
+    |> case do
+      value when is_binary(value) -> value
+      _other -> "unavailable"
+    end
+  end
+
+  defp process_start_time_from_read({:error, _reason}), do: "unavailable"
 
   defp persist_mirrored(paths, writer, error_tag) do
     {local_paths, global_paths} = Enum.split(paths, 2)

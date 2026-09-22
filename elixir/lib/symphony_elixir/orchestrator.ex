@@ -382,6 +382,7 @@ defmodule SymphonyElixir.Orchestrator do
         issue_id: issue_id,
         issue_identifier: Map.get(running_entry, :identifier),
         attempt: Map.get(running_entry, :writer_attempt),
+        public_attempt: Map.get(running_entry, :retry_attempt),
         writer_id: Map.get(running_entry, :writer_id),
         session_id: Map.get(running_entry, :session_id),
         workspace: Map.get(running_entry, :workspace_path),
@@ -1387,7 +1388,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: nil,
         terminal_failure: evidence,
         binding: nil,
-        binding_id: evidence.binding_id
+        binding_id: evidence.binding_id,
+        retry_attempt: Map.get(evidence, :public_attempt, evidence.attempt || 0)
       }
 
       %{
@@ -2159,10 +2161,15 @@ defmodule SymphonyElixir.Orchestrator do
     with {:ok, blocked_entry} <- fetch_terminal_block(state, issue_id),
          :ok <- validate_terminal_resume_lifecycle(state, issue_id, blocked_entry),
          :ok <- validate_terminal_resume_evidence(blocked_entry),
-         :ok <- validate_terminal_resume_capacity(state, issue_id, blocked_entry),
          {:ok, normalized_binding} <- validate_terminal_resume_binding(blocked_entry, binding) do
-      attempt = max(issue_attempt_count(state, issue_id), 1)
-      {:ok, blocked_entry, normalized_binding, attempt}
+      public_attempt = max(Map.get(blocked_entry, :retry_attempt, 0), 0) + 1
+      prior_writer_attempt = Map.get(blocked_entry.terminal_failure, :attempt) || 0
+      writer_attempt = max(issue_attempt_count(state, issue_id), prior_writer_attempt + 1)
+
+      case validate_terminal_resume_capacity(state, issue_id, blocked_entry, writer_attempt) do
+        :ok -> {:ok, blocked_entry, normalized_binding, public_attempt, writer_attempt}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
@@ -2214,9 +2221,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp validate_terminal_resume_capacity(state, issue_id, blocked_entry) do
+  defp validate_terminal_resume_capacity(state, issue_id, blocked_entry, writer_attempt) do
     cond do
-      attempt_budget_exhausted?(state, issue_id) ->
+      terminal_resume_attempt_budget_exhausted?(state, issue_id, writer_attempt) ->
         {:error, :terminal_resume_attempt_budget_exhausted}
 
       not dispatch_slots_available?(blocked_entry.issue, state) ->
@@ -2231,6 +2238,14 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         :ok
     end
+  end
+
+  defp terminal_resume_attempt_budget_exhausted?(state, issue_id, writer_attempt) do
+    attempt_budget_exhausted?(state, issue_id) or
+      case Config.max_attempts_per_issue() do
+        limit when is_integer(limit) -> writer_attempt >= limit
+        _other -> false
+      end
   end
 
   defp validate_terminal_resume_binding(blocked_entry, binding) do
@@ -2257,24 +2272,37 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp resume_terminal_issue(state, issue, blocked_entry, binding, attempt, from) do
+  defp resume_terminal_issue(
+         state,
+         issue,
+         blocked_entry,
+         binding,
+         public_attempt,
+         writer_attempt,
+         from
+       ) do
     evidence = Map.fetch!(blocked_entry, :terminal_failure)
 
     case SymphonyElixir.TerminalFailure.record_resume(
            blocked_entry.workspace_path,
            evidence,
            binding.binding_id,
-           attempt
+           writer_attempt
          ) do
       {:ok, receipt_path} ->
-        candidate_state = %{state | blocked: Map.delete(state.blocked, issue.id)}
+        candidate_state = %{
+          state
+          | blocked: Map.delete(state.blocked, issue.id),
+            attempts: Map.put(state.attempts, issue.id, writer_attempt)
+        }
+
         resume_binding = Map.put(binding, :predecessor_event_id, evidence.event_id)
 
         next_state =
           do_dispatch_issue(
             candidate_state,
             issue,
-            attempt,
+            public_attempt,
             Map.get(blocked_entry, :worker_host),
             resume_binding,
             blocked_entry.workspace_path
@@ -2291,7 +2319,8 @@ defmodule SymphonyElixir.Orchestrator do
             binding_id: binding.binding_id,
             backend: binding.backend,
             workspace_path: blocked_entry.workspace_path,
-            attempt: attempt,
+            attempt: public_attempt,
+            writer_attempt: writer_attempt,
             disposition: :running,
             receipt_path: receipt_path
           }
@@ -2311,7 +2340,7 @@ defmodule SymphonyElixir.Orchestrator do
             |> Map.put(:resume_handoff, handoff)
 
           Logger.info(
-            "Waiting for native writer proof after terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} attempt=#{attempt}"
+            "Waiting for native writer proof after terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} public_attempt=#{public_attempt} writer_attempt=#{writer_attempt}"
           )
 
           {:noreply, %{next_state | running: Map.put(next_state.running, issue.id, running_entry)}}
@@ -2510,7 +2539,7 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_call({:resume_terminal_attempt, issue_id, binding}, from, state) do
     case prepare_terminal_resume(state, issue_id, binding) do
-      {:ok, blocked_entry, normalized_binding, attempt} ->
+      {:ok, blocked_entry, normalized_binding, public_attempt, writer_attempt} ->
         case refresh_issue_for_dispatch(blocked_entry.issue) do
           {:ok, %Issue{} = issue} ->
             resume_terminal_issue(
@@ -2518,7 +2547,8 @@ defmodule SymphonyElixir.Orchestrator do
               issue,
               blocked_entry,
               normalized_binding,
-              attempt,
+              public_attempt,
+              writer_attempt,
               from
             )
 

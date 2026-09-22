@@ -555,17 +555,20 @@ Launch and protocol requirements:
   `permission_denied`, `worker_crashed`, `worker_stalled`, `provider_protocol_error`, or
   `unknown_terminal_failure`. Unknown or ambiguous messages MUST NOT be inferred to be quota.
 - Terminal evidence MUST correlate issue, attempt, backend, session, workspace, and a non-secret
-  binding ID. It MUST have a deterministic event ID, an immutable create-once event receipt, and a
-  fail-closed active marker; if workspace metadata is unavailable, a workspace-root hold MUST retain
+  binding ID. It MUST have a deterministic semantic event ID plus a separate integrity hash over
+  every accepted persisted field, reject unknown or malformed fields before normalization, retain
+  an immutable create-once event receipt, and use a fail-closed active marker; if workspace metadata is unavailable, a workspace-root hold MUST retain
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
   active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
   include a stable workflow scope as well as issue identity so unrelated repositories and tracker
   instances cannot collide. Every dispatched writer MUST carry a non-null unique writer ID plus a
   monotonically reserved writer-attempt identity that is distinct from the public retry/continuation
   attempt used by prompts, status, and backoff. Active-marker replacement and removal MUST verify
-  workflow, issue, workspace,
-  event, binding, attempt, and an explicit predecessor-event lineage while holding an exclusive lock
-  on a stable ownership key independent of marker existence; a resumed event may transfer ownership
+  workflow, issue, workspace, event, binding, attempt, and an explicit predecessor-event lineage
+  while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
+  ownership MUST be durable and recoverable: same-runtime dead owners and same-machine dead or
+  PID-reused runtimes are reclaimed by ownership proof, while live, remote, malformed, or recent
+  ownerless locks fail closed; startup MUST probe and reconcile the lock namespace; a resumed event may transfer ownership
   to exactly its authorized next terminal event, but unrelated, stale, cleared, or concurrent owners
   MUST fail closed. Collisions MUST accept
   byte-identical receipts or fail closed without rewriting history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
@@ -581,8 +584,10 @@ Launch and protocol requirements:
   only backend-reviewed launch options; AntiGravity accepts only a dedicated absolute
   `profile_root`. A create-once resume-intent receipt MUST be durable before dispatch. The new
   attempt MUST open the exact recorded issue workspace even if configuration reload changed the
-  workspace root, preserve its existing bytes/branch, and MUST NOT rerun `after_create`. A failed
-  intent write MUST launch no writer; after an intent is written, only backend-native session proof
+  workspace root, preserve its existing bytes/branch, and MUST NOT rerun `after_create`. Resume MUST
+  advance the public retry/continuation attempt independently from the monotonically reserved
+  writer attempt; only the writer attempt is recorded in resume authorization and terminal evidence.
+  A failed intent write MUST launch no writer; after an intent is written, only backend-native session proof
   from the authorized attempt is a successful handoff. Creating an orchestration task, queueing a
   retry, or any other unproven dispatch MUST be cancelled, marked ambiguous, and require explicit
   recovery. Symphony validates and executes the binding but MUST NOT select an account,

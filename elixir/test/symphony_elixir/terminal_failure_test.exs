@@ -818,6 +818,190 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)
   end
 
+  test "crash-stale owned locks are reclaimed without manual filesystem repair" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-stale-lock-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "stale-lock",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "stale-lock-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    parent = self()
+
+    clean_holder =
+      spawn(fn ->
+        TerminalFailure.hold_active_lock_for_test(workspace, context.issue_id, parent)
+      end)
+
+    assert_receive {:active_lock_acquired, ^clean_holder}, 1_000
+    clean_ref = Process.monitor(clean_holder)
+    send(clean_holder, :release_active_lock)
+    assert_receive {:DOWN, ^clean_ref, :process, ^clean_holder, :normal}, 1_000
+
+    holder =
+      spawn(fn ->
+        TerminalFailure.hold_active_lock_for_test(workspace, context.issue_id, parent)
+      end)
+
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
+    assert {:error, {:active_marker_locked, _path, :eexist}} = TerminalFailure.storage_ready()
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+
+    assert :ok = TerminalFailure.storage_ready()
+    evidence = TerminalFailure.build(:worker_crashed, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
+    assert {:settled, %{event_id: event_id}} = TerminalFailure.recovery_state(workspace, context.issue_id)
+    assert event_id == evidence.event_id
+  end
+
+  test "lock recovery fails closed for live or malformed owners and reclaims proven dead runtimes" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-lock-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+    issue_id = "lock-recovery"
+    lock_path = TerminalFailure.active_lock_path_for_test(workspace, issue_id)
+    owner_path = Path.join(lock_path, "owner.json")
+    parent = self()
+
+    start_holder = fn ->
+      spawn(fn -> TerminalFailure.hold_active_lock_for_test(workspace, issue_id, parent) end)
+    end
+
+    holder = start_holder.()
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
+    owner = owner_path |> File.read!() |> Jason.decode!()
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+
+    File.write!(owner_path, Jason.encode!(Map.put(owner, "erlang_pid", "not-base64")))
+    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+
+    File.write!(owner_path, Jason.encode!(owner))
+    assert :ok = TerminalFailure.storage_ready()
+
+    holder = start_holder.()
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
+    owner = owner_path |> File.read!() |> Jason.decode!()
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+
+    dead_runtime_owner =
+      owner
+      |> Map.put("runtime_instance", String.duplicate("d", 64))
+      |> Map.put("os_pid", "99999999")
+      |> Map.put("os_start_time", "1")
+
+    File.write!(owner_path, Jason.encode!(dead_runtime_owner))
+    assert :ok = TerminalFailure.storage_ready()
+
+    File.mkdir!(lock_path)
+    File.write!(owner_path, "[]")
+
+    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
+             TerminalFailure.storage_ready()
+
+    File.write!(owner_path, Jason.encode!(Map.put(owner, "token", "short")))
+
+    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
+             TerminalFailure.storage_ready()
+
+    File.rm!(owner_path)
+    old_time = System.os_time(:second) - 5
+    assert :ok = File.touch(lock_path, old_time)
+    assert :ok = TerminalFailure.storage_ready()
+
+    File.mkdir!(lock_path)
+    unexpected = Path.join(lock_path, "unexpected")
+    File.write!(unexpected, "occupied")
+    assert :ok = File.touch(lock_path, old_time)
+    assert {:error, {:active_marker_locked, ^lock_path, :eexist}} = TerminalFailure.storage_ready()
+    File.rm!(unexpected)
+    File.rmdir!(lock_path)
+
+    holder = start_holder.()
+    assert_receive {:active_lock_acquired, ^holder}, 1_000
+    ref = Process.monitor(holder)
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
+    assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
+
+    File.mkdir!(lock_path)
+    File.write!(owner_path, "not-json")
+
+    assert {:error, {:active_marker_locked, ^lock_path, :invalid_lock_owner}} =
+             TerminalFailure.persist(workspace, evidence)
+
+    File.rm!(owner_path)
+    File.rmdir!(lock_path)
+
+    edge_root = Path.join(root, "edges")
+    edges = TerminalFailure.lock_recovery_edges_for_test(edge_root)
+    assert edges.cleanup == :ok
+    assert match?({:error, _reason}, edges.owner_failure)
+    assert edges.invalid_owner == false
+    assert edges.incomplete_owner == false
+    assert edges.missing == :reclaimed
+    assert edges.missing_rmdir == :reclaimed
+    assert edges.denied_rmdir == :locked
+    assert edges.denied_stat == {:error, :eacces}
+    assert edges.missing_namespace == :ok
+    assert edges.invalid_namespace == {:error, {:terminal_lock_namespace_unavailable, :enotdir}}
+    assert byte_size(edges.machine_fallback) == 64
+    assert edges.boot_fallback == "unknown-boot"
+    assert edges.short_stat == "unavailable"
+    assert edges.missing_stat == "unavailable"
+    assert edges.invalid_pid == :error
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    lock_root = Path.join(state_root, "locks")
+    File.rm_rf!(lock_root)
+    File.write!(lock_root, "blocked")
+
+    assert {:error, {:active_marker_locked, _path, {:lock_namespace_unavailable, reason}}} =
+             TerminalFailure.persist(workspace, evidence)
+
+    assert reason in [:eexist, :enotdir]
+
+    File.rm!(lock_root)
+    File.mkdir_p!(lock_root)
+  end
+
   test "active marker IO failures fail closed during clear, validation, and transfer" do
     root =
       Path.join(
@@ -1031,30 +1215,49 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert {:error, :invalid_terminal_failure_receipt} =
              TerminalFailure.recovery_state(workspace)
 
-    malformed_writer =
+    valid =
       TerminalFailure.build(:worker_crashed, %{}, %{
         backend: :antigravity,
         issue_id: "issue-tamper",
         issue_identifier: "JARVIS-936",
         attempt: 0,
+        writer_id: String.duplicate("c", 64),
         session_id: nil,
         workspace: workspace,
         binding_id: nil
       })
-      |> Map.put(:writer_id, "short")
-      |> Map.delete(:event_id)
 
-    malformed_writer =
-      Map.put(
-        malformed_writer,
-        :event_id,
-        :crypto.hash(:sha256, :erlang.term_to_binary(malformed_writer, [:deterministic]))
-        |> Base.encode16(case: :lower)
-      )
+    File.rm!(marker)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, valid)
+    persisted = marker |> File.read!() |> Jason.decode!()
 
-    File.write!(marker, Jason.encode!(malformed_writer))
+    File.write!(marker, Jason.encode!(Map.put(persisted, "writer_id", "short")))
 
     assert {:error, :invalid_terminal_failure_receipt} =
              TerminalFailure.recovery_state(workspace)
+
+    File.write!(marker, Jason.encode!(Map.put(persisted, "unexpected", "not integrity bound")))
+
+    assert {:error, :invalid_terminal_failure_receipt} =
+             TerminalFailure.recovery_state(workspace)
+
+    File.write!(marker, Jason.encode!(Map.put(persisted, "occurred_at", "2099-01-01T00:00:00Z")))
+
+    assert {:error, :invalid_terminal_failure_receipt} =
+             TerminalFailure.recovery_state(workspace)
+
+    for {field, value} <- [{"reason", 42}, {"backend", "unknown"}, {"issue_id", 42}] do
+      File.write!(marker, Jason.encode!(Map.put(persisted, field, value)))
+
+      assert {:error, :invalid_terminal_failure_receipt} =
+               TerminalFailure.recovery_state(workspace)
+    end
+
+    assert_raise ArgumentError, fn ->
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        workspace: 42
+      })
+    end
   end
 end

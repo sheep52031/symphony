@@ -257,6 +257,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
       issue_id: Map.get(issue, :id) || Map.get(issue, "id"),
       issue_identifier: Map.get(issue, :identifier) || Map.get(issue, "identifier"),
       attempt: Keyword.get(opts, :writer_attempt),
+      public_attempt: Keyword.get(opts, :attempt),
       writer_id: Keyword.get(opts, :writer_id),
       session_id: Map.get(details, :session_id) || Transport.session_id(session.transport),
       workspace: session.workspace,

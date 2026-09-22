@@ -146,6 +146,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     refute File.exists?(resume_receipt)
 
+    :sys.replace_state(pid, fn state ->
+      state
+      |> put_in([Access.key(:blocked), issue.id, :retry_attempt], 5)
+      |> Map.update!(:attempts, &Map.delete(&1, issue.id))
+    end)
+
     assert {:ok, receipt} =
              Orchestrator.resume_terminal_attempt(
                issue.id,
@@ -160,7 +166,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert receipt.prior_event_id == evidence.event_id
     assert receipt.binding_id == "slot-b"
     assert receipt.workspace_path == workspace
-    assert receipt.attempt == 1
+    assert receipt.attempt == 6
+    assert receipt.writer_attempt == 1
     assert receipt.disposition == :running
 
     live_snapshot =
@@ -173,6 +180,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       )
 
     assert [%{workspace_path: ^workspace, binding_id: "slot-b"}] = live_snapshot.running
+    assert %{retry_attempt: 6, writer_attempt: 1} = :sys.get_state(pid).running[issue.id]
+
     [resumed_writer] = live_snapshot.running
     resumed_writer_pid = resumed_writer.backend_process_pid
     refute resumed_writer_pid == old_writer_pid
@@ -183,7 +192,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert {"preserved-branch\n", 0} = System.cmd("git", ["branch", "--show-current"], cd: workspace)
 
     assert File.regular?(resume_receipt)
-    assert Jason.decode!(File.read!(resume_receipt))["binding_id"] == "slot-b"
+    resume_payload = Jason.decode!(File.read!(resume_receipt))
+    assert resume_payload["binding_id"] == "slot-b"
+    assert resume_payload["attempt"] == 1
 
     case :sys.get_state(pid).running[issue.id] do
       %{pid: task_pid} when is_pid(task_pid) ->
