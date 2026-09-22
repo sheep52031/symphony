@@ -117,6 +117,11 @@ defmodule SymphonyElixir.TestSupport do
           pi_first_event_timeout_ms: nil,
           pi_turn_timeout_ms: nil,
           pi_post_result_timeout_ms: nil,
+          antigravity_executable: nil,
+          antigravity_profile_root: nil,
+          antigravity_first_event_timeout_ms: 30_000,
+          antigravity_turn_timeout_ms: 3_600_000,
+          antigravity_cancel_grace_ms: 1_000,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -165,6 +170,11 @@ defmodule SymphonyElixir.TestSupport do
     pi_first_event_timeout_ms = Keyword.get(config, :pi_first_event_timeout_ms)
     pi_turn_timeout_ms = Keyword.get(config, :pi_turn_timeout_ms)
     pi_post_result_timeout_ms = Keyword.get(config, :pi_post_result_timeout_ms)
+    antigravity_executable = Keyword.get(config, :antigravity_executable)
+    antigravity_profile_root = Keyword.get(config, :antigravity_profile_root)
+    antigravity_first_event_timeout_ms = Keyword.get(config, :antigravity_first_event_timeout_ms)
+    antigravity_turn_timeout_ms = Keyword.get(config, :antigravity_turn_timeout_ms)
+    antigravity_cancel_grace_ms = Keyword.get(config, :antigravity_cancel_grace_ms)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -219,6 +229,12 @@ defmodule SymphonyElixir.TestSupport do
         "  first_event_timeout_ms: #{yaml_value(pi_first_event_timeout_ms)}",
         "  turn_timeout_ms: #{yaml_value(pi_turn_timeout_ms)}",
         "  post_result_timeout_ms: #{yaml_value(pi_post_result_timeout_ms)}",
+        "antigravity:",
+        "  executable: #{yaml_value(antigravity_executable)}",
+        "  profile_root: #{yaml_value(antigravity_profile_root)}",
+        "  first_event_timeout_ms: #{yaml_value(antigravity_first_event_timeout_ms)}",
+        "  turn_timeout_ms: #{yaml_value(antigravity_turn_timeout_ms)}",
+        "  cancel_grace_ms: #{yaml_value(antigravity_cancel_grace_ms)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

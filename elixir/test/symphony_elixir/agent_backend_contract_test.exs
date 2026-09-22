@@ -3,13 +3,15 @@ defmodule SymphonyElixir.AgentBackendContractTest do
 
   alias SymphonyElixir.AgentBackend
 
-  test "accepts the shared Codex and Pi update and result shapes" do
+  test "accepts the shared Codex, Pi, and AntiGravity update and result shapes" do
     now = DateTime.utc_now()
 
     assert :ok = AgentBackend.validate_update(%{event: :session_started, timestamp: now})
     assert :ok = AgentBackend.validate_update(%{event: :agent_settled, timestamp: now, backend: :pi})
+    assert :ok = AgentBackend.validate_update(%{event: :native_result, timestamp: now, backend: :antigravity})
     assert :ok = AgentBackend.validate_turn_result(%{session_id: "codex-thread-turn"})
     assert :ok = AgentBackend.validate_turn_result(%{session_id: "pi-session", backend: :pi})
+    assert :ok = AgentBackend.validate_turn_result(%{session_id: "agy-session", backend: :antigravity})
   end
 
   test "rejects malformed adapter updates and turn results" do

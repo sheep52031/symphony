@@ -254,6 +254,48 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Antigravity do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:executable, :string)
+      field(:profile_root, :string)
+      field(:first_event_timeout_ms, :integer, default: 30_000)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:cancel_grace_ms, :integer, default: 1_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :executable,
+          :profile_root,
+          :first_event_timeout_ms,
+          :turn_timeout_ms,
+          :cancel_grace_ms
+        ],
+        empty_values: []
+      )
+      |> validate_nonblank(:executable)
+      |> validate_nonblank(:profile_root)
+      |> validate_number(:first_event_timeout_ms, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:cancel_grace_ms, greater_than: 0)
+    end
+
+    defp validate_nonblank(changeset, field) do
+      validate_change(changeset, field, fn ^field, value ->
+        if is_binary(value) and String.trim(value) != "", do: [], else: [{field, "can't be blank"}]
+      end)
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -379,6 +421,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:pi, Pi, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:antigravity, Antigravity, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -481,6 +524,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:pi, with: &Pi.changeset/2)
+    |> cast_embed(:antigravity, with: &Antigravity.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -521,13 +565,19 @@ defmodule SymphonyElixir.Config.Schema do
         | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
       }
 
+      antigravity = %{
+        settings.antigravity
+        | executable: resolve_optional_path_value(settings.antigravity.executable),
+          profile_root: resolve_optional_path_value(settings.antigravity.profile_root)
+      }
+
       codex = %{
         settings.codex
         | approval_policy: normalize_keys(settings.codex.approval_policy),
           turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
       }
 
-      {:ok, %{settings | tracker: tracker, workspace: workspace, codex: codex}}
+      {:ok, %{settings | tracker: tracker, workspace: workspace, antigravity: antigravity, codex: codex}}
     end
   end
 
@@ -619,6 +669,16 @@ defmodule SymphonyElixir.Config.Schema do
 
       path ->
         path
+    end
+  end
+
+  defp resolve_optional_path_value(nil), do: nil
+
+  defp resolve_optional_path_value(value) when is_binary(value) do
+    case normalize_path_token(value) do
+      :missing -> nil
+      "" -> nil
+      path -> path
     end
   end
 

@@ -16,10 +16,9 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Launches the selected execution backend inside the workspace (Codex app-server by default)
+4. Sends the backend a workflow prompt
+5. Keeps the selected agent working on the issue until the work is done
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
@@ -28,12 +27,22 @@ tools with configured host-side auth and removes declared tracker-token environm
 the Codex child, so the agent does not need a second tracker login.
 
 `agent.backend` defaults to `codex`. Set it to `pi` only when PiAgent is installed on the same
-local worker. The Pi backend is local-worker-only and runs its command through non-interactive
-`bash -lc`; on Windows, run Symphony and Pi inside the same WSL2 environment. On macOS, prefer a
+local worker. The Pi backend is local-worker-only and runs its command through non-interactive,
+non-login `bash -c`; on Windows, run Symphony and Pi inside the same WSL2 environment. On macOS, prefer a
 host-specific absolute Pi launcher when interactive shell PATH entries are not inherited. For Pi,
 Symphony uses Pi's native RPC/session lifecycle only: it does not inject tracker tools, a loopback
 bridge, or a host-side handoff into Pi. Configured tracker credential environment names are removed
 from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
+
+Set `agent.backend` to `antigravity` only on the accepted native Linux route. It is a local-only,
+opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
+`agy` executable and one explicit profile root. Symphony launches it through a mandatory
+Bubblewrap boundary: host root is read-only, the real user home and host `/run/user` are masked,
+only the issue workspace and selected profile root are host-writable, the exact AGY executable is
+projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony` runtime metadata is
+read-only to the child, and native `--sandbox` remains enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
+usage, or permission/input denial fails visibly. Codex remains the default and rollback path; Pi
+remains supported.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -157,6 +166,12 @@ pi:
   first_event_timeout_ms: 5000
   turn_timeout_ms: 3600000
   post_result_timeout_ms: 5000
+antigravity:
+  executable: $ANTIGRAVITY_EXECUTABLE
+  profile_root: $ANTIGRAVITY_PROFILE_ROOT
+  first_event_timeout_ms: 30000
+  turn_timeout_ms: 3600000
+  cancel_grace_ms: 1000
 codex:
   command: codex app-server
 ---
@@ -169,8 +184,9 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
-- `pi.command` defaults to `pi --mode rpc`. The command must resolve from non-interactive
-  `bash -lc`. Symphony does not pass `--provider`, `--model`, or `--thinking`: Pi inherits the
+- `pi.command` defaults to `pi --mode rpc`. The command must resolve from non-interactive,
+  non-login `bash -c`; shell startup files cannot reintroduce scrubbed tracker credentials.
+  Symphony does not pass `--provider`, `--model`, or `--thinking`: Pi inherits the
   operator's active `PI_CODING_AGENT_DIR` (or Pi's normal user profile) and therefore uses the same
   saved default model as an operator-opened Pi terminal. Symphony records the effective model and
   thinking level returned by `get_state`, and keeps only the worker session in a workspace-owned
@@ -186,6 +202,40 @@ Notes:
   On timeout Symphony sends a bounded native abort. On hosts with `setsid`, session shutdown then
   terminates the dedicated Pi process group, including descendants; other hosts retain bounded
   direct-child shutdown. The Pi fields fall back to the compatible Codex read/turn defaults when omitted.
+- `antigravity.executable` and `antigravity.profile_root` are required absolute paths when the
+  AntiGravity backend is selected. The executable must be outside both writable roots. The profile
+  root must be a dedicated directory: `/`, top-level or security-sensitive host trees (including
+  `/bin`, `/etc`, and `/usr`), broad aggregate roots such as `/var`, the real user home or its
+  ancestors, and roots overlapping the issue workspace are rejected. Specific descendants of the
+  canonical home, private temporary roots, or dedicated roots such as `/var/lib/agy-profile`
+  remain supported. Under the canonical home, `profile_root` uses exactly
+  `~/.agy-profiles/<slot>`, while the issue workspace uses a non-hidden,
+  non-credential/configuration path at least two components below home; each role rejects the
+  other's home shape. Symphony does not
+  rotate profiles or fall back to another backend.
+  AntiGravity SSH workers are rejected.
+- AntiGravity requires `/usr/bin/bwrap`. It runs with `--unshare-all --share-net --unshare-user
+  --disable-userns`, read-only `/`, private `/dev`, `/proc`, `/tmp`, and `/run/user`, and masks the
+  canonical real user home with a private tmpfs unless a broader private tmpfs already contains it.
+  Unrelated host-home contents, including host Git credentials, are unavailable. The selected profile
+  is the sole intentional credential-bearing exception and the only dedicated explicit read-write
+  host root besides the issue workspace. A single read-only bind projects the exact AGY executable
+  to a fixed private `/tmp` path; its installation directory is not separately bound, and a source
+  beneath the masked home remains hidden. The private mode-`0700` `XDG_RUNTIME_DIR` has no host
+  session D-Bus address, and the native process also receives
+  `--sandbox --mode accept-edits`; Symphony never adds `--add-dir`, `unsandboxed(...)`, or
+  `--dangerously-skip-permissions`. Trusted host wrappers are addressed under `/usr/bin`; tracker
+  credential names are removed before launch and the sandboxed child receives a small allowlisted
+  environment. Symlinked runtime metadata directories are rejected, metadata is read-only to the
+  child, and transient stderr/process-group files are removed during bounded shutdown.
+- `antigravity.first_event_timeout_ms` and `antigravity.turn_timeout_ms` are absolute from prompt
+  submission; protocol chatter cannot extend them. On timeout Symphony records local cancellation,
+  sends bounded `SIGINT`/`SIGTERM`/`SIGKILL`, and verifies the process group is empty.
+  `antigravity.cancel_grace_ms` bounds collection of a native terminal envelope after `SIGINT`.
+  Native `denied_actions` and `WAITING` are surfaced as input-required errors rather than silently
+  completed turns. Stdout frames are bounded and only reviewed protocol fields are forwarded to
+  orchestration callbacks. A requested continuation identity may never become a fresh-session
+  fallback.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -209,13 +259,12 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` is an explicit,
-  local-only opt-in in this fork; Pi workers configured with SSH hosts are rejected until a native
-  remote Pi transport is added.
+- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` and `antigravity`
+  are explicit, local-only opt-ins in this fork; configured SSH workers are rejected for both.
 - Pi completion waits for the authoritative `agent_settled` event; `agent_end` with `willRetry: false`
   is not treated as final evidence. Pi returns lifecycle outcomes and neutral session/runtime evidence
   only; it does not receive a tracker bridge, host handoff path, or receipt store.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
+- `agent.max_turns` caps how many back-to-back backend turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `agent.allowed_issue_identifiers` is an optional exact, case-sensitive issue-identifier allowlist.
   When omitted, all otherwise eligible issues remain eligible exactly as before. When present it must
@@ -255,9 +304,9 @@ Notes:
   workspace. Use `$VAR` so Symphony can keep the token out of the child environment.
 
 - For path values, `~` is expanded to the home directory.
-- For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
-  while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
-  launched shell.
+- For env-backed path values, use `$VAR`. `workspace.root`, `antigravity.executable`, and
+  `antigravity.profile_root` resolve `$VAR` before path handling, while `codex.command` stays a shell
+  command string and any `$VAR` expansion there happens in the launched shell.
 
 ```yaml
 tracker:
