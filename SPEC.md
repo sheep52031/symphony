@@ -560,10 +560,12 @@ Launch and protocol requirements:
   the same recovery evidence. A host lifecycle index independent of `workspace.root` MUST mirror
   active markers and resume intents so configuration reload cannot lose a hold. Host index keys MUST
   include a stable workflow scope as well as issue identity so unrelated repositories and tracker
-  instances cannot collide. Active-marker replacement and removal MUST verify workflow, issue,
-  workspace, event, binding, attempt, and resume-lineage ownership while holding an exclusive
-  marker lock; a resumed event may transfer ownership to exactly its authorized next terminal
-  event, but unrelated, stale, or concurrent owners MUST fail closed. Collisions MUST accept
+  instances cannot collide. Every dispatched writer MUST carry a non-null, monotonically reserved
+  attempt identity. Active-marker replacement and removal MUST verify workflow, issue, workspace,
+  event, binding, attempt, and an explicit predecessor-event lineage while holding an exclusive lock
+  on a stable ownership key independent of marker existence; a resumed event may transfer ownership
+  to exactly its authorized next terminal event, but unrelated, stale, cleared, or concurrent owners
+  MUST fail closed. Collisions MUST accept
   byte-identical receipts or fail closed without rewriting history. Only reviewed provider code, HTTP status, duration-shaped reset hint, and
   liveness fields MAY accompany the normalized reason. Raw messages, provider account identifiers,
   email addresses, tokens, OAuth payloads, usernames, and profile paths MUST NOT be retained.
@@ -879,13 +881,18 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - The service MUST verify the actual immutable-event, active-marker, resume-intent, and fault
   namespaces under the host lifecycle state root before enabling dispatch. Local/global mirrors are
   one evidence family: a partial family is a storage fault, never settled or authorized evidence.
-  A runtime lifecycle-storage fault MUST latch immediately at the update boundary, cancel queued
-  retries, and gate poll, timer, direct-dispatch, and resume paths until an operator repairs storage
-  and restarts.
+  A runtime lifecycle-storage fault MUST latch through one service-wide transition immediately at
+  the update or cleanup boundary, cancel queued retries, and gate poll, timer, direct-dispatch, and
+  resume paths until an operator repairs storage and restarts. Lifecycle settlement MUST
+  ownership-clear both a matching active-marker family and its storage-fault family; clearing only
+  one is not successful settlement.
 - Startup terminal cleanup and running-issue reconciliation remove each exact recorded workspace
   for an issue already in a terminal state before clearing that issue's ownership-checked active
   markers. Cleanup or marker settlement failure MUST stop startup or latch dispatch rather than
   silently release ownership.
+- A proven resumed writer that later crashes or stalls MUST become a new durably linked terminal
+  hold and MUST NOT enter ordinary retry. Another writer requires a fresh external binding and
+  create-once resume intent, and every retry entry point MUST pass through terminal recovery first.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

@@ -259,7 +259,8 @@ defmodule SymphonyElixir.Antigravity.Backend do
       attempt: Keyword.get(opts, :attempt),
       session_id: Map.get(details, :session_id) || Transport.session_id(session.transport),
       workspace: session.workspace,
-      binding_id: session.binding_id
+      binding_id: session.binding_id,
+      predecessor_event_id: Keyword.get(opts, :predecessor_event_id)
     }
 
     evidence = TerminalFailure.build(reason, Map.delete(details, :session_id), context)

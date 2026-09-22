@@ -45,6 +45,15 @@ defmodule SymphonyElixir.TerminalFailureTest do
     second = TerminalFailure.build(:provider_quota_exhausted, details, context)
 
     assert first.event_id == second.event_id
+
+    next_attempt =
+      TerminalFailure.build(
+        :provider_quota_exhausted,
+        details,
+        %{context | attempt: context.attempt + 1}
+      )
+
+    refute next_attempt.event_id == first.event_id
     refute Map.has_key?(first, :message)
     refute inspect(first) =~ "owner@example.com"
     refute inspect(first) =~ "secret-refresh-value"
@@ -228,6 +237,14 @@ defmodule SymphonyElixir.TerminalFailureTest do
     File.rm!(local_fault)
 
     assert {:ok, _path} = TerminalFailure.persist(workspace, evidence)
+
+    assert {:error, {:active_marker_owner_mismatch, _path}} =
+             TerminalFailure.settle_lifecycle(
+               workspace,
+               evidence.issue_id,
+               String.duplicate("f", 64)
+             )
+
     global_event = Path.join(state_root, "events/#{scoped_identity}-#{evidence.event_id}.json")
     global_active = Path.join(state_root, "active/#{scoped_identity}.json")
     event_bytes = File.read!(global_event)
@@ -442,7 +459,9 @@ defmodule SymphonyElixir.TerminalFailureTest do
     metadata_dir = Path.join(clear_workspace, ".symphony")
     File.chmod!(metadata_dir, 0o500)
 
-    assert {:error, {:active_marker_locked, _lock_path, :eacces}} =
+    marker = Path.join(clear_workspace, ".symphony/terminal-failure.json")
+
+    assert {:error, {^marker, :eacces}} =
              TerminalFailure.clear_active(
                clear_workspace,
                clear_evidence.issue_id,
@@ -683,10 +702,15 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_auth_failed,
         %{},
-        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "second-session",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
       )
 
-    assert {:error, {:active_marker_locked, _lock_path, :eacces}} =
+    assert {:error, {:active_marker_replace_failed, :eacces}} =
              TerminalFailure.persist(workspace, second)
 
     File.chmod!(metadata_dir, 0o700)
@@ -722,10 +746,15 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_auth_failed,
         %{provider_code: "UNAUTHENTICATED", http_status: 401},
-        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "second-session",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
       )
 
-    marker_lock = Path.join(workspace, ".symphony/terminal-failure.json.lock")
+    marker_lock = TerminalFailure.active_lock_path_for_test(workspace, context.issue_id)
     File.mkdir!(marker_lock)
 
     assert {:error, {:active_marker_locked, ^marker_lock, :eexist}} =
@@ -737,7 +766,12 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_network_unreachable,
         %{},
-        %{context | attempt: 1, session_id: "stale-session", binding_id: "slot-c"}
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "stale-session",
+          binding_id: "slot-c",
+          predecessor_event_id: first.event_id
+        })
       )
 
     assert {:error, :active_marker_owner_mismatch} =
@@ -747,7 +781,12 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_network_unreachable,
         %{},
-        %{context | attempt: 2, session_id: "wrong-attempt", binding_id: "slot-b"}
+        Map.merge(context, %{
+          attempt: 2,
+          session_id: "wrong-attempt",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
       )
 
     assert {:error, :active_marker_owner_mismatch} =
@@ -801,7 +840,12 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_auth_failed,
         %{},
-        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "second-session",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
       )
 
     assert {:error, {:active_marker_invalid, :eacces}} =
@@ -832,6 +876,50 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
     assert {:ok, _path} = TerminalFailure.persist(workspace, second)
     assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, second.event_id)
+  end
+
+  test "a cleared predecessor cannot be resurrected by a stale authorized successor" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-terminal-cleared-predecessor-#{System.unique_integer([:positive])}"
+      )
+
+    workspace = Path.join(root, "JARVIS-936")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    context = %{
+      backend: :antigravity,
+      issue_id: "cleared-predecessor",
+      issue_identifier: "JARVIS-936",
+      attempt: 0,
+      session_id: "first-session",
+      workspace: workspace,
+      binding_id: "slot-a"
+    }
+
+    first = TerminalFailure.build(:provider_quota_exhausted, %{}, context)
+    assert {:ok, _path} = TerminalFailure.persist(workspace, first)
+    assert {:ok, _path} = TerminalFailure.record_resume(workspace, first, "slot-b", 1)
+    assert :ok = TerminalFailure.clear_active(workspace, context.issue_id, first.event_id)
+
+    successor =
+      TerminalFailure.build(
+        :worker_crashed,
+        %{},
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "second-session",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
+      )
+
+    assert {:error, :active_marker_owner_mismatch} =
+             TerminalFailure.persist(workspace, successor)
+
+    assert :none = TerminalFailure.recovery_state(workspace, context.issue_id)
   end
 
   test "fallback marker ownership is transferred in place after storage recovers" do
@@ -871,7 +959,12 @@ defmodule SymphonyElixir.TerminalFailureTest do
       TerminalFailure.build(
         :provider_auth_failed,
         %{},
-        %{context | attempt: 1, session_id: "second-session", binding_id: "slot-b"}
+        Map.merge(context, %{
+          attempt: 1,
+          session_id: "second-session",
+          binding_id: "slot-b",
+          predecessor_event_id: first.event_id
+        })
       )
 
     assert {:ok, _receipt_path} = TerminalFailure.persist(workspace, second)

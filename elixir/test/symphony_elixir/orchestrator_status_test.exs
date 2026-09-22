@@ -210,19 +210,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              Orchestrator.snapshot(recovery_name, 1_000)
 
     assert recovered.disposition == :terminal_failure
-    assert recovered.recovery_state == :ambiguous
-    assert recovered.terminal_failure.event_id == evidence.event_id
-
-    assert {:error, :terminal_resume_recovery_ambiguous} =
-             Orchestrator.resume_terminal_attempt(
-               issue.id,
-               %{
-                 binding_id: "slot-c",
-                 backend: :antigravity,
-                 options: %{profile_root: profile}
-               },
-               recovery_name
-             )
+    assert recovered.recovery_state == :settled
+    assert recovered.terminal_failure.reason == :worker_crashed
+    assert recovered.terminal_failure.predecessor_event_id == evidence.event_id
+    refute recovered.terminal_failure.event_id == evidence.event_id
   end
 
   test "durable resume intent becomes ambiguous and cancels retry when no writer starts" do
@@ -685,6 +676,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       })
 
     assert {:ok, _path} = SymphonyElixir.TerminalFailure.persist(workspace, evidence)
+
+    assert {:ok, _path} =
+             SymphonyElixir.TerminalFailure.persist_storage_fault(
+               workspace,
+               evidence,
+               :active_marker_unavailable
+             )
+
+    assert {:storage_fault, %{event_id: event_id}} =
+             SymphonyElixir.TerminalFailure.recovery_state(workspace, active_issue.id)
+
+    assert event_id == evidence.event_id
     {:ok, task_pid} = Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> Process.sleep(:infinity) end)
     task_ref = Process.monitor(task_pid)
 

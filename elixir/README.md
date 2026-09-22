@@ -50,8 +50,9 @@ fields—never raw provider prose, account identifiers, tokens, OAuth payloads, 
 persists an immutable receipt plus a fail-closed active marker, with a workspace-root fallback and
 a workflow-scoped lifecycle index beside the configured log directory so workspace-root reloads
 cannot lose an active hold or collide with another tracker/repository instance. Active ownership is
-bound to the workflow, issue, workspace, event, binding, attempt, and resume lineage and is changed
-under an exclusive marker lock; stale or concurrent events cannot overwrite or clear a newer hold.
+bound to the workflow, issue, workspace, event, binding, monotonically reserved attempt, and an
+explicit predecessor event. It is changed under a stable ownership-key lock that exists independently
+of marker files; stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
 
@@ -70,7 +71,8 @@ validated launch binding. The backend must remain unchanged; for AntiGravity the
 is a dedicated absolute `profile_root`. Before any writer starts, Symphony durably records a
 non-secret resume-intent receipt. Only a backend-native session-start event from that authorized
 attempt completes the handoff; task creation, a queued retry, or any other unproven dispatch is
-cancelled and leaves the intent ambiguous. The new attempt
+cancelled and leaves the intent ambiguous. A proven resumed writer that later crashes or stalls is
+sealed as a new linked terminal hold instead of entering ordinary retry. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
@@ -80,8 +82,8 @@ clear failures are distinct lifecycle-storage blockers: the service schedules no
 immediately cancels queued retries and disables poll, timer, direct, and resume dispatch until an
 operator repairs storage and restarts. Startup probes the actual event, active, resume, and fault
 namespaces; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
-reconciliation remove the exact recorded workspace before ownership-checked marker removal. The
-JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or
+reconciliation remove the exact recorded workspace before ownership-checked settlement of both the
+active and storage-fault marker families. The JSON state API and dashboard expose a latched lifecycle-storage fault without revealing paths or
 provider secrets.
 
 ## How to use it

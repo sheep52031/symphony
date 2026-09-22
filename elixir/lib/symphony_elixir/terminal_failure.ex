@@ -41,6 +41,7 @@ defmodule SymphonyElixir.TerminalFailure do
           required(:session_id) => String.t() | nil,
           required(:workspace) => Path.t(),
           required(:binding_id) => String.t() | nil,
+          required(:predecessor_event_id) => String.t() | nil,
           required(:occurred_at) => String.t(),
           optional(:provider_code) => String.t(),
           optional(:http_status) => non_neg_integer(),
@@ -64,6 +65,7 @@ defmodule SymphonyElixir.TerminalFailure do
       session_id: bounded_optional(Map.get(context, :session_id), 256),
       workspace: bounded_required(Map.fetch!(context, :workspace), 4_096),
       binding_id: bounded_optional(Map.get(context, :binding_id), 256),
+      predecessor_event_id: bounded_optional(Map.get(context, :predecessor_event_id), 64),
       occurred_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
@@ -202,6 +204,26 @@ defmodule SymphonyElixir.TerminalFailure do
     clear_fault_paths(storage_fault_paths(workspace, issue_id), expected_event_id)
   end
 
+  @spec settle_lifecycle(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def settle_lifecycle(workspace, issue_id, expected_event_id)
+      when is_binary(workspace) and is_binary(issue_id) and is_binary(expected_event_id) do
+    scope = active_marker_scope(workspace, issue_id, expected_event_id)
+    paths = active_paths(workspace, issue_id, scope)
+
+    with_active_marker_locks(paths, fn ->
+      case clear_paths(paths, expected_event_id) do
+        :ok ->
+          clear_fault_paths(
+            storage_fault_paths(workspace, issue_id, scope),
+            expected_event_id
+          )
+
+        {:error, _reason} = error ->
+          error
+      end
+    end)
+  end
+
   defp clear_paths(paths, expected_event_id) do
     Enum.reduce_while(paths, :ok, fn path, :ok ->
       case read_active_event_id(path) do
@@ -325,7 +347,10 @@ defmodule SymphonyElixir.TerminalFailure do
           occurred_at: occurred_at
         } = evidence
       ) do
+    predecessor_event_id = Map.get(evidence, :predecessor_event_id)
+
     valid_hash?(event_id) and valid_hash?(Map.get(evidence, :workflow_scope)) and
+      (is_nil(predecessor_event_id) or valid_hash?(predecessor_event_id)) and
       valid_reason?(reason, category) and valid_backend?(backend) and
       is_binary(workspace) and workspace != "" and is_binary(occurred_at)
   end
@@ -515,6 +540,7 @@ defmodule SymphonyElixir.TerminalFailure do
       session_id: bounded_optional(Map.get(decoded, "session_id"), 256),
       workspace: bounded_required(Map.get(decoded, "workspace"), 4_096),
       binding_id: bounded_optional(Map.get(decoded, "binding_id"), 256),
+      predecessor_event_id: bounded_optional(Map.get(decoded, "predecessor_event_id"), 64),
       occurred_at: Map.get(decoded, "occurred_at")
     }
 
@@ -707,14 +733,22 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp validate_existing_active_paths(paths, payload, evidence) do
-    paths
-    |> Enum.filter(&File.regular?/1)
-    |> Enum.reduce_while(:ok, fn path, :ok ->
-      case active_transfer_allowed?(path, payload, evidence) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
+    existing = Enum.filter(paths, &File.regular?/1)
+
+    if is_binary(Map.get(evidence, :predecessor_event_id)) and existing == [] do
+      {:error, :active_marker_owner_mismatch}
+    else
+      Enum.reduce_while(existing, :ok, fn path, :ok ->
+        active_transfer_reducer(path, payload, evidence)
+      end)
+    end
+  end
+
+  defp active_transfer_reducer(path, payload, evidence) do
+    case active_transfer_allowed?(path, payload, evidence) do
+      :ok -> {:cont, :ok}
+      {:error, _reason} = error -> {:halt, error}
+    end
   end
 
   defp active_transfer_allowed?(path, payload, evidence) do
@@ -729,6 +763,7 @@ defmodule SymphonyElixir.TerminalFailure do
     with {:ok, decoded} <- Jason.decode(contents),
          {:ok, prior} <- decode_evidence(decoded),
          true <- same_active_owner?(prior, evidence),
+         true <- evidence.predecessor_event_id == prior.event_id,
          true <- resumed_event?(prior, evidence) do
       :ok
     else
@@ -857,12 +892,16 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  @doc false
+  @spec active_lock_path_for_test(Path.t(), String.t()) :: Path.t()
+  def active_lock_path_for_test(workspace, issue_id) do
+    workspace
+    |> active_paths(issue_id)
+    |> ownership_lock_path()
+  end
+
   defp with_active_marker_locks(paths, operation) do
-    lock_paths =
-      paths
-      |> Enum.filter(&File.regular?/1)
-      |> Enum.map(&"#{&1}.lock")
-      |> Enum.sort()
+    lock_paths = [ownership_lock_path(paths)]
 
     case acquire_marker_locks(lock_paths, []) do
       {:ok, acquired} ->
@@ -876,6 +915,11 @@ defmodule SymphonyElixir.TerminalFailure do
         release_marker_locks(acquired)
         {:error, reason}
     end
+  end
+
+  defp ownership_lock_path(paths) do
+    ownership_key = paths |> Enum.map(&Path.expand/1) |> Enum.sort() |> Enum.join("\u0000") |> identity_hash()
+    Path.join(state_root(), "locks/#{ownership_key}.lock")
   end
 
   defp acquire_marker_locks([], acquired), do: {:ok, acquired}
