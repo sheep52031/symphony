@@ -57,6 +57,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert String.starts_with?(Path.basename(first_workspace), "MT_Det--")
   end
 
+  test "recorded workspace reuse is exact and independent of a reloaded workspace root" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-recorded-workspace-#{System.unique_integer([:positive])}"
+      )
+
+    old_root = Path.join(root, "old")
+    new_root = Path.join(root, "new")
+    issue = %Issue{id: "issue-recorded", identifier: "MT-RECORDED"}
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: old_root)
+      assert {:ok, recorded} = Workspace.create_for_issue(issue)
+      File.write!(Path.join(recorded, "dirty.txt"), "preserve\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: new_root)
+      assert {:ok, ^recorded} = Workspace.open_recorded_for_issue(recorded, issue, nil)
+      assert File.read!(Path.join(recorded, "dirty.txt")) == "preserve\n"
+      refute File.exists?(Path.join(new_root, issue.identifier))
+
+      assert {:error, {:recorded_workspace_issue_mismatch, ^recorded, "OTHER"}} =
+               Workspace.open_recorded_for_issue(recorded, "OTHER", nil)
+
+      missing = Path.join(old_root, "MT-MISSING")
+
+      assert {:error, {:recorded_workspace_missing, ^missing}} =
+               Workspace.open_recorded_for_issue(missing, "MT-MISSING", nil)
+
+      assert {:error, {:workspace_path_unreadable, "relative", :not_absolute}} =
+               Workspace.open_recorded_for_issue("relative", "relative", nil)
+
+      assert {:error, {:recorded_workspace_remote_resume_unsupported, "worker-a"}} =
+               Workspace.open_recorded_for_issue(recorded, issue, "worker-a")
+    after
+      File.rm_rf(root)
+    end
+  end
+
   test "relative local workspace roots resolve from the workflow directory" do
     workflow_dir = Path.dirname(Workflow.workflow_file_path())
     launcher_dir = Path.join(System.tmp_dir!(), "symphony-elixir-launcher-#{System.unique_integer([:positive])}")

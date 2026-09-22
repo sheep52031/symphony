@@ -2,12 +2,11 @@ defmodule SymphonyElixir.TerminalFailure do
   @moduledoc """
   Provider-neutral, bounded terminal evidence emitted after a worker attempt can no longer continue.
 
-  Provider adapters classify native failures. This module only validates the shared reason set,
-  removes common secret-bearing values, binds correlation fields, and persists an idempotent receipt
-  inside the existing issue workspace.
+  Provider adapters classify native failures. This module retains only reviewed structured fields,
+  binds correlation fields, and persists immutable receipts plus a fail-closed active marker. Raw
+  provider prose, account identifiers, profile paths, and credential payloads are never retained.
   """
 
-  @max_message_bytes 2_048
   @max_hint_bytes 128
   @reasons [
     :provider_quota_exhausted,
@@ -45,7 +44,6 @@ defmodule SymphonyElixir.TerminalFailure do
           optional(:provider_code) => String.t(),
           optional(:http_status) => non_neg_integer(),
           optional(:reset_hint) => String.t(),
-          optional(:message) => String.t(),
           optional(:liveness) => atom()
         }
 
@@ -62,17 +60,16 @@ defmodule SymphonyElixir.TerminalFailure do
       issue_identifier: bounded_optional(Map.get(context, :issue_identifier), 256),
       attempt: normalize_attempt(Map.get(context, :attempt)),
       session_id: bounded_optional(Map.get(context, :session_id), 256),
-      workspace: Map.fetch!(context, :workspace),
+      workspace: bounded_required(Map.fetch!(context, :workspace), 4_096),
       binding_id: bounded_optional(Map.get(context, :binding_id), 256),
       occurred_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
     evidence =
       evidence
-      |> maybe_put(:provider_code, bounded_optional(Map.get(details, :provider_code), 128))
+      |> maybe_put(:provider_code, normalize_provider_code(Map.get(details, :provider_code)))
       |> maybe_put(:http_status, normalize_http_status(Map.get(details, :http_status)))
-      |> maybe_put(:reset_hint, bounded_optional(Map.get(details, :reset_hint), @max_hint_bytes))
-      |> maybe_put(:message, sanitize_message(Map.get(details, :message)))
+      |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(details, :reset_hint)))
       |> maybe_put(:liveness, normalize_liveness(Map.get(details, :liveness)))
 
     Map.put(evidence, :event_id, event_id(evidence))
@@ -81,14 +78,14 @@ defmodule SymphonyElixir.TerminalFailure do
   @spec persist(Path.t(), evidence()) :: {:ok, Path.t()} | {:error, term()}
   def persist(workspace, %{event_id: event_id} = evidence)
       when is_binary(workspace) and is_binary(event_id) do
-    directory = Path.join(workspace, ".symphony/terminal-events")
-    receipt_path = Path.join(directory, "#{event_id}.json")
-    latest_path = Path.join(workspace, ".symphony/terminal-failure.json")
-
     with {:ok, payload} <- Jason.encode(json_safe(evidence), pretty: true),
-         :ok <- File.mkdir_p(directory),
-         :ok <- atomic_write(receipt_path, payload),
-         :ok <- atomic_write(latest_path, payload) do
+         {:ok, receipt_path} <-
+           persist_immutable_candidates(
+             event_receipt_paths(workspace, evidence.issue_id, event_id),
+             payload
+           ),
+         {:ok, _active_path} <-
+           persist_replace_candidates(active_paths(workspace, evidence.issue_id), payload) do
       {:ok, receipt_path}
     end
   end
@@ -96,75 +93,54 @@ defmodule SymphonyElixir.TerminalFailure do
   @spec recovery_state(Path.t()) ::
           :none | {:settled, evidence()} | {:ambiguous, evidence()} | {:error, term()}
   def recovery_state(workspace) when is_binary(workspace) do
-    active_path = Path.join(workspace, ".symphony/terminal-failure.json")
-
-    case File.read(active_path) do
-      {:ok, contents} -> decode_recovery_state(workspace, contents)
-      {:error, :enoent} -> :none
-      {:error, reason} -> {:error, reason}
-    end
+    read_active(active_paths(workspace, nil), workspace, nil)
   end
 
-  defp decode_recovery_state(workspace, contents) do
-    with {:ok, decoded} <- Jason.decode(contents),
-         {:ok, evidence} <- decode_evidence(decoded) do
-      recovery_disposition(workspace, evidence)
-    end
+  @spec recovery_state(Path.t(), String.t()) ::
+          :none | {:settled, evidence()} | {:ambiguous, evidence()} | {:error, term()}
+  def recovery_state(workspace, issue_id) when is_binary(workspace) and is_binary(issue_id) do
+    read_active(active_paths(workspace, issue_id), workspace, nil)
   end
 
-  defp recovery_disposition(workspace, evidence) do
-    resume_path =
-      Path.join(workspace, ".symphony/terminal-resumes/#{evidence.event_id}.json")
+  @spec clear_active(Path.t(), String.t() | nil) :: :ok | {:error, term()}
+  def clear_active(workspace, issue_id \\ nil) when is_binary(workspace) do
+    {local_paths, global_paths} = Enum.split(active_paths(workspace, issue_id), 2)
 
-    if File.regular?(resume_path),
-      do: {:ambiguous, evidence},
-      else: {:settled, evidence}
-  end
-
-  @spec clear_active(Path.t()) :: :ok | {:error, term()}
-  def clear_active(workspace) when is_binary(workspace) do
-    case File.rm(Path.join(workspace, ".symphony/terminal-failure.json")) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
+    case clear_paths(local_paths) do
+      :ok -> clear_paths(global_paths)
       {:error, _reason} = error -> error
     end
   end
 
+  defp clear_paths(paths) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      case File.rm(path) do
+        :ok -> {:cont, :ok}
+        {:error, :enoent} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {path, reason}}}
+      end
+    end)
+  end
+
   @spec record_resume(Path.t(), evidence(), String.t(), non_neg_integer()) ::
           {:ok, Path.t()} | {:error, term()}
-  def record_resume(workspace, %{event_id: event_id}, binding_id, attempt)
+  def record_resume(workspace, %{event_id: event_id} = evidence, binding_id, attempt)
       when is_binary(workspace) and is_binary(event_id) and is_binary(binding_id) and
              is_integer(attempt) and attempt >= 0 do
-    directory = Path.join(workspace, ".symphony/terminal-resumes")
-    receipt_path = Path.join(directory, "#{event_id}.json")
-
     receipt = %{
       "terminal_event_id" => event_id,
-      "binding_id" => binding_id,
+      "binding_id" => bounded_required(binding_id, 256),
       "attempt" => attempt,
       "resumed_at" => DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
-    with {:ok, payload} <- Jason.encode(receipt, pretty: true),
-         :ok <- File.mkdir_p(directory),
-         :ok <- atomic_write(receipt_path, payload) do
-      {:ok, receipt_path}
+    with {:ok, payload} <- Jason.encode(receipt, pretty: true) do
+      persist_immutable_candidates(
+        resume_receipt_paths(workspace, evidence.issue_id, event_id),
+        payload
+      )
     end
   end
-
-  @spec sanitize_message(term()) :: String.t() | nil
-  def sanitize_message(message) when is_binary(message) do
-    message
-    |> String.replace(~r/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/u, "[REDACTED_EMAIL]")
-    |> String.replace(
-      ~r/(?i)\b(bearer|oauth[_-]?(?:token|payload|code)|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|password|credential)\b\s*[:=]?\s*[^\s,;]+/u,
-      "\\1=[REDACTED]"
-    )
-    |> String.replace(~r/\beyJ[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]+){1,2}\b/u, "[REDACTED_TOKEN]")
-    |> bounded(@max_message_bytes)
-  end
-
-  def sanitize_message(_message), do: nil
 
   @spec valid?(term()) :: boolean()
   def valid?(%{
@@ -176,11 +152,38 @@ defmodule SymphonyElixir.TerminalFailure do
         occurred_at: occurred_at
       }) do
     is_binary(event_id) and byte_size(event_id) == 64 and reason in @reasons and
-      is_binary(category) and is_atom(backend) and is_binary(workspace) and workspace != "" and
-      is_binary(occurred_at)
+      category == category(reason) and is_atom(backend) and not is_nil(backend) and
+      is_binary(workspace) and workspace != "" and is_binary(occurred_at)
   end
 
   def valid?(_evidence), do: false
+
+  defp read_active([], _workspace, nil), do: :none
+  defp read_active([], _workspace, error), do: {:error, error}
+
+  defp read_active([path | rest], workspace, prior_error) do
+    case File.read(path) do
+      {:ok, contents} -> decode_recovery_state(workspace, contents)
+      {:error, :enoent} -> read_active(rest, workspace, prior_error)
+      {:error, reason} -> read_active(rest, workspace, prior_error || {path, reason})
+    end
+  end
+
+  defp decode_recovery_state(workspace, contents) do
+    with {:ok, decoded} <- Jason.decode(contents),
+         {:ok, evidence} <- decode_evidence(decoded) do
+      recovery_disposition(workspace, evidence)
+    end
+  end
+
+  defp recovery_disposition(workspace, evidence) do
+    if Enum.any?(
+         resume_receipt_paths(workspace, evidence.issue_id, evidence.event_id),
+         &File.regular?/1
+       ),
+       do: {:ambiguous, evidence},
+       else: {:settled, evidence}
+  end
 
   defp decode_evidence(decoded) when is_map(decoded) do
     reason = decode_reason(Map.get(decoded, "reason"))
@@ -192,26 +195,27 @@ defmodule SymphonyElixir.TerminalFailure do
       reason: reason,
       category: Map.get(decoded, "category"),
       backend: backend,
-      issue_id: Map.get(decoded, "issue_id"),
-      issue_identifier: Map.get(decoded, "issue_identifier"),
-      attempt: Map.get(decoded, "attempt"),
-      session_id: Map.get(decoded, "session_id"),
-      workspace: Map.get(decoded, "workspace"),
-      binding_id: Map.get(decoded, "binding_id"),
+      issue_id: bounded_optional(Map.get(decoded, "issue_id"), 256),
+      issue_identifier: bounded_optional(Map.get(decoded, "issue_identifier"), 256),
+      attempt: normalize_attempt(Map.get(decoded, "attempt")),
+      session_id: bounded_optional(Map.get(decoded, "session_id"), 256),
+      workspace: bounded_required(Map.get(decoded, "workspace"), 4_096),
+      binding_id: bounded_optional(Map.get(decoded, "binding_id"), 256),
       occurred_at: Map.get(decoded, "occurred_at")
     }
 
     evidence =
       evidence
-      |> maybe_put(:provider_code, bounded_optional(Map.get(decoded, "provider_code"), 128))
+      |> maybe_put(:provider_code, normalize_provider_code(Map.get(decoded, "provider_code")))
       |> maybe_put(:http_status, normalize_http_status(Map.get(decoded, "http_status")))
-      |> maybe_put(:reset_hint, bounded_optional(Map.get(decoded, "reset_hint"), @max_hint_bytes))
-      |> maybe_put(:message, sanitize_message(Map.get(decoded, "message")))
+      |> maybe_put(:reset_hint, normalize_reset_hint(Map.get(decoded, "reset_hint")))
       |> maybe_put(:liveness, liveness)
 
     if valid?(evidence) and event_id(evidence) == evidence.event_id,
       do: {:ok, evidence},
       else: {:error, :invalid_terminal_failure_receipt}
+  rescue
+    ArgumentError -> {:error, :invalid_terminal_failure_receipt}
   end
 
   defp decode_evidence(_decoded), do: {:error, :invalid_terminal_failure_receipt}
@@ -250,8 +254,133 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
-  defp atomic_write(path, payload) do
-    temp_path = "#{path}.tmp-#{System.unique_integer([:positive, :monotonic])}"
+  defp event_receipt_paths(workspace, issue_id, event_id) do
+    local_paths = [
+      Path.join(workspace, ".symphony/terminal-events/#{event_id}.json"),
+      Path.join(fallback_root(workspace), "events/#{workspace_hash(workspace)}-#{event_id}.json")
+    ]
+
+    if is_binary(issue_id) and issue_id != "" do
+      local_paths ++ [Path.join(state_root(), "events/#{identity_hash(issue_id)}-#{event_id}.json")]
+    else
+      local_paths
+    end
+  end
+
+  defp active_paths(workspace, issue_id) do
+    local_paths = [
+      Path.join(workspace, ".symphony/terminal-failure.json"),
+      Path.join(fallback_root(workspace), "active/#{workspace_hash(workspace)}.json")
+    ]
+
+    if is_binary(issue_id) and issue_id != "" do
+      local_paths ++ [Path.join(state_root(), "active/#{identity_hash(issue_id)}.json")]
+    else
+      local_paths
+    end
+  end
+
+  defp resume_receipt_paths(workspace, issue_id, event_id) do
+    local_paths = [
+      Path.join(workspace, ".symphony/terminal-resumes/#{event_id}.json"),
+      Path.join(fallback_root(workspace), "resumes/#{workspace_hash(workspace)}-#{event_id}.json")
+    ]
+
+    if is_binary(issue_id) and issue_id != "" do
+      local_paths ++
+        [Path.join(state_root(), "resumes/#{identity_hash(issue_id)}-#{event_id}.json")]
+    else
+      local_paths
+    end
+  end
+
+  defp fallback_root(workspace), do: Path.join(Path.dirname(Path.expand(workspace)), ".symphony/terminal-holds")
+
+  defp state_root do
+    Application.get_env(:symphony_elixir, :terminal_state_root) ||
+      Application.get_env(
+        :symphony_elixir,
+        :log_file,
+        SymphonyElixir.LogFile.default_log_file()
+      )
+      |> Path.dirname()
+      |> Path.join("terminal-holds")
+  end
+
+  defp identity_hash(identity) do
+    identity
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp workspace_hash(workspace) do
+    workspace
+    |> Path.expand()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp persist_immutable_candidates(paths, payload),
+    do: persist_mirrored(paths, &atomic_create(&1, payload), :immutable_receipt_unavailable)
+
+  defp persist_replace_candidates(paths, payload),
+    do: persist_mirrored(paths, &atomic_replace(&1, payload), :active_marker_unavailable)
+
+  defp persist_mirrored(paths, writer, error_tag) do
+    {local_paths, global_paths} = Enum.split(paths, 2)
+
+    with {:ok, selected_path} <- persist_candidates(local_paths, writer, error_tag),
+         :ok <- persist_required(global_paths, writer, error_tag) do
+      {:ok, selected_path}
+    end
+  end
+
+  defp persist_required(paths, writer, error_tag) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      result = with :ok <- File.mkdir_p(Path.dirname(path)), do: writer.(path)
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {error_tag, path, reason}}}
+      end
+    end)
+  end
+
+  defp persist_candidates(paths, writer, error_tag) do
+    Enum.reduce_while(paths, {:error, {error_tag, :no_path}}, fn path, _last_error ->
+      result = with :ok <- File.mkdir_p(Path.dirname(path)), do: writer.(path)
+
+      case result do
+        :ok -> {:halt, {:ok, path}}
+        {:error, :receipt_conflict} = error -> {:halt, error}
+        {:error, reason} -> {:cont, {:error, {error_tag, path, reason}}}
+      end
+    end)
+  end
+
+  defp atomic_create(path, payload) do
+    case File.write(path, payload, [:exclusive, :sync]) do
+      :ok ->
+        File.chmod(path, 0o600)
+
+      {:error, :eexist} ->
+        existing_receipt_result(path, payload)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp existing_receipt_result(path, payload) do
+    cond do
+      not File.regular?(path) -> {:error, :invalid_receipt_target}
+      File.read(path) == {:ok, payload} -> :ok
+      true -> {:error, :receipt_conflict}
+    end
+  end
+
+  defp atomic_replace(path, payload) do
+    temp_path = temp_path(path)
 
     with :ok <- File.write(temp_path, payload),
          :ok <- File.chmod(temp_path, 0o600),
@@ -264,6 +393,8 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  defp temp_path(path), do: "#{path}.tmp-#{System.unique_integer([:positive, :monotonic])}"
+
   defp json_safe(value) when is_map(value) do
     Map.new(value, fn {key, nested} -> {to_string(key), json_safe(nested)} end)
   end
@@ -271,19 +402,54 @@ defmodule SymphonyElixir.TerminalFailure do
   defp json_safe(value) when is_atom(value), do: Atom.to_string(value)
   defp json_safe(value), do: value
 
+  defp bounded_required(value, max_bytes) when is_binary(value), do: bounded(value, max_bytes)
+  defp bounded_required(_value, _max_bytes), do: raise(ArgumentError, "required evidence string is invalid")
+
   defp bounded_optional(value, max_bytes) when is_binary(value) and value != "",
     do: bounded(value, max_bytes)
 
   defp bounded_optional(_value, _max_bytes), do: nil
 
-  defp bounded(value, max_bytes) when byte_size(value) <= max_bytes, do: value
-  defp bounded(value, max_bytes), do: binary_part(value, 0, max_bytes)
+  defp bounded(value, max_bytes) do
+    value = if String.valid?(value), do: value, else: "[INVALID_UTF8]"
+
+    if byte_size(value) <= max_bytes do
+      value
+    else
+      value
+      |> String.graphemes()
+      |> Enum.reduce_while({[], 0}, &bounded_grapheme(&1, &2, max_bytes))
+      |> elem(0)
+      |> Enum.reverse()
+      |> IO.iodata_to_binary()
+    end
+  end
+
+  defp bounded_grapheme(grapheme, {parts, bytes}, max_bytes) do
+    next_bytes = bytes + byte_size(grapheme)
+
+    if next_bytes <= max_bytes,
+      do: {:cont, {[grapheme | parts], next_bytes}},
+      else: {:halt, {parts, bytes}}
+  end
 
   defp normalize_attempt(value) when is_integer(value) and value >= 0, do: value
   defp normalize_attempt(_value), do: nil
 
+  defp normalize_provider_code(value) when value in ["RESOURCE_EXHAUSTED", "UNAUTHENTICATED", "PERMISSION_DENIED", "UNAVAILABLE"],
+    do: value
+
+  defp normalize_provider_code(_value), do: nil
+
   defp normalize_http_status(value) when is_integer(value) and value in 100..599, do: value
   defp normalize_http_status(_value), do: nil
+
+  defp normalize_reset_hint(value) when is_binary(value) do
+    value = bounded(value, @max_hint_bytes)
+    if Regex.match?(~r/\A[0-9]+(?:\s*[smhd])(?:\s*[0-9]+\s*[smhd]){0,3}\z/i, value), do: value
+  end
+
+  defp normalize_reset_hint(_value), do: nil
 
   defp normalize_liveness(value)
        when value in [:alive_but_thinking, :semantically_stuck, :dead_or_unreachable],

@@ -1070,7 +1070,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     workspace = Path.join(Config.local_workspace_root(), Workspace.workspace_key(issue))
 
-    case SymphonyElixir.TerminalFailure.recovery_state(workspace) do
+    case SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id) do
       :none ->
         dispatch_issue_without_terminal_marker(
           state,
@@ -1111,8 +1111,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp recover_terminal_failure(state, issue, workspace, evidence, recovery_state) do
-    if evidence.issue_id == issue.id and evidence.issue_identifier == issue.identifier and
-         evidence.workspace == workspace do
+    with true <- evidence.issue_id == issue.id,
+         true <- evidence.issue_identifier == issue.identifier,
+         {:ok, recorded_workspace} <-
+           Workspace.open_recorded_for_issue(evidence.workspace, issue, nil) do
       reason =
         case recovery_state do
           :settled -> "recovered settled terminal failure: #{evidence.reason}"
@@ -1128,7 +1130,7 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: issue.identifier,
         issue: issue,
         worker_host: nil,
-        workspace_path: workspace,
+        workspace_path: recorded_workspace,
         session_id: evidence.session_id,
         backend: evidence.backend,
         disposition: :terminal_failure,
@@ -1151,7 +1153,7 @@ defmodule SymphonyElixir.Orchestrator do
           attempts: Map.put_new(state.attempts, issue.id, max((evidence.attempt || 0) + 1, 1))
       }
     else
-      recover_invalid_terminal_failure(state, issue, workspace, :identity_mismatch)
+      _reason -> recover_invalid_terminal_failure(state, issue, workspace, :identity_mismatch)
     end
   end
 
@@ -1206,7 +1208,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, binding) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, binding, workspace_path \\ nil) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1215,30 +1217,30 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding, workspace_path)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding, workspace_path) do
     if issue_identifier_allowed?(issue.identifier) do
-      spawn_allowed_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding)
+      spawn_allowed_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding, workspace_path)
     else
       Logger.warning("Skipping agent spawn; issue identifier is not allowed: #{issue_context(issue)}")
       state
     end
   end
 
-  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding) do
+  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding, workspace_path) do
     case reserve_issue_attempt(state, issue) do
       {:ok, state} ->
-        spawn_reserved_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding)
+        spawn_reserved_issue_on_worker_host(state, issue, attempt, recipient, worker_host, binding, workspace_path)
 
       {:exhausted, state} ->
         block_issue_from_retry(state, issue.id, %{issue: issue, identifier: issue.identifier}, :attempt_limit_hold)
     end
   end
 
-  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding) do
+  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, binding, workspace_path) do
     backend_name = binding_backend_name(binding, Config.settings!().agent.backend)
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
@@ -1248,7 +1250,8 @@ defmodule SymphonyElixir.Orchestrator do
              attempt: attempt,
              worker_host: worker_host,
              backend: backend_name,
-             binding: binding
+             binding: binding,
+             workspace_path: workspace_path
            )
          end) do
       {:ok, pid} ->
@@ -1266,7 +1269,7 @@ defmodule SymphonyElixir.Orchestrator do
             binding: binding,
             binding_id: binding_id(binding),
             worker_host: worker_host,
-            workspace_path: nil,
+            workspace_path: workspace_path,
             session_id: nil,
             terminal_failure: nil,
             last_codex_message: nil,
@@ -1303,7 +1306,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host,
-          binding: binding
+          binding: binding,
+          workspace_path: workspace_path
         })
     end
   end
@@ -1532,7 +1536,8 @@ defmodule SymphonyElixir.Orchestrator do
              refreshed_issue,
              attempt,
              metadata[:worker_host],
-             metadata[:binding]
+             metadata[:binding],
+             metadata[:workspace_path]
            )}
 
         {:skip, :missing} ->
@@ -1817,63 +1822,99 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminal_receipt_matches?(blocked_entry) do
     expected = Map.get(blocked_entry, :terminal_failure)
 
-    case SymphonyElixir.TerminalFailure.recovery_state(Map.get(blocked_entry, :workspace_path)) do
+    case SymphonyElixir.TerminalFailure.recovery_state(
+           Map.get(blocked_entry, :workspace_path),
+           expected.issue_id
+         ) do
       {:settled, %{event_id: event_id}} -> event_id == expected.event_id
       _ -> false
     end
   end
 
   defp resume_terminal_issue(state, issue, blocked_entry, binding, attempt) do
-    candidate_state = %{state | blocked: Map.delete(state.blocked, issue.id)}
+    evidence = Map.fetch!(blocked_entry, :terminal_failure)
 
-    next_state =
-      do_dispatch_issue(
-        candidate_state,
-        issue,
-        attempt,
-        Map.get(blocked_entry, :worker_host),
-        binding
-      )
+    case SymphonyElixir.TerminalFailure.record_resume(
+           blocked_entry.workspace_path,
+           evidence,
+           binding.binding_id,
+           attempt
+         ) do
+      {:ok, receipt_path} ->
+        candidate_state = %{state | blocked: Map.delete(state.blocked, issue.id)}
 
-    disposition =
-      cond do
-        Map.has_key?(next_state.running, issue.id) -> :running
-        Map.has_key?(next_state.retry_attempts, issue.id) -> :retry_queued
-        true -> nil
-      end
+        next_state =
+          do_dispatch_issue(
+            candidate_state,
+            issue,
+            attempt,
+            Map.get(blocked_entry, :worker_host),
+            binding,
+            blocked_entry.workspace_path
+          )
 
-    if disposition do
-      evidence = Map.fetch!(blocked_entry, :terminal_failure)
+        disposition =
+          cond do
+            Map.has_key?(next_state.running, issue.id) -> :running
+            Map.has_key?(next_state.retry_attempts, issue.id) -> :retry_queued
+            true -> nil
+          end
 
-      receipt_result =
-        SymphonyElixir.TerminalFailure.record_resume(
-          blocked_entry.workspace_path,
-          evidence,
-          binding.binding_id,
-          attempt
+        if disposition do
+          Logger.info(
+            "Accepted externally selected terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} attempt=#{attempt} disposition=#{disposition}"
+          )
+
+          {:reply,
+           {:ok,
+            %{
+              issue_id: issue.id,
+              issue_identifier: issue.identifier,
+              prior_event_id: evidence.event_id,
+              binding_id: binding.binding_id,
+              backend: binding.backend,
+              workspace_path: blocked_entry.workspace_path,
+              attempt: attempt,
+              disposition: disposition,
+              receipt_path: receipt_path
+            }}, next_state}
+        else
+          ambiguous = Map.put(blocked_entry, :recovery_state, :ambiguous)
+          blocked = Map.put(state.blocked, issue.id, ambiguous)
+          {:reply, {:error, :terminal_resume_dispatch_rejected}, %{state | blocked: blocked}}
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "Rejected terminal resume because authorization receipt was not durable issue_id=#{issue.id} issue_identifier=#{issue.identifier} binding_id=#{binding.binding_id} error=#{inspect(stable_terminal_error(reason))}"
         )
 
-      Logger.info(
-        "Accepted externally selected terminal resume issue_id=#{issue.id} issue_identifier=#{issue.identifier} prior_event_id=#{evidence.event_id} binding_id=#{binding.binding_id} attempt=#{attempt} disposition=#{disposition}"
-      )
+        failed_state = mark_resume_ambiguous_if_durable(state, issue.id, blocked_entry)
 
-      {:reply,
-       {:ok,
-        %{
-          issue_id: issue.id,
-          issue_identifier: issue.identifier,
-          prior_event_id: evidence.event_id,
-          binding_id: binding.binding_id,
-          backend: binding.backend,
-          workspace_path: blocked_entry.workspace_path,
-          attempt: attempt,
-          disposition: disposition,
-          receipt: receipt_result
-        }}, next_state}
-    else
-      {:reply, {:error, :terminal_resume_dispatch_rejected}, state}
+        {:reply, {:error, {:terminal_resume_receipt_failed, stable_terminal_error(reason)}}, failed_state}
     end
   end
+
+  defp mark_resume_ambiguous_if_durable(state, issue_id, blocked_entry) do
+    case SymphonyElixir.TerminalFailure.recovery_state(
+           blocked_entry.workspace_path,
+           issue_id
+         ) do
+      {:ambiguous, _evidence} ->
+        blocked =
+          Map.update!(state.blocked, issue_id, &Map.put(&1, :recovery_state, :ambiguous))
+
+        %{state | blocked: blocked}
+
+      _other ->
+        state
+    end
+  end
+
+  defp stable_terminal_error(reason) when is_atom(reason), do: reason
+  defp stable_terminal_error({reason, _details}) when is_atom(reason), do: reason
+  defp stable_terminal_error({reason, _first, _second}) when is_atom(reason), do: reason
+  defp stable_terminal_error(_reason), do: :terminal_storage_error
 
   defp binding_backend_name(%{backend: backend}, _default) when is_atom(backend),
     do: Atom.to_string(backend)

@@ -99,13 +99,13 @@ defmodule SymphonyElixir.Antigravity.Backend do
           on_message
         )
 
-      {:error, {:antigravity_process_exit, status}} ->
+      {:error, {:antigravity_process_exit, _status}} ->
         terminal_fail(
           session,
           issue,
           opts,
           :worker_crashed,
-          %{message: "native worker exited with status #{status}", liveness: :dead_or_unreachable},
+          %{liveness: :dead_or_unreachable},
           on_message
         )
 
@@ -115,7 +115,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
           issue,
           opts,
           :provider_protocol_error,
-          %{message: protocol_reason(reason)},
+          %{provider_code: protocol_code(reason)},
           on_message
         )
     end
@@ -218,8 +218,8 @@ defmodule SymphonyElixir.Antigravity.Backend do
     {reason, details} =
       case result.status do
         "ERROR" -> classify_native_error(result.error)
-        "INVALID" -> {:provider_protocol_error, %{message: result.error || "native result was invalid"}}
-        _ -> {:unknown_terminal_failure, %{message: result.error || "native terminal failure"}}
+        "INVALID" -> {:provider_protocol_error, %{provider_code: "INVALID_RESULT"}}
+        _ -> {:unknown_terminal_failure, %{}}
       end
 
     terminal_fail(
@@ -246,8 +246,11 @@ defmodule SymphonyElixir.Antigravity.Backend do
     evidence = TerminalFailure.build(reason, Map.delete(details, :session_id), context)
 
     case TerminalFailure.persist(session.workspace, evidence) do
-      {:ok, _path} -> :ok
-      {:error, persist_reason} -> Logger.warning("Unable to persist terminal evidence event_id=#{evidence.event_id} reason=#{inspect(persist_reason)}")
+      {:ok, _path} ->
+        :ok
+
+      {:error, persist_reason} ->
+        Logger.error("Terminal evidence storage unavailable event_id=#{evidence.event_id} reason=#{stable_storage_error(persist_reason)}; holding the live issue fail-closed")
     end
 
     on_message.(
@@ -323,9 +326,8 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
   defp classify_native_error(message) do
     raw_message = if is_binary(message), do: message, else: "native provider failure"
-    sanitized = TerminalFailure.sanitize_message(raw_message) || "native provider failure"
     normalized = String.downcase(raw_message)
-    details = native_error_details(sanitized)
+    details = native_error_details(raw_message)
 
     {classify_native_error_reason(normalized, details), details}
   end
@@ -373,7 +375,6 @@ defmodule SymphonyElixir.Antigravity.Backend do
 
   defp native_error_details(message) do
     %{
-      message: message,
       provider_code: provider_code(message),
       http_status: http_status(message),
       reset_hint: reset_hint(message),
@@ -404,17 +405,20 @@ defmodule SymphonyElixir.Antigravity.Backend do
   end
 
   defp reset_hint(message) do
-    case Regex.run(~r/\bresets?\s+in\s+([^.,;\n]+)/i, message, capture: :all_but_first) do
-      [hint] -> String.trim(hint)
+    case Regex.run(
+           ~r/\bresets?\s+in\s+([0-9]+(?:\s*[smhd])(?:\s*[0-9]+\s*[smhd]){0,3})\b/i,
+           message,
+           capture: :all_but_first
+         ) do
+      [hint] -> String.replace(hint, ~r/\s+/, "")
       _ -> nil
     end
   end
 
-  defp timeout_details(stage, terminal) do
+  defp timeout_details(_stage, terminal) do
     progress_seen = timeout_progress_seen?(terminal)
 
     %{
-      message: "native worker exceeded #{stage} deadline",
       liveness:
         if(progress_seen,
           do: :alive_but_thinking,
@@ -427,7 +431,13 @@ defmodule SymphonyElixir.Antigravity.Backend do
   defp timeout_progress_seen?({:cleanup_failed, _reason, terminal}), do: timeout_progress_seen?(terminal)
   defp timeout_progress_seen?(_terminal), do: false
 
-  defp protocol_reason(reason), do: "AntiGravity protocol failure: #{inspect(reason)}"
+  defp protocol_code(reason) when is_atom(reason), do: "PROTOCOL_" <> (reason |> Atom.to_string() |> String.upcase())
+  defp protocol_code(_reason), do: "PROTOCOL_ERROR"
+
+  defp stable_storage_error(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp stable_storage_error({reason, _details}) when is_atom(reason), do: Atom.to_string(reason)
+  defp stable_storage_error({reason, _first, _second}) when is_atom(reason), do: Atom.to_string(reason)
+  defp stable_storage_error(_reason), do: "terminal_storage_error"
 
   defp binding_profile_root(%{options: options}, default) when is_map(options) do
     Map.get(options, :profile_root) || Map.get(options, "profile_root") || default

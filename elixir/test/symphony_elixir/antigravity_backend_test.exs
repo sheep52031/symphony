@@ -583,6 +583,33 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     end
   end
 
+  test "bound launch failures never log the selected profile path" do
+    {root, _workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    secret_profile = Path.join(root, "profiles/account-owner-secret")
+    issue = %Issue{id: "issue-binding-log", identifier: "JARVIS-LOG", title: "Binding log"}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert_raise RuntimeError, fn ->
+          SymphonyElixir.AgentRunner.run(
+            issue,
+            nil,
+            backend: "antigravity",
+            binding: %{
+              binding_id: "slot-safe-id",
+              backend: :antigravity,
+              options: %{profile_root: secret_profile}
+            }
+          )
+        end
+      end)
+
+    refute log =~ secret_profile
+    assert log =~ "slot-safe-id"
+    File.rm_rf!(root)
+  end
+
   test "remains local-only at session start" do
     workspace = temporary_root("remote")
     File.mkdir_p!(workspace)

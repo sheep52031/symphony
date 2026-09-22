@@ -43,10 +43,13 @@ projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony`
 read-only to the child, and native `--sandbox` remains enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
 usage, or permission/input denial fails visibly. Native `SYSTEM / ERROR_MESSAGE` steps are accepted
 as terminal provider evidence instead of being misreported as an unknown step type. The adapter
-classifies a bounded, redacted provider-neutral reason (`provider_quota_exhausted`,
-`provider_auth_failed`, `provider_network_unreachable`, `permission_denied`, `worker_crashed`,
-`worker_stalled`, `provider_protocol_error`, or `unknown_terminal_failure`) and persists an
-idempotent receipt under the existing issue workspace. Codex remains the default and rollback path;
+classifies one provider-neutral reason (`provider_quota_exhausted`, `provider_auth_failed`,
+`provider_network_unreachable`, `permission_denied`, `worker_crashed`, `worker_stalled`,
+`provider_protocol_error`, or `unknown_terminal_failure`) and retains only reviewed structured
+fields—never raw provider prose, account identifiers, tokens, OAuth payloads, or profile paths. It
+persists an immutable receipt plus a fail-closed active marker, with a workspace-root fallback and
+a mirrored lifecycle index beside the configured log directory so workspace-root reloads cannot
+lose an active hold. Codex remains the default and rollback path;
 Pi remains supported.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
@@ -61,9 +64,11 @@ A typed provider terminal failure follows a stricter boundary. The worker proces
 the orchestrator moves the issue to a `terminal_failure` hold, and no ordinary retry is scheduled.
 A policy owner may call the narrow `Orchestrator.resume_terminal_attempt/3` seam with an opaque,
 validated launch binding. The backend must remain unchanged; for AntiGravity the only binding option
-is a dedicated absolute `profile_root`. The new attempt reuses the same issue workspace, skips
-`after_create`, and records a non-secret resume receipt. Symphony validates and executes that
-binding but never selects an account or rotates profiles itself. A restart that finds a settled
+is a dedicated absolute `profile_root`. Before any writer starts, Symphony durably records a
+non-secret resume-intent receipt. The new attempt opens the exact recorded issue workspace even if
+configuration was reloaded with a different workspace root, preserves its bytes/branch, and skips
+`after_create`. Symphony validates and executes that binding but never selects an account or rotates
+profiles itself. A restart that finds a settled
 terminal marker reconstructs the hold; a marker that already has a resume receipt is ambiguous and
 fails closed instead of creating a duplicate writer.
 
@@ -248,9 +253,11 @@ Notes:
   sends bounded `SIGINT`/`SIGTERM`/`SIGKILL`, and verifies the process group is empty.
   `antigravity.cancel_grace_ms` bounds collection of a native terminal envelope after `SIGINT`.
   Native `denied_actions` and `WAITING` are surfaced as input-required errors rather than silently
-  completed turns. `SYSTEM / ERROR_MESSAGE` is a terminal provider event; its message is redacted
-  and bounded before it enters callbacks, logs, or workspace receipts. Unknown error messages stay
-  `unknown_terminal_failure` and are never inferred to be quota failures. Stdout frames are bounded
+  completed turns. `SYSTEM / ERROR_MESSAGE` is a terminal provider event. Raw provider prose is
+  used only transiently inside the adapter classifier and is discarded; callbacks, logs, and
+  receipts receive only the normalized reason plus allowlisted code, HTTP status, duration-shaped
+  reset hint, and liveness fields. Unknown errors stay `unknown_terminal_failure` and are never
+  inferred to be quota failures. Stdout frames are bounded
   and only reviewed protocol fields are forwarded to orchestration callbacks. A requested
   continuation identity may never become a fresh-session fallback.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under

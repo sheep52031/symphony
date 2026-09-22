@@ -37,6 +37,34 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc false
+  @spec open_recorded_for_issue(Path.t(), map() | String.t() | nil, worker_host()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def open_recorded_for_issue(workspace, issue_or_identifier, nil) when is_binary(workspace) do
+    expected_key = workspace_key(issue_or_identifier)
+
+    cond do
+      Path.type(workspace) != :absolute ->
+        {:error, {:workspace_path_unreadable, workspace, :not_absolute}}
+
+      Path.basename(workspace) != expected_key ->
+        {:error, {:recorded_workspace_issue_mismatch, workspace, expected_key}}
+
+      not File.dir?(workspace) ->
+        {:error, {:recorded_workspace_missing, workspace}}
+
+      true ->
+        case validate_recorded_workspace_path(workspace) do
+          :ok -> PathSafety.canonicalize(workspace)
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  def open_recorded_for_issue(workspace, _issue_or_identifier, worker_host)
+      when is_binary(workspace) and is_binary(worker_host),
+      do: {:error, {:recorded_workspace_remote_resume_unsupported, worker_host}}
+
   defp ensure_workspace(workspace, nil) do
     cond do
       File.dir?(workspace) ->

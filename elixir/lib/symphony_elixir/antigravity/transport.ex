@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Antigravity.Transport do
   @moduledoc false
 
-  alias SymphonyElixir.{Antigravity.Launcher, TerminalFailure}
+  alias SymphonyElixir.Antigravity.Launcher
 
   @line_bytes 1_048_576
   @max_identity_bytes 256
@@ -398,7 +398,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
            "source" => source,
            "type" => type,
            "status" => status,
-           "error" => TerminalFailure.sanitize_message(error)
+           "error" => error
          }}
     end
   end

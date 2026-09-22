@@ -144,6 +144,61 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert blocked.disposition == :terminal_failure
     assert blocked.terminal_failure.event_id == evidence.event_id
 
+    drift_workspace_root = Path.join(root, "changed-workspace-root")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      agent_backend: "antigravity",
+      workspace_root: drift_workspace_root,
+      antigravity_executable: agy,
+      antigravity_profile_root: Path.join(root, "profiles/slot-a"),
+      antigravity_first_event_timeout_ms: 1_000,
+      antigravity_turn_timeout_ms: 10_000,
+      hook_after_create: "printf hook-ran > after-create-ran"
+    )
+
+    resume_receipt = Path.join(workspace, ".symphony/terminal-resumes/#{evidence.event_id}.json")
+    workspace_hash = :crypto.hash(:sha256, Path.expand(workspace)) |> Base.encode16(case: :lower)
+
+    fallback_resume_receipt =
+      Path.join(
+        Path.dirname(workspace),
+        ".symphony/terminal-holds/resumes/#{workspace_hash}-#{evidence.event_id}.json"
+      )
+
+    issue_hash = :crypto.hash(:sha256, issue.id) |> Base.encode16(case: :lower)
+
+    global_resume_receipt =
+      Path.join(
+        Application.fetch_env!(:symphony_elixir, :terminal_state_root),
+        "resumes/#{issue_hash}-#{evidence.event_id}.json"
+      )
+
+    File.mkdir_p!(global_resume_receipt)
+
+    assert {:error, {:terminal_resume_receipt_failed, :immutable_receipt_unavailable}} =
+             Orchestrator.resume_terminal_attempt(
+               issue.id,
+               %{
+                 binding_id: "slot-b",
+                 backend: :antigravity,
+                 options: %{profile_root: profile}
+               },
+               orchestrator_name
+             )
+
+    assert %{running: [], retrying: [], blocked: [%{recovery_state: :ambiguous}]} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    File.rm_rf!(resume_receipt)
+    File.rm_rf!(fallback_resume_receipt)
+    File.rm_rf!(global_resume_receipt)
+
+    :sys.replace_state(pid, fn state ->
+      blocked = Map.update!(state.blocked, issue.id, &Map.put(&1, :recovery_state, :settled))
+      %{state | blocked: blocked}
+    end)
+
     assert {:ok, receipt} =
              Orchestrator.resume_terminal_attempt(
                issue.id,
@@ -159,12 +214,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert receipt.binding_id == "slot-b"
     assert receipt.workspace_path == workspace
     assert receipt.attempt == 1
-    assert receipt.disposition in [:running, :retry_queued]
+    assert receipt.disposition == :running
+
+    live_snapshot =
+      wait_for_snapshot(
+        orchestrator_name,
+        fn snapshot ->
+          Enum.any?(snapshot.running, &(&1.issue_id == issue.id and &1.session_id == "resume-session"))
+        end,
+        1_000
+      )
+
+    assert [%{workspace_path: ^workspace, binding_id: "slot-b"}] = live_snapshot.running
+    refute File.exists?(Path.join(drift_workspace_root, "JARVIS-936"))
     assert File.read!(Path.join(workspace, "dirty-candidate.txt")) == "preserve me\n"
     refute File.exists?(Path.join(workspace, "after-create-ran"))
     assert {"preserved-branch\n", 0} = System.cmd("git", ["branch", "--show-current"], cd: workspace)
 
-    resume_receipt = Path.join(workspace, ".symphony/terminal-resumes/#{evidence.event_id}.json")
     assert File.regular?(resume_receipt)
     assert Jason.decode!(File.read!(resume_receipt))["binding_id"] == "slot-b"
 

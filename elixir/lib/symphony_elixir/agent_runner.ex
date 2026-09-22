@@ -30,8 +30,9 @@ defmodule SymphonyElixir.AgentRunner do
           :ok
 
         {:error, reason} ->
-          Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+          safe_reason = safe_failure_reason(reason, opts)
+          Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(safe_reason)}")
+          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(safe_reason)}"
       end
     else
       Logger.warning("Skipping agent run; issue identifier is not allowed: #{issue_context(issue)}")
@@ -42,7 +43,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    case resolve_workspace(issue, worker_host, opts) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
@@ -137,19 +138,64 @@ defmodule SymphonyElixir.AgentRunner do
         Process.put(stop_key, true)
         stop_backend!(backend, session)
 
-        if result == :ok do
-          case TerminalFailure.clear_active(workspace) do
-            :ok -> :ok
-            {:error, reason} -> Logger.warning("Unable to clear settled terminal marker workspace=#{workspace} reason=#{inspect(reason)}")
-          end
-        end
-
-        result
+        if result == :ok,
+          do: settle_success_marker(workspace, issue, codex_update_recipient),
+          else: result
       after
         unless Process.delete(stop_key), do: stop_backend!(backend, session)
       end
     end
   end
+
+  defp resolve_workspace(issue, worker_host, opts) do
+    case Keyword.get(opts, :workspace_path) do
+      nil -> Workspace.create_for_issue(issue, worker_host)
+      workspace -> Workspace.open_recorded_for_issue(workspace, issue, worker_host)
+    end
+  end
+
+  defp settle_success_marker(workspace, issue, recipient) do
+    case TerminalFailure.clear_active(workspace, issue.id) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        send_marker_failure_evidence(recipient, issue, workspace)
+        {:error, {:terminal_marker_clear_failed, stable_error_code(reason)}}
+    end
+  end
+
+  defp send_marker_failure_evidence(recipient, issue, workspace) do
+    case TerminalFailure.recovery_state(workspace, issue.id) do
+      {disposition, evidence} when disposition in [:settled, :ambiguous] ->
+        send_codex_update(recipient, issue, %{
+          event: :terminal_failure,
+          terminal_failure: evidence,
+          session_id: evidence.session_id,
+          backend: evidence.backend,
+          timestamp: DateTime.utc_now()
+        })
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp safe_failure_reason(reason, opts) do
+    case Keyword.get(opts, :binding) do
+      %{binding_id: binding_id, backend: backend} ->
+        {:bound_agent_run_failed, backend, binding_id, stable_error_code(reason)}
+
+      _binding ->
+        reason
+    end
+  end
+
+  defp stable_error_code(reason) when is_atom(reason), do: reason
+  defp stable_error_code({reason, _details}) when is_atom(reason), do: reason
+  defp stable_error_code({reason, _first, _second}) when is_atom(reason), do: reason
+  defp stable_error_code({reason, _first, _second, _third}) when is_atom(reason), do: reason
+  defp stable_error_code(_reason), do: :agent_runtime_error
 
   defp do_run_agent_turns(
          %{
