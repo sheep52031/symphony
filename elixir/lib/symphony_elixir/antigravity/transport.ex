@@ -2,6 +2,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @moduledoc false
 
   alias SymphonyElixir.Antigravity.{CleanupRegistry, Launcher}
+  alias SymphonyElixir.TerminalFailure
 
   @line_bytes 1_048_576
   @max_identity_bytes 256
@@ -27,6 +28,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
           process_group_id: non_neg_integer(),
           os_pid: non_neg_integer() | nil,
           cleanup_guard_pid: pid() | nil,
+          cleanup_fence_id: String.t(),
           owner_pid: pid(),
           launch: Launcher.launch()
         }
@@ -84,7 +86,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
     process_result = close_process(session)
     runtime_result = remove_runtime_files(session)
     result = merge_cleanup_results(process_result, runtime_result)
-    release_cleanup_guard(session, result)
+    result = release_cleanup_guard(session, result)
     stop_state(session.state)
     result
   end
@@ -116,8 +118,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
          :ok <- trusted_system_executable(@bash_path, "bash"),
          :ok <- trusted_system_executable(@kill_path, "kill"),
          :ok <- trusted_system_executable(@ps_path, "ps"),
-         {:ok, guard_pid} <-
-           start_cleanup_guard(self(), %{
+         {:ok, guard_pid, cleanup_fence_id} <-
+           arm_cleanup_guard(self(), %{
              port: nil,
              backend_process_pid: nil,
              process_group_id: nil,
@@ -146,11 +148,26 @@ defmodule SymphonyElixir.Antigravity.Transport do
         )
 
       send(guard_pid, {:antigravity_port_opened, port, port_os_pid(port)})
-      finalize_started_port(port, launch, stderr_path, process_group_path, guard_pid)
+
+      finalize_started_port(
+        port,
+        launch,
+        stderr_path,
+        process_group_path,
+        guard_pid,
+        cleanup_fence_id
+      )
     end
   end
 
-  defp finalize_started_port(port, launch, stderr_path, process_group_path, guard_pid) do
+  defp finalize_started_port(
+         port,
+         launch,
+         stderr_path,
+         process_group_path,
+         guard_pid,
+         cleanup_fence_id
+       ) do
     process_group_id = read_process_group_id(process_group_path)
 
     if is_nil(process_group_id) do
@@ -181,6 +198,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
         process_group_id: process_group_id,
         os_pid: port_os_pid(port),
         cleanup_guard_pid: nil,
+        cleanup_fence_id: cleanup_fence_id,
         owner_pid: owner_pid,
         launch: launch
       }
@@ -663,6 +681,31 @@ defmodule SymphonyElixir.Antigravity.Transport do
     _error -> false
   end
 
+  defp arm_cleanup_guard(owner_pid, launch_state) do
+    case TerminalFailure.begin_native_cleanup_fence() do
+      {:ok, cleanup_fence_id} ->
+        launch_state = Map.put(launch_state, :cleanup_fence_id, cleanup_fence_id)
+
+        owner_pid
+        |> start_cleanup_guard(launch_state)
+        |> finish_cleanup_guard_arm(cleanup_fence_id)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp finish_cleanup_guard_arm({:ok, guard_pid}, cleanup_fence_id) do
+    {:ok, guard_pid, cleanup_fence_id}
+  end
+
+  defp finish_cleanup_guard_arm({:error, reason}, cleanup_fence_id) do
+    case TerminalFailure.complete_native_cleanup_fence(cleanup_fence_id) do
+      :ok -> {:error, reason}
+      {:error, fence_reason} -> {:error, fence_reason}
+    end
+  end
+
   defp start_cleanup_guard(owner_pid, session) do
     guard_pid =
       spawn(fn ->
@@ -712,7 +755,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp complete_guard_cleanup(owner_pid, launch_state) do
-    result = cleanup_guard_launch(launch_state)
+    result = launch_state |> cleanup_guard_launch() |> settle_cleanup_fence(launch_state)
     :ok = CleanupRegistry.complete(owner_pid, self(), result)
   end
 
@@ -748,14 +791,24 @@ defmodule SymphonyElixir.Antigravity.Transport do
     )
   end
 
-  defp release_cleanup_guard(%{cleanup_guard_pid: guard_pid, owner_pid: owner_pid}, result)
+  defp release_cleanup_guard(
+         %{cleanup_guard_pid: guard_pid, owner_pid: owner_pid} = session,
+         result
+       )
        when is_pid(guard_pid) and is_pid(owner_pid) do
+    result = settle_cleanup_fence(result, session)
     :ok = CleanupRegistry.complete(owner_pid, guard_pid, result)
     send(guard_pid, :antigravity_closed)
-    :ok
+    result
   end
 
-  defp release_cleanup_guard(_session, _result), do: :ok
+  defp release_cleanup_guard(_session, result), do: result
+
+  defp settle_cleanup_fence(:ok, %{cleanup_fence_id: cleanup_fence_id}) do
+    TerminalFailure.complete_native_cleanup_fence(cleanup_fence_id)
+  end
+
+  defp settle_cleanup_fence({:error, _reason} = error, _session), do: error
 
   defp close_process(session) do
     close_port(session.port)

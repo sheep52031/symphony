@@ -13,6 +13,8 @@ defmodule SymphonyElixir.TerminalFailure do
   @runtime_instance_key {__MODULE__, :runtime_instance}
   @lock_namespace_mutex {__MODULE__, :lock_namespace_mutex}
   @sync_path "/usr/bin/sync"
+  @native_cleanup_wait_attempts if(Mix.env() == :test, do: 4, else: 120)
+  @native_cleanup_wait_delay_ms 50
 
   if Mix.env() == :test do
     @lock_test_overrides_key {__MODULE__, :lock_test_overrides}
@@ -30,7 +32,10 @@ defmodule SymphonyElixir.TerminalFailure do
                                :public_remove,
                                :transient_remove,
                                :directory_sync,
-                               :namespace_transaction
+                               :namespace_transaction,
+                               :native_cleanup_wait,
+                               :cleanup_ls,
+                               :cleanup_lstat
                              ])
   end
 
@@ -50,6 +55,15 @@ defmodule SymphonyElixir.TerminalFailure do
                             "predecessor_event_id",
                             "occurred_at"
                           ])
+  @native_cleanup_fence_keys MapSet.new([
+                               "version",
+                               "cleanup_id",
+                               "workflow_scope",
+                               "runtime_instance",
+                               "created_at",
+                               "integrity_hash"
+                             ])
+
   @optional_evidence_keys MapSet.new([
                             "writer_id",
                             "public_attempt",
@@ -393,10 +407,54 @@ defmodule SymphonyElixir.TerminalFailure do
     end
   end
 
+  @spec begin_native_cleanup_fence() :: {:ok, String.t()} | {:error, term()}
+  def begin_native_cleanup_fence do
+    cleanup_id = random_hex(32)
+    path = native_cleanup_fence_path(cleanup_id)
+    payload = native_cleanup_fence_payload(cleanup_id)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- atomic_create(path, Jason.encode!(payload)),
+         :ok <- File.chmod(path, 0o600),
+         :ok <- sync_parent_directories([path]) do
+      {:ok, cleanup_id}
+    else
+      {:error, reason} -> {:error, {:native_cleanup_fence_unavailable, reason}}
+    end
+  rescue
+    _error -> {:error, :native_cleanup_fence_unavailable}
+  end
+
+  @spec complete_native_cleanup_fence(String.t()) :: :ok | {:error, term()}
+  def complete_native_cleanup_fence(cleanup_id) when is_binary(cleanup_id) do
+    if valid_hex_id?(cleanup_id) do
+      path = native_cleanup_fence_path(cleanup_id)
+
+      case remove_native_cleanup_fence(path) do
+        :ok -> sync_parent_directories([path])
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, :invalid_native_cleanup_fence_id}
+    end
+  rescue
+    _error -> {:error, :native_cleanup_fence_clear_failed}
+  end
+
   @spec storage_ready() :: :ok | {:error, term()}
   def storage_ready do
-    with :ok <- probe_storage_namespaces(["events", "pending", "active", "resumes", "faults", "locks"]),
+    with :ok <-
+           probe_storage_namespaces([
+             "events",
+             "pending",
+             "active",
+             "resumes",
+             "faults",
+             "locks",
+             "cleanups"
+           ]),
          :ok <- sync_parent_directories([Path.join(state_root(), "storage-probe")]),
+         :ok <- await_native_cleanup_fences(@native_cleanup_wait_attempts),
          :ok <- verify_no_pending_transactions() do
       with_lock_namespace_mutex(&recover_lock_namespace/0)
     end
@@ -1000,6 +1058,121 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
+  defp random_hex(byte_count) do
+    byte_count
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :lower)
+  end
+
+  defp valid_hex_id?(value), do: valid_hash?(value)
+
+  defp native_cleanup_fence_path(cleanup_id) do
+    Path.join([state_root(), "cleanups", "#{cleanup_id}.json"])
+  end
+
+  defp native_cleanup_fence_payload(cleanup_id) do
+    payload = %{
+      "version" => 1,
+      "cleanup_id" => cleanup_id,
+      "workflow_scope" => lifecycle_scope(),
+      "runtime_instance" => runtime_instance(),
+      "created_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    Map.put(payload, "integrity_hash", native_cleanup_fence_integrity(payload))
+  end
+
+  defp native_cleanup_fence_integrity(payload) do
+    [
+      Integer.to_string(payload["version"]),
+      payload["cleanup_id"],
+      payload["workflow_scope"],
+      payload["runtime_instance"],
+      payload["created_at"]
+    ]
+    |> Enum.join("\0")
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp await_native_cleanup_fences(attempts_remaining) do
+    case native_cleanup_fences() do
+      {:ok, []} ->
+        :ok
+
+      {:ok, _fences} when attempts_remaining > 0 ->
+        run_native_cleanup_wait_hook()
+        Process.sleep(@native_cleanup_wait_delay_ms)
+        await_native_cleanup_fences(attempts_remaining - 1)
+
+      {:ok, fences} ->
+        {:error, {:native_cleanup_incomplete, length(fences)}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp native_cleanup_fences do
+    directory = Path.join(state_root(), "cleanups")
+
+    case cleanup_directory_ls(directory) do
+      {:ok, entries} -> validate_native_cleanup_fences(entries, directory)
+      {:error, :enoent} -> {:ok, []}
+      {:error, reason} -> {:error, {:native_cleanup_namespace_unavailable, reason}}
+    end
+  end
+
+  defp validate_native_cleanup_fences(entries, directory) do
+    entries
+    |> Enum.sort()
+    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, fences} ->
+      reduce_native_cleanup_fence(entry, directory, fences)
+    end)
+  end
+
+  defp reduce_native_cleanup_fence(entry, directory, fences) do
+    path = Path.join(directory, entry)
+
+    case validate_native_cleanup_fence(path, entry) do
+      :ok -> {:cont, {:ok, [path | fences]}}
+      {:error, :enoent} -> {:cont, {:ok, fences}}
+      {:error, reason} -> {:halt, {:error, {:invalid_native_cleanup_fence, entry, reason}}}
+    end
+  end
+
+  defp validate_native_cleanup_fence(path, entry) do
+    expected_id = String.trim_trailing(entry, ".json")
+
+    with true <- String.ends_with?(entry, ".json"),
+         true <- valid_hex_id?(expected_id),
+         {:ok, %File.Stat{type: :regular, size: size}} when size <= 2_048 <- cleanup_fence_lstat(path),
+         {:ok, contents} <- File.read(path),
+         {:ok, decoded} when is_map(decoded) <- Jason.decode(contents),
+         true <- Map.keys(decoded) |> MapSet.new() |> MapSet.equal?(@native_cleanup_fence_keys),
+         true <- decoded["version"] == 1,
+         true <- decoded["cleanup_id"] == expected_id,
+         true <- valid_hash?(decoded["workflow_scope"]),
+         true <- valid_hash?(decoded["runtime_instance"]),
+         true <- is_binary(decoded["created_at"]) and byte_size(decoded["created_at"]) <= 64,
+         {:ok, _datetime, 0} <- DateTime.from_iso8601(decoded["created_at"]),
+         true <- valid_hash?(decoded["integrity_hash"]),
+         true <- decoded["integrity_hash"] == native_cleanup_fence_integrity(decoded) do
+      :ok
+    else
+      {:error, :enoent} -> {:error, :enoent}
+      _invalid -> {:error, :invalid_payload}
+    end
+  end
+
+  defp remove_native_cleanup_fence(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:native_cleanup_fence_clear_failed, reason}}
+    end
+  end
+
   defp sync_parent_directories(paths) do
     if :os.type() == {:unix, :linux}, do: sync_linux_parent_directories(paths), else: :ok
   rescue
@@ -1283,15 +1456,24 @@ defmodule SymphonyElixir.TerminalFailure do
                 :lock_lstat,
                 :public_remove,
                 :transient_remove,
-                :directory_sync
+                :directory_sync,
+                :cleanup_lstat
               ],
          do: is_function(operation, 1)
 
     defp valid_lock_override?({:reclaim_link, operation}), do: is_function(operation, 2)
     defp valid_lock_override?({:namespace_transaction, operation}), do: is_function(operation, 1)
+    defp valid_lock_override?({:native_cleanup_wait, operation}), do: is_function(operation, 0)
 
     defp valid_lock_override?({key, result})
-         when key in [:machine_read, :boot_read, :pid_namespace_read, :file_ls, :pending_ls],
+         when key in [
+                :machine_read,
+                :boot_read,
+                :pid_namespace_read,
+                :file_ls,
+                :pending_ls,
+                :cleanup_ls
+              ],
          do: match?({:ok, _value}, result) or match?({:error, _reason}, result)
 
     defp valid_lock_override?(_entry), do: false
@@ -1363,6 +1545,27 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
 
+    defp cleanup_directory_ls(directory) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{cleanup_ls: result} -> result
+        _overrides -> File.ls(directory)
+      end
+    end
+
+    defp cleanup_fence_lstat(path) do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{cleanup_lstat: operation} when is_function(operation, 1) -> operation.(path)
+        _overrides -> File.lstat(path)
+      end
+    end
+
+    defp run_native_cleanup_wait_hook do
+      case Process.get(@lock_test_overrides_key, %{}) do
+        %{native_cleanup_wait: operation} when is_function(operation, 0) -> operation.()
+        _overrides -> :ok
+      end
+    end
+
     defp run_lock_namespace_transaction(operation) do
       case Process.get(@lock_test_overrides_key, %{}) do
         %{namespace_transaction: transaction} when is_function(transaction, 1) ->
@@ -1394,6 +1597,9 @@ defmodule SymphonyElixir.TerminalFailure do
     defp remove_transient_lock(path), do: File.rm(path)
     defp create_reclaim_link(source, destination), do: File.ln(source, destination)
     defp remove_public_lock(path), do: File.rm(path)
+    defp cleanup_directory_ls(directory), do: File.ls(directory)
+    defp cleanup_fence_lstat(path), do: File.lstat(path)
+    defp run_native_cleanup_wait_hook, do: :ok
 
     defp run_lock_namespace_transaction(operation),
       do: :global.trans({@lock_namespace_mutex, self()}, operation, [node()])

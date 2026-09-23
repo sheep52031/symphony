@@ -85,11 +85,14 @@ sealed as a new linked terminal hold instead of entering ordinary retry, but onl
 AntiGravity cleanup guard acknowledges that the old native process group is empty. Missing or failed
 cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor.
 The orchestrator registers that required acknowledgement before releasing the resumed task's start
-gate, and the transport registers its cleanup guard before opening the native port. Every forced
-resumed-task stop consumes cleanup proof before state settlement, reply, or workspace deletion.
-Cleanup registry, task supervisor, and orchestrator share one-for-all restart ownership; guard death
-is a failed acknowledgement. Required completion remains owned until explicit consumption rather
-than expiring by timer. The new attempt
+gate. Before opening the native port, the transport durably publishes an integrity-bound cleanup
+fence and registers its cleanup guard. The fence is removed only after positive process-group absence,
+runtime-file cleanup, and filesystem synchronization. Every forced resumed-task stop consumes cleanup
+proof before state settlement, reply, or workspace deletion. Cleanup registry, task supervisor, and
+orchestrator share one-for-all restart ownership; the detached guard and durable fence bridge that
+restart. Startup waits a bounded interval for surviving guards and refuses dispatch while any valid
+fence remains or any fence is malformed. Guard death is a failed acknowledgement. During a live
+runtime, required completion remains owned until explicit consumption rather than expiring by timer. The new attempt
 opens the exact recorded issue workspace even if configuration was reloaded with a different
 workspace root, preserves its bytes/branch, and skips `after_create`. Symphony validates and executes
 that binding but never selects an account or rotates profiles itself. A restart that finds a settled
@@ -103,8 +106,8 @@ a surviving pending transaction makes the receipt-before-active crash window a s
 Linux, pending creation, receipt creation, active publication, and pending removal are separated by
 successful filesystem synchronization barriers so host-crash recovery preserves that ordering.
 Startup enumerates and strictly validates every host-indexed pending entry before enabling any
-dispatch, independent of tracker visibility, then probes the actual event, pending, active, resume, fault, and lock
-namespaces and reclaims
+dispatch, independent of tracker visibility, then probes the actual event, pending, active, resume,
+fault, native-cleanup-fence, and lock namespaces and reclaims
 only provably dead owners; partial local/global mirrors fail closed. Terminal cleanup and running-terminal
 reconciliation reread durable lifecycle evidence after the writer stops, then remove the exact
 recorded workspace before ownership-checked settlement of both the active and storage-fault marker

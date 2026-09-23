@@ -24,6 +24,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "terminal failure settles without retry and externally selected binding resumes one writer in the same workspace" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-936")
     profile = Path.join(root, "profiles/slot-b")
@@ -253,6 +254,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "durable resume intent becomes ambiguous and cancels retry when no writer starts" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-resume-dispatch-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-937")
     profile = Path.join(root, "profile")
@@ -341,6 +343,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "resume becomes a terminal hold without retry when the task starts but no writer is proven" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-unproven-writer-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-937A")
     profile = Path.join(root, "profile")
@@ -420,6 +423,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "terminal storage failure disables ordinary retry and all further dispatch" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-storage-fault-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-938")
     profile = Path.join(root, "profile")
@@ -641,6 +645,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "startup terminal cleanup removes the recorded workspace before its global hold" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-terminal-cleanup-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-940")
     File.mkdir_p!(workspace)
@@ -689,6 +694,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "running terminal reconciliation clears owned lifecycle markers after strict cleanup" do
     unique = System.unique_integer([:positive])
     root = Path.join("/var/tmp", "symphony-j936-running-terminal-#{unique}")
+    File.rm_rf!(root)
     workspace_root = Path.join(root, "workspaces")
     workspace = Path.join(workspace_root, "JARVIS-942")
     File.mkdir_p!(workspace)

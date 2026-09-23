@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Antigravity.BackendTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{AgentBackend, Config.Schema}
+  alias SymphonyElixir.{AgentBackend, Config.Schema, TerminalFailure}
   alias SymphonyElixir.Antigravity.{Backend, CleanupRegistry, Launcher, Transport}
 
   setup do
@@ -556,11 +556,22 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     configure_backend!(agy, profile)
     issue = %{id: "issue-tree", identifier: "JARVIS-907", title: "Tree cleanup"}
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+
+    cleanup_fence =
+      Path.join([
+        state_root,
+        "cleanups",
+        "#{session.transport.cleanup_fence_id}.json"
+      ])
+
+    assert File.regular?(cleanup_fence)
     assert {:ok, _turn} = Backend.run_turn(session, "descendant", issue, [])
     child_pid = workspace |> Path.join("child.pid") |> File.read!() |> String.trim()
     assert process_alive?(child_pid)
     assert :ok = Backend.stop_session(session)
     refute process_alive?(child_pid)
+    refute File.exists?(cleanup_fence)
     File.rm_rf!(root)
   end
 
@@ -627,6 +638,53 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
     assert :ok = Transport.await_owner_cleanup(owner, 2_000)
     refute process_alive?(child_pid)
+    File.rm_rf!(root)
+  end
+
+  test "runtime restart remains blocked by a durable cleanup fence until the detached guard settles" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile, tracker_kind: "memory")
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    fence_path = Path.join([state_root, "cleanups", "#{session.transport.cleanup_fence_id}.json"])
+    assert File.regular?(fence_path)
+
+    cleanup_registry = Process.whereis(CleanupRegistry)
+    runtime_supervisor = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
+    assert is_pid(cleanup_registry)
+    assert is_pid(runtime_supervisor)
+
+    on_exit(fn ->
+      _ = TerminalFailure.complete_native_cleanup_fence(session.transport.cleanup_fence_id)
+
+      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
+        Supervisor.restart_child(
+          SymphonyElixir.Supervisor,
+          SymphonyElixir.AgentRuntimeSupervisor
+        )
+      end
+    end)
+
+    assert :ok =
+             Supervisor.terminate_child(
+               SymphonyElixir.Supervisor,
+               SymphonyElixir.AgentRuntimeSupervisor
+             )
+
+    restart =
+      Task.async(fn ->
+        Supervisor.restart_child(
+          SymphonyElixir.Supervisor,
+          SymphonyElixir.AgentRuntimeSupervisor
+        )
+      end)
+
+    assert is_pid(wait_for_replacement(CleanupRegistry, cleanup_registry, 100))
+    assert File.regular?(fence_path)
+    assert nil == Task.yield(restart, 0)
+    assert :ok = Backend.stop_session(session)
+    assert {:ok, restarted_runtime} = Task.await(restart, 5_000)
+    assert is_pid(restarted_runtime)
     File.rm_rf!(root)
   end
 
@@ -811,10 +869,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       File.rm_rf!(root)
     end)
 
-    Application.put_env(:symphony_elixir, :terminal_state_root, blocked_state_root)
     issue = %{id: "issue-storage-failure", identifier: "JARVIS-936", title: "Storage failure"}
     on_message = fn message -> send(self(), {:agy_message, message}) end
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    Application.put_env(:symphony_elixir, :terminal_state_root, blocked_state_root)
 
     assert {:error, {:backend_terminal_storage_failure, event_id}} =
              Backend.run_turn(session, "quota_error", issue,
@@ -834,6 +892,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert {:storage_fault, %{event_id: ^event_id}} =
              SymphonyElixir.TerminalFailure.recovery_state(workspace, issue.id)
+
+    if original_state_root,
+      do: Application.put_env(:symphony_elixir, :terminal_state_root, original_state_root),
+      else: Application.delete_env(:symphony_elixir, :terminal_state_root)
 
     assert :ok = Backend.stop_session(session)
   end
@@ -1127,6 +1189,19 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
              )
 
     evidence
+  end
+
+  defp wait_for_replacement(_name, _prior_pid, 0), do: nil
+
+  defp wait_for_replacement(name, prior_pid, attempts) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != prior_pid ->
+        pid
+
+      _other ->
+        Process.sleep(10)
+        wait_for_replacement(name, prior_pid, attempts - 1)
+    end
   end
 
   defp process_alive?(pid) do

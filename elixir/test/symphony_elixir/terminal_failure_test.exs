@@ -3,6 +3,99 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
   alias SymphonyElixir.TerminalFailure
 
+  test "native cleanup fences survive runtime restart boundaries until positive cleanup proof" do
+    assert {:ok, cleanup_id} = TerminalFailure.begin_native_cleanup_fence()
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    fence_path = Path.join([state_root, "cleanups", "#{cleanup_id}.json"])
+    assert File.regular?(fence_path)
+    parent = self()
+
+    waiter =
+      Task.async(fn ->
+        TerminalFailure.with_lock_overrides_for_test(
+          %{
+            native_cleanup_wait: fn ->
+              send(parent, {:native_cleanup_waiting, self()})
+
+              receive do
+                :native_cleanup_may_continue -> :ok
+              end
+            end
+          },
+          &TerminalFailure.storage_ready/0
+        )
+      end)
+
+    assert_receive {:native_cleanup_waiting, waiter_pid}, 1_000
+    assert waiter_pid == waiter.pid
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(cleanup_id)
+    send(waiter.pid, :native_cleanup_may_continue)
+    assert :ok = Task.await(waiter, 1_000)
+    refute File.exists?(fence_path)
+  end
+
+  test "native cleanup fence validation and unresolved ownership fail closed" do
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+
+    assert {:error, :invalid_native_cleanup_fence_id} =
+             TerminalFailure.complete_native_cleanup_fence("not-a-fence")
+
+    assert {:ok, unresolved_id} = TerminalFailure.begin_native_cleanup_fence()
+    assert {:error, {:native_cleanup_incomplete, 1}} = TerminalFailure.storage_ready()
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(unresolved_id)
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(unresolved_id)
+
+    assert {:ok, malformed_id} = TerminalFailure.begin_native_cleanup_fence()
+    malformed_path = Path.join([state_root, "cleanups", "#{malformed_id}.json"])
+    File.write!(malformed_path, Jason.encode!(%{"version" => 1}))
+
+    assert {:error, {:invalid_native_cleanup_fence, _, :invalid_payload}} =
+             TerminalFailure.storage_ready()
+
+    File.rm!(malformed_path)
+    assert :ok = TerminalFailure.storage_ready()
+  end
+
+  test "native cleanup fence IO failures are typed and race-safe" do
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{cleanup_ls: {:error, :enoent}},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:error, {:native_cleanup_namespace_unavailable, :eacces}} =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{cleanup_ls: {:error, :eacces}},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert {:ok, disappearing_id} = TerminalFailure.begin_native_cleanup_fence()
+
+    assert :ok =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{cleanup_lstat: fn _path -> {:error, :enoent} end},
+               &TerminalFailure.storage_ready/0
+             )
+
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(disappearing_id)
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    on_exit(fn -> Application.put_env(:symphony_elixir, :terminal_state_root, state_root) end)
+    blocked_root = Path.join(state_root, "blocked-cleanup-root")
+    File.write!(blocked_root, "not a directory")
+    Application.put_env(:symphony_elixir, :terminal_state_root, blocked_root)
+
+    assert {:error, {:native_cleanup_fence_unavailable, _reason}} =
+             TerminalFailure.begin_native_cleanup_fence()
+
+    Application.put_env(:symphony_elixir, :terminal_state_root, :invalid_root)
+    assert {:error, :native_cleanup_fence_unavailable} = TerminalFailure.begin_native_cleanup_fence()
+
+    assert {:error, :native_cleanup_fence_clear_failed} =
+             TerminalFailure.complete_native_cleanup_fence(String.duplicate("a", 64))
+
+    Application.put_env(:symphony_elixir, :terminal_state_root, state_root)
+  end
+
   test "terminal receipts are allowlisted, deterministic, immutable, and restart-classified" do
     assert TerminalFailure.reasons() == [
              :provider_quota_exhausted,

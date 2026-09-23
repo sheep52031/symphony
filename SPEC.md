@@ -590,12 +590,16 @@ Launch and protocol requirements:
   native-cleanup acknowledgement before its successor terminal hold is persisted or exposed; an
   unavailable or failed acknowledgement is a service-wide lifecycle fault, not a resumable hold.
   The orchestrator MUST durably require the acknowledgement before releasing a resumed AntiGravity
-  task's start gate, and the transport MUST register its cleanup guard before opening the native port.
-  Every orchestrator-forced resumed-task termination MUST stop the task and consume cleanup proof
-  before replying, settling lifecycle state, or removing a workspace. Cleanup registry, task
-  supervisor, and orchestrator share one-for-all restart ownership; guard death is an explicit failed
-  acknowledgement. Completed required acknowledgements remain owned until explicitly consumed,
-  without TTL-based semantic expiry.
+  task's start gate. Before opening the native port, the transport MUST durably publish a strict,
+  integrity-bound cleanup fence and register its cleanup guard. The fence may be removed only after
+  positive native process-group absence and runtime-file cleanup, followed by a successful filesystem
+  synchronization. Every orchestrator-forced resumed-task termination MUST stop the task and consume
+  cleanup proof before replying, settling lifecycle state, or removing a workspace. Cleanup registry,
+  task supervisor, and orchestrator share one-for-all restart ownership, while the detached guard and
+  durable fence bridge that restart boundary. Startup MUST strictly enumerate all cleanup fences and
+  wait a bounded interval for surviving guards; an unresolved or malformed fence prevents dispatch.
+  Guard death is an explicit failed acknowledgement. During a live runtime, completed required
+  acknowledgements remain owned until explicitly consumed, without TTL-based semantic expiry.
 - An externally selected launch binding MAY start a new attempt only after the previous task is down
   and its terminal hold owns no live writer. The binding MUST keep the same backend and MAY override
   only backend-reviewed launch options; AntiGravity accepts only a dedicated absolute
@@ -904,8 +908,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   instance. Immutable terminal and resume receipts remain as lifecycle evidence until normal
   workspace cleanup.
 - The service MUST verify the actual immutable-event, pending-transaction, active-marker,
-  resume-intent, fault, and lock namespaces under the host lifecycle state root before enabling
-  dispatch. Terminal persistence MUST publish a host-indexed pending transaction before immutable
+  resume-intent, fault, native-cleanup-fence, and lock namespaces under the host lifecycle state root
+  before enabling dispatch. Terminal persistence MUST publish a host-indexed pending transaction before immutable
   receipts, then publish the active family and owner-clear the pending family under the same
   ownership lock. On Linux, each pending-create, receipt-create, active-publication, and pending-clear
   boundary MUST be separated by a successful filesystem synchronization so a later namespace entry
