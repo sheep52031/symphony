@@ -1468,8 +1468,11 @@ defmodule SymphonyElixir.TerminalFailureTest do
 
       assert_receive {^holder, {:data, {:eol, "LOCKED"}}}, 1_000
 
+      ready_path = Path.join(root, "waiter-ready")
+
       expression =
         "Application.put_env(:symphony_elixir, :terminal_state_root, #{inspect(state_root)}); " <>
+          "File.write!(#{inspect(ready_path)}, \"ready\"); " <>
           "IO.inspect(SymphonyElixir.TerminalFailure.storage_ready())"
 
       waiter =
@@ -1481,7 +1484,8 @@ defmodule SymphonyElixir.TerminalFailureTest do
           )
         end)
 
-      Process.sleep(200)
+      assert :ok = await_file(ready_path, 500)
+      assert :ok = await_flock_waiter(guard_path, 500)
       assert nil == Task.yield(waiter, 0)
       Port.command(holder, "\n")
       assert_receive {^holder, {:exit_status, 0}}, 1_000
@@ -1947,6 +1951,31 @@ defmodule SymphonyElixir.TerminalFailureTest do
     Process.exit(holder, :kill)
     assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
     :ok
+  end
+
+  defp await_file(_path, 0), do: flunk("timed out waiting for child readiness")
+
+  defp await_file(path, attempts_left) do
+    if File.regular?(path) do
+      :ok
+    else
+      Process.sleep(20)
+      await_file(path, attempts_left - 1)
+    end
+  end
+
+  defp await_flock_waiter(_guard_path, 0), do: flunk("timed out waiting for flock contention")
+
+  defp await_flock_waiter(guard_path, attempts_left) do
+    expected_arguments = "/usr/bin/flock -x -w 10 #{guard_path}"
+    {processes, 0} = System.cmd("/usr/bin/ps", ["-eo", "args="])
+
+    if String.contains?(processes, expected_arguments) do
+      :ok
+    else
+      Process.sleep(20)
+      await_flock_waiter(guard_path, attempts_left - 1)
+    end
   end
 
   defp process_stat(start_time) do

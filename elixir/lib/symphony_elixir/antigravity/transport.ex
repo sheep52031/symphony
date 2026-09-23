@@ -109,17 +109,12 @@ defmodule SymphonyElixir.Antigravity.Transport do
       end
     end
 
-    defp run_cleanup_guard_arm_hook(guard_pid) do
-      case Process.get(@cleanup_guard_arm_hook_key) do
-        hook when is_function(hook, 1) -> hook.(guard_pid)
-        _other -> :ok
-      end
-    end
+    defp cleanup_guard_arm_hook, do: Process.get(@cleanup_guard_arm_hook_key)
   else
     defp port_opener, do: &Port.open/2
     defp port_connector, do: &Port.connect/2
     defp run_process_group_path_hook(_path), do: :ok
-    defp run_cleanup_guard_arm_hook(_guard_pid), do: :ok
+    defp cleanup_guard_arm_hook, do: nil
   end
 
   @spec start(Path.t(), Path.t(), Path.t(), pos_integer(), keyword()) ::
@@ -783,59 +778,51 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp arm_cleanup_guard(owner_pid, launch_state) do
-    case TerminalFailure.begin_native_cleanup_fence() do
-      {:ok, cleanup_fence_id} ->
-        launch_state = Map.put(launch_state, :cleanup_fence_id, cleanup_fence_id)
-
-        owner_pid
-        |> start_cleanup_guard(launch_state)
-        |> finish_cleanup_guard_arm(cleanup_fence_id)
-
-      {:error, _reason} = error ->
-        error
-    end
+    :ok = CleanupRegistry.expect_guard(owner_pid)
+    start_cleanup_guard(owner_pid, launch_state, cleanup_guard_arm_hook())
   end
 
-  defp finish_cleanup_guard_arm({:ok, guard_pid}, cleanup_fence_id) do
-    {:ok, guard_pid, cleanup_fence_id}
-  end
-
-  defp finish_cleanup_guard_arm({:error, reason}, cleanup_fence_id) do
-    case TerminalFailure.complete_native_cleanup_fence(cleanup_fence_id) do
-      :ok -> {:error, reason}
-      {:error, fence_reason} -> {:error, fence_reason}
-    end
-  end
-
-  defp start_cleanup_guard(owner_pid, session) do
+  defp start_cleanup_guard(owner_pid, launch_state, arm_hook) do
     parent = self()
 
-    guard_pid =
-      spawn(fn ->
-        Process.flag(:trap_exit, true)
-        owner_ref = Process.monitor(owner_pid)
-        send(parent, {:cleanup_guard_armed, self()})
-        cleanup_guard_receive(owner_pid, owner_ref, session)
-      end)
-
-    guard_ref = Process.monitor(guard_pid)
+    {guard_pid, guard_ref} =
+      spawn_monitor(fn -> initialize_cleanup_guard(parent, owner_pid, launch_state, arm_hook) end)
 
     receive do
-      {:cleanup_guard_armed, ^guard_pid} ->
+      {:cleanup_guard_armed, ^guard_pid, cleanup_fence_id} ->
         Process.demonitor(guard_ref, [:flush])
-        run_cleanup_guard_arm_hook(guard_pid)
+        {:ok, guard_pid, cleanup_fence_id}
 
-        case CleanupRegistry.register(owner_pid, guard_pid) do
-          :ok ->
-            {:ok, guard_pid}
-
-          {:error, reason} ->
-            Process.exit(guard_pid, :kill)
-            {:error, reason}
-        end
+      {:cleanup_guard_arm_failed, ^guard_pid, {:error, reason}} ->
+        Process.demonitor(guard_ref, [:flush])
+        {:error, reason}
 
       {:DOWN, ^guard_ref, :process, ^guard_pid, _reason} ->
         {:error, :cleanup_guard_failed}
+    end
+  end
+
+  defp initialize_cleanup_guard(parent, owner_pid, launch_state, arm_hook) do
+    Process.flag(:trap_exit, true)
+    owner_ref = Process.monitor(owner_pid)
+
+    case CleanupRegistry.register(owner_pid, self()) do
+      :ok -> initialize_registered_cleanup_guard(parent, owner_pid, owner_ref, launch_state, arm_hook)
+      {:error, reason} -> send(parent, {:cleanup_guard_arm_failed, self(), {:error, reason}})
+    end
+  end
+
+  defp initialize_registered_cleanup_guard(parent, owner_pid, owner_ref, launch_state, arm_hook) do
+    case TerminalFailure.begin_native_cleanup_fence() do
+      {:ok, cleanup_fence_id} ->
+        launch_state = Map.put(launch_state, :cleanup_fence_id, cleanup_fence_id)
+        if is_function(arm_hook, 1), do: arm_hook.(self())
+        send(parent, {:cleanup_guard_armed, self(), cleanup_fence_id})
+        cleanup_guard_receive(owner_pid, owner_ref, launch_state)
+
+      {:error, _reason} = error ->
+        :ok = CleanupRegistry.complete(owner_pid, self(), error)
+        send(parent, {:cleanup_guard_arm_failed, self(), error})
     end
   end
 

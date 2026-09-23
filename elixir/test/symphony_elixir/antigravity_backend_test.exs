@@ -568,34 +568,49 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
-  test "cleanup guard monitors its owner before registry attachment" do
+  test "registry waits for the attached guard and propagates its exact cleanup failure" do
     {root, workspace, profile, agy} = setup_fake_agy!()
     configure_backend!(agy, profile)
     parent = self()
 
     owner =
       spawn(fn ->
-        :ok = CleanupRegistry.require_ack(self())
+        owner_pid = self()
+        :ok = CleanupRegistry.require_ack(owner_pid)
 
-        Transport.with_cleanup_guard_arm_hook_for_test(
-          fn guard_pid ->
-            send(parent, {:cleanup_guard_monitor_armed, self(), guard_pid})
-            Process.sleep(:infinity)
-          end,
-          fn -> Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5) end
+        Transport.with_process_group_path_hook_for_test(
+          fn process_group_path -> File.mkdir!(process_group_path) end,
+          fn ->
+            Transport.with_cleanup_guard_arm_hook_for_test(
+              fn guard_pid ->
+                send(parent, {:cleanup_guard_attached, owner_pid, guard_pid})
+
+                receive do
+                  :continue_cleanup_guard -> :ok
+                end
+              end,
+              fn -> Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5) end
+            )
+          end
         )
       end)
 
-    assert_receive {:cleanup_guard_monitor_armed, ^owner, guard_pid}, 1_000
+    assert_receive {:cleanup_guard_attached, ^owner, guard_pid}, 1_000
     guard_ref = Process.monitor(guard_pid)
     owner_ref = Process.monitor(owner)
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
-    assert :ok = Transport.await_owner_cleanup(owner, 2_000)
+
+    cleanup_waiter = Task.async(fn -> Transport.await_owner_cleanup(owner, 2_000) end)
+    assert nil == Task.yield(cleanup_waiter, 0)
+    send(guard_pid, :continue_cleanup_guard)
+    assert {:error, _cleanup_reason} = Task.await(cleanup_waiter, 2_000)
     assert_receive {:DOWN, ^guard_ref, :process, ^guard_pid, :normal}, 1_000
 
     state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
-    assert File.ls!(Path.join(state_root, "cleanups")) == []
+    assert [fence_entry] = File.ls!(Path.join(state_root, "cleanups"))
+    cleanup_id = String.replace_suffix(fence_entry, ".json", "")
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(cleanup_id)
     File.rm_rf!(root)
   end
 
@@ -697,6 +712,24 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert :ok = CleanupRegistry.register(failed_guard_owner, failed_guard)
     Process.exit(failed_guard, :kill)
     assert {:error, :cleanup_guard_failed} = CleanupRegistry.await(failed_guard_owner, 1_000)
+
+    expected_guard_owner = spawn(fn -> Process.sleep(:infinity) end)
+    assert :ok = CleanupRegistry.require_ack(expected_guard_owner)
+    assert :ok = CleanupRegistry.expect_guard(expected_guard_owner)
+    expected_guard_ref = Process.monitor(expected_guard_owner)
+    Process.exit(expected_guard_owner, :kill)
+    assert_receive {:DOWN, ^expected_guard_ref, :process, ^expected_guard_owner, :killed}, 1_000
+
+    assert {:error, :cleanup_guard_not_attached} =
+             CleanupRegistry.await(expected_guard_owner, 1_000)
+
+    waiting_guard_owner = spawn(fn -> Process.sleep(:infinity) end)
+    assert :ok = CleanupRegistry.require_ack(waiting_guard_owner)
+    assert :ok = CleanupRegistry.expect_guard(waiting_guard_owner)
+    waiting_guard_waiter = Task.async(fn -> CleanupRegistry.await(waiting_guard_owner, 1_000) end)
+    assert nil == Task.yield(waiting_guard_waiter, 0)
+    Process.exit(waiting_guard_owner, :kill)
+    assert {:error, :cleanup_guard_not_attached} = Task.await(waiting_guard_waiter, 1_000)
 
     reserved_owner = spawn(fn -> Process.sleep(:infinity) end)
     assert :ok = CleanupRegistry.require_ack(reserved_owner)

@@ -91,8 +91,10 @@ cleanup acknowledgement latches a service-wide lifecycle fault and exposes no re
 The orchestrator registers that required acknowledgement before releasing the resumed task's start
 gate. Before opening the native port, the transport durably publishes an integrity-bound cleanup
 fence and registers its cleanup guard. The guard owns `Port.open` and transfers the opened port to the
-task, eliminating an unrepresented task-death launch window; it arms owner monitoring before
-registry attachment can be acknowledged. A positively proven pre-port failure clears the fence
+task, eliminating an unrepresented task-death launch window. The registry first records that guard
+attachment is expected; the guard then arms owner monitoring, attaches itself, and creates the fence
+before publishing its armed acknowledgment. Owner death in that interval cannot default to success:
+only the attached guard's exact completion resolves the cleanup wait. A positively proven pre-port failure clears the fence
 without claiming native cleanup. Native command execution is conditional on successful dedicated
 process-group publication, and the outer port OS PID is never accepted as a fallback process group. The fence is removed only after positive process-group absence,
 runtime-file cleanup, and filesystem synchronization. Every forced resumed-task stop consumes cleanup

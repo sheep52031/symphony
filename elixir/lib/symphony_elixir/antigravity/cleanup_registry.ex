@@ -11,6 +11,12 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   end
 
   @doc false
+  @spec expect_guard(pid()) :: :ok
+  def expect_guard(owner_pid) when is_pid(owner_pid) do
+    GenServer.call(__MODULE__, {:expect_guard, owner_pid})
+  end
+
+  @doc false
   @spec register(pid(), pid()) :: :ok | {:error, :cleanup_owner_already_registered}
   def register(owner_pid, guard_pid) when is_pid(owner_pid) and is_pid(guard_pid) do
     GenServer.call(__MODULE__, {:register, owner_pid, guard_pid})
@@ -45,10 +51,20 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   def init(state), do: {:ok, state}
 
   @impl true
+  def handle_call({:expect_guard, owner_pid}, _from, state) do
+    entry =
+      case Map.get(state, owner_pid) do
+        nil -> new_entry(owner_pid, nil, false, true)
+        existing -> %{existing | guard_expected?: true}
+      end
+
+    {:reply, :ok, Map.put(state, owner_pid, entry)}
+  end
+
   def handle_call({:register, owner_pid, guard_pid}, _from, state) do
     case Map.get(state, owner_pid) do
       nil ->
-        {:reply, :ok, Map.put(state, owner_pid, new_entry(owner_pid, guard_pid, false))}
+        {:reply, :ok, Map.put(state, owner_pid, new_entry(owner_pid, guard_pid, false, false))}
 
       %{guard_pid: nil} = entry ->
         {:reply, :ok, Map.put(state, owner_pid, attach_guard(entry, guard_pid))}
@@ -65,7 +81,7 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
     state =
       case Map.fetch(state, owner_pid) do
         {:ok, entry} -> Map.put(state, owner_pid, %{entry | required?: true})
-        :error -> Map.put(state, owner_pid, new_entry(owner_pid, nil, true))
+        :error -> Map.put(state, owner_pid, new_entry(owner_pid, nil, true, false))
       end
 
     {:reply, :ok, state}
@@ -107,6 +123,37 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
       end)
 
     {:noreply, handle_monitored_down(monitored_entry, monitor_ref, state)}
+  end
+
+  defp handle_monitored_down(
+         {owner_pid,
+          %{
+            monitor_ref: monitor_ref,
+            guard_pid: nil,
+            guard_expected?: true,
+            required?: true,
+            waiters: []
+          } = entry},
+         monitor_ref,
+         state
+       ) do
+    Map.put(state, owner_pid, %{entry | result: {:error, :cleanup_guard_not_attached}})
+  end
+
+  defp handle_monitored_down(
+         {owner_pid,
+          %{
+            monitor_ref: monitor_ref,
+            guard_pid: nil,
+            guard_expected?: true,
+            required?: true,
+            waiters: waiters
+          } = entry},
+         monitor_ref,
+         state
+       ) do
+    Enum.each(waiters, &GenServer.reply(&1, {:error, :cleanup_guard_not_attached}))
+    delete_entry(state, owner_pid, entry)
   end
 
   defp handle_monitored_down(
@@ -161,9 +208,10 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
 
   defp handle_monitored_down(_monitored_entry, _monitor_ref, state), do: state
 
-  defp new_entry(owner_pid, guard_pid, required?) do
+  defp new_entry(owner_pid, guard_pid, required?, guard_expected?) do
     %{
       guard_pid: guard_pid,
+      guard_expected?: guard_expected?,
       guard_monitor_ref: if(is_pid(guard_pid), do: Process.monitor(guard_pid)),
       result: nil,
       waiters: [],
@@ -173,7 +221,13 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   end
 
   defp attach_guard(entry, guard_pid) do
-    %{entry | guard_pid: guard_pid, guard_monitor_ref: Process.monitor(guard_pid)}
+    %{
+      entry
+      | guard_pid: guard_pid,
+        guard_expected?: false,
+        guard_monitor_ref: Process.monitor(guard_pid),
+        result: nil
+    }
   end
 
   defp detach_guard_monitor(%{guard_monitor_ref: nil} = entry), do: entry

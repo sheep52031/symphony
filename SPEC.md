@@ -598,8 +598,11 @@ Launch and protocol requirements:
   integrity-bound cleanup fence and register its cleanup guard. The guard MUST own `Port.open` and
   transfer the opened port to the task, so task death cannot create an unrepresented launch window;
   a positively proven pre-port failure clears the fence without claiming that a process was cleaned.
-  The guard MUST establish its owner monitor before registry attachment is acknowledged. Native
-  command execution MUST be conditional on successful process-group publication; the outer port OS
+  Before spawning the guard, the registry MUST record that guard attachment is expected. The guard
+  MUST establish its owner monitor, attach itself to that registry expectation, and create the fence
+  before publishing its armed acknowledgment. Once a guard is expected, owner death MUST NOT produce
+  a default successful cleanup acknowledgment; only the attached guard's exact completion may resolve
+  the wait. Native command execution MUST be conditional on successful process-group publication; the outer port OS
   PID MUST NOT substitute for an unverified dedicated process-group ID. The fence may be removed only after
   positive native process-group absence and runtime-file cleanup, followed by a successful filesystem
   synchronization. Every orchestrator-forced resumed-task termination MUST stop the task and consume
