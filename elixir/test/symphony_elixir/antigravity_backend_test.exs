@@ -601,10 +601,20 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
 
-    cleanup_waiter = Task.async(fn -> Transport.await_owner_cleanup(owner, 2_000) end)
+    cleanup_waiter =
+      Task.async(fn ->
+        CleanupRegistry.await_with_registration_notice_for_test(owner, parent, 2_000)
+      end)
+
+    assert_receive {:cleanup_waiter_registered, ^owner}, 1_000
     assert nil == Task.yield(cleanup_waiter, 0)
     send(guard_pid, :continue_cleanup_guard)
-    assert {:error, _cleanup_reason} = Task.await(cleanup_waiter, 2_000)
+
+    assert {:error, {:antigravity_runtime_cleanup_failed, cleanup_reason}} =
+             Task.await(cleanup_waiter, 2_000)
+
+    assert cleanup_reason in [:eacces, :eisdir, :eperm]
+
     assert_receive {:DOWN, ^guard_ref, :process, ^guard_pid, :normal}, 1_000
 
     state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)

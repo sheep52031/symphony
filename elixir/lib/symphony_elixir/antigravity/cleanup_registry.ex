@@ -41,7 +41,20 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
 
   @spec await(pid(), timeout()) :: cleanup_result() | {:error, :cleanup_not_registered}
   def await(owner_pid, timeout_ms) when is_pid(owner_pid) and is_integer(timeout_ms) and timeout_ms > 0 do
-    GenServer.call(__MODULE__, {:await, owner_pid}, timeout_ms)
+    call_await({:await, owner_pid}, timeout_ms)
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    @spec await_with_registration_notice_for_test(pid(), pid(), timeout()) :: cleanup_result()
+    def await_with_registration_notice_for_test(owner_pid, observer_pid, timeout_ms)
+        when is_pid(owner_pid) and is_pid(observer_pid) and is_integer(timeout_ms) and timeout_ms > 0 do
+      call_await({:await_with_registration_notice, owner_pid, observer_pid}, timeout_ms)
+    end
+  end
+
+  defp call_await(request, timeout_ms) do
+    GenServer.call(__MODULE__, request, timeout_ms)
   catch
     :exit, {:timeout, _call} -> {:error, :cleanup_ack_timeout}
     :exit, {:noproc, _call} -> {:error, :cleanup_registry_unavailable}
@@ -103,6 +116,17 @@ defmodule SymphonyElixir.Antigravity.CleanupRegistry do
   end
 
   def handle_call({:await, owner_pid}, from, state) do
+    handle_await(owner_pid, from, state)
+  end
+
+  if Mix.env() == :test do
+    def handle_call({:await_with_registration_notice, owner_pid, observer_pid}, from, state) do
+      send(observer_pid, {:cleanup_waiter_registered, owner_pid})
+      handle_await(owner_pid, from, state)
+    end
+  end
+
+  defp handle_await(owner_pid, from, state) do
     case Map.get(state, owner_pid) do
       nil ->
         {:reply, {:error, :cleanup_not_registered}, state}
