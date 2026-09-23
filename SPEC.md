@@ -569,9 +569,11 @@ Launch and protocol requirements:
   while holding an exclusive lock on a stable ownership key independent of marker existence. Lock
   ownership MUST be atomically published with its generation token and recoverable. Reclamation
   MUST fence the observed inode generation so a competing stale reclaimer cannot remove a
-  replacement owner's lock. Reclaim publication and startup lock-namespace recovery MUST share a
-  VM-wide serialization boundary, so startup removes only candidate/reclaim links that cannot belong
-  to an in-progress local reclaimer. Startup MUST fail closed on the prior directory-form lock format
+  replacement owner's lock. Reclaim publication, replacement publication, and startup lock-namespace
+  recovery MUST share a VM-wide serialization boundary. On Linux they MUST additionally hold one
+  stable advisory filesystem lock across processes, so the final generation check and unlink cannot
+  race another publisher or startup transient cleanup. Startup therefore removes only
+  candidate/reclaim links that cannot belong to an in-progress compliant reclaimer. Startup MUST fail closed on the prior directory-form lock format
   or any unsupported lock target. Runtime identity is fixed for the VM. A prior runtime
   is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
   namespace reports the PID absent or a strictly parsed positive process-start time mismatch.
@@ -591,7 +593,9 @@ Launch and protocol requirements:
   unavailable or failed acknowledgement is a service-wide lifecycle fault, not a resumable hold.
   The orchestrator MUST durably require the acknowledgement before releasing a resumed AntiGravity
   task's start gate. Before opening the native port, the transport MUST durably publish a strict,
-  integrity-bound cleanup fence and register its cleanup guard. The fence may be removed only after
+  integrity-bound cleanup fence and register its cleanup guard. The guard MUST own `Port.open` and
+  transfer the opened port to the task, so task death cannot create an unrepresented launch window;
+  a positively proven pre-port failure clears the fence without claiming that a process was cleaned. The fence may be removed only after
   positive native process-group absence and runtime-file cleanup, followed by a successful filesystem
   synchronization. Every orchestrator-forced resumed-task termination MUST stop the task and consume
   cleanup proof before replying, settling lifecycle state, or removing a workspace. Cleanup registry,

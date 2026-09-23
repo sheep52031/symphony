@@ -551,6 +551,23 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     end
   end
 
+  test "pre-port launch failure positively clears its durable cleanup fence" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+
+    assert {:error, %ErlangError{original: :forced_port_open}} =
+             Transport.with_port_open_override_for_test(
+               fn _port_name, _port_options -> :erlang.error(:forced_port_open) end,
+               fn ->
+                 Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5)
+               end
+             )
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    assert File.ls!(Path.join(state_root, "cleanups")) == []
+    File.rm_rf!(root)
+  end
+
   test "normal stop reaps a native descendant in the owned process group" do
     {root, workspace, profile, agy} = setup_fake_agy!()
     configure_backend!(agy, profile)

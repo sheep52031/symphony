@@ -1064,10 +1064,15 @@ defmodule SymphonyElixir.TerminalFailure do
     |> Base.encode16(case: :lower)
   end
 
-  defp valid_hex_id?(value), do: valid_hash?(value)
+  defp valid_hex_id?(value) do
+    byte_size(value) == 64 and String.match?(value, ~r/\A[0-9a-f]{64}\z/)
+  end
 
   defp native_cleanup_fence_path(cleanup_id) do
-    Path.join([state_root(), "cleanups", "#{cleanup_id}.json"])
+    directory = Path.expand(Path.join(state_root(), "cleanups"))
+    filename = "#{cleanup_id}.json"
+    {:ok, ^filename} = Path.safe_relative(filename, directory)
+    Path.join(directory, filename)
   end
 
   defp native_cleanup_fence_payload(cleanup_id) do
@@ -1142,10 +1147,8 @@ defmodule SymphonyElixir.TerminalFailure do
   end
 
   defp validate_native_cleanup_fence(path, entry) do
-    expected_id = String.trim_trailing(entry, ".json")
-
-    with true <- String.ends_with?(entry, ".json"),
-         true <- valid_hex_id?(expected_id),
+    with [expected_id] <-
+           Regex.run(~r/\A([0-9a-f]{64})\.json\z/, entry, capture: :all_but_first),
          {:ok, %File.Stat{type: :regular, size: size}} when size <= 2_048 <- cleanup_fence_lstat(path),
          {:ok, contents} <- File.read(path),
          {:ok, decoded} when is_map(decoded) <- Jason.decode(contents),
@@ -1590,6 +1593,9 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
   else
+    @flock_path "/usr/bin/flock"
+    @bash_path "/usr/bin/bash"
+
     defp lock_override(_key, fallback), do: fallback.()
     defp lock_process_read(pid), do: File.read("/proc/#{pid}/stat")
     defp read_lock_file(path), do: File.read(path)
@@ -1601,8 +1607,109 @@ defmodule SymphonyElixir.TerminalFailure do
     defp cleanup_fence_lstat(path), do: File.lstat(path)
     defp run_native_cleanup_wait_hook, do: :ok
 
-    defp run_lock_namespace_transaction(operation),
-      do: :global.trans({@lock_namespace_mutex, self()}, operation, [node()])
+    defp run_lock_namespace_transaction(operation) do
+      :global.trans(
+        {@lock_namespace_mutex, self()},
+        fn -> with_filesystem_namespace_lock(operation) end,
+        [node()]
+      )
+    end
+
+    if :os.type() == {:unix, :linux} do
+      defp with_filesystem_namespace_lock(operation), do: with_linux_namespace_lock(operation)
+    else
+      defp with_filesystem_namespace_lock(operation), do: operation.()
+    end
+
+    defp with_linux_namespace_lock(operation) do
+      lock_path = Path.join([state_root(), "locks", ".namespace.guard"])
+
+      with :ok <- prepare_namespace_guard(lock_path),
+           :ok <- trusted_lock_executable(@flock_path),
+           :ok <- trusted_lock_executable(@bash_path),
+           {:ok, port} <- open_namespace_lock_port(lock_path) do
+        try do
+          result = operation.()
+
+          case release_namespace_lock_port(port) do
+            :ok -> result
+            {:error, _reason} = error -> error
+          end
+        after
+          close_namespace_lock_port(port)
+        end
+      end
+    end
+
+    defp prepare_namespace_guard(path) do
+      with :ok <- File.mkdir_p(Path.dirname(path)) do
+        case File.lstat(path) do
+          {:ok, %File.Stat{type: :regular}} -> :ok
+          {:ok, %File.Stat{type: type}} -> {:error, {:invalid_lock_namespace_guard, type}}
+          {:error, :enoent} -> atomic_create(path, "")
+          {:error, reason} -> {:error, {:lock_namespace_guard_unavailable, reason}}
+        end
+      end
+    end
+
+    defp trusted_lock_executable(path) do
+      case File.stat(path) do
+        {:ok, %File.Stat{type: :regular, mode: mode}} when Bitwise.band(mode, 0o111) != 0 -> :ok
+        _other -> {:error, :lock_namespace_executable_unavailable}
+      end
+    end
+
+    defp open_namespace_lock_port(lock_path) do
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(@flock_path)},
+          [
+            :binary,
+            :exit_status,
+            args: [
+              ~c"-x",
+              ~c"-w",
+              ~c"10",
+              String.to_charlist(lock_path),
+              String.to_charlist(@bash_path),
+              ~c"-c",
+              ~c"printf 'LOCKED\\n'; IFS= read -r _"
+            ],
+            line: 128
+          ]
+        )
+
+      receive do
+        {^port, {:data, {:eol, "LOCKED"}}} -> {:ok, port}
+        {^port, {:exit_status, status}} -> {:error, {:lock_namespace_acquire_failed, status}}
+      after
+        10_500 ->
+          close_namespace_lock_port(port)
+          {:error, :lock_namespace_acquire_timeout}
+      end
+    rescue
+      _error -> {:error, :lock_namespace_acquire_failed}
+    end
+
+    defp release_namespace_lock_port(port) do
+      Port.command(port, "\n")
+
+      receive do
+        {^port, {:exit_status, 0}} -> :ok
+        {^port, {:exit_status, status}} -> {:error, {:lock_namespace_release_failed, status}}
+      after
+        1_000 -> {:error, :lock_namespace_release_timeout}
+      end
+    rescue
+      _error -> {:error, :lock_namespace_release_failed}
+    end
+
+    defp close_namespace_lock_port(port) do
+      Port.close(port)
+      :ok
+    rescue
+      _error -> :ok
+    end
 
     defp run_directory_sync(directory),
       do: System.cmd(@sync_path, ["-f", directory], stderr_to_stdout: true)

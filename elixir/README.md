@@ -57,9 +57,11 @@ retry/continuation attempt used by prompts and backoff. It is changed under a st
 lock that exists independently of marker files, is atomically published with a generation token,
 and carries a VM-stable runtime identity plus strict machine, boot, PID-namespace, PID, and
 process-start ownership. Stale reclamation fences the observed inode generation so it cannot delete
-a replacement lock. Reclaim publication and startup namespace recovery share a VM-wide serialization
-boundary, so startup removes only candidate/reclaim links that cannot belong to an in-progress local
-reclaimer, and rejects the prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
+a replacement lock. Reclaim publication, replacement publication, and startup namespace recovery
+share a VM-wide serialization boundary; on Linux they also hold one stable advisory filesystem lock
+across processes through the final generation check and unlink. Startup therefore removes only
+candidate/reclaim links that cannot belong to an in-progress compliant reclaimer, and rejects the
+prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
 and live, malformed, remote, cross-namespace, or ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
 Codex remains the default and rollback path;
 Pi remains supported.
@@ -86,7 +88,9 @@ AntiGravity cleanup guard acknowledges that the old native process group is empt
 cleanup acknowledgement latches a service-wide lifecycle fault and exposes no resumable successor.
 The orchestrator registers that required acknowledgement before releasing the resumed task's start
 gate. Before opening the native port, the transport durably publishes an integrity-bound cleanup
-fence and registers its cleanup guard. The fence is removed only after positive process-group absence,
+fence and registers its cleanup guard. The guard owns `Port.open` and transfers the opened port to the
+task, eliminating an unrepresented task-death launch window; a positively proven pre-port failure
+clears the fence without claiming native cleanup. The fence is removed only after positive process-group absence,
 runtime-file cleanup, and filesystem synchronization. Every forced resumed-task stop consumes cleanup
 proof before state settlement, reply, or workspace deletion. Cleanup registry, task supervisor, and
 orchestrator share one-for-all restart ownership; the detached guard and durable fence bridge that

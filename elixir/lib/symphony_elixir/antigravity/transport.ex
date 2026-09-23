@@ -19,6 +19,10 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @usage_fields ~w(input_tokens output_tokens thinking_tokens cache_read_tokens total_tokens)
   @secret_name_pattern ~r/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE[_-]?KEY)/i
 
+  if Mix.env() == :test do
+    @port_open_override_key {__MODULE__, :port_open_override}
+  end
+
   @type session :: %{
           port: port(),
           state: pid(),
@@ -34,6 +38,28 @@ defmodule SymphonyElixir.Antigravity.Transport do
         }
 
   @type native_event_handler :: (map() -> term())
+
+  if Mix.env() == :test do
+    @doc false
+    @spec with_port_open_override_for_test((term(), list() -> port()), (-> result)) :: result
+          when result: term()
+    def with_port_open_override_for_test(port_opener, operation)
+        when is_function(port_opener, 2) and is_function(operation, 0) do
+      Process.put(@port_open_override_key, port_opener)
+
+      try do
+        operation.()
+      after
+        Process.delete(@port_open_override_key)
+      end
+    end
+
+    defp port_opener do
+      Process.get(@port_open_override_key, &Port.open/2)
+    end
+  else
+    defp port_opener, do: &Port.open/2
+  end
 
   @spec start(Path.t(), Path.t(), Path.t(), pos_integer(), keyword()) ::
           {:ok, session()} | {:error, term()}
@@ -122,6 +148,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
            arm_cleanup_guard(self(), %{
              port: nil,
              backend_process_pid: nil,
+             launch_requested?: false,
              process_group_id: nil,
              process_group_path: process_group_path,
              stderr_path: stderr_path
@@ -134,29 +161,27 @@ defmodule SymphonyElixir.Antigravity.Transport do
       launch_command =
         "exec #{shell_escape(@setsid_path)} --wait #{shell_escape(@bash_path)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
 
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(@bash_path)},
-          [
-            :binary,
-            :exit_status,
-            args: [~c"-c", String.to_charlist(launch_command)],
-            cd: String.to_charlist(launch.workspace),
-            env: secret_port_env(Keyword.get(opts, :secret_environment_names, [])),
-            line: @line_bytes
-          ]
+      port_spec =
+        {{:spawn_executable, String.to_charlist(@bash_path)},
+         [
+           :binary,
+           :exit_status,
+           args: [~c"-c", String.to_charlist(launch_command)],
+           cd: String.to_charlist(launch.workspace),
+           env: secret_port_env(Keyword.get(opts, :secret_environment_names, [])),
+           line: @line_bytes
+         ], port_opener()}
+
+      with {:ok, port} <- open_cleanup_guard_port(guard_pid, port_spec) do
+        finalize_started_port(
+          port,
+          launch,
+          stderr_path,
+          process_group_path,
+          guard_pid,
+          cleanup_fence_id
         )
-
-      send(guard_pid, {:antigravity_port_opened, port, port_os_pid(port)})
-
-      finalize_started_port(
-        port,
-        launch,
-        stderr_path,
-        process_group_path,
-        guard_pid,
-        cleanup_fence_id
-      )
+      end
     end
   end
 
@@ -681,6 +706,21 @@ defmodule SymphonyElixir.Antigravity.Transport do
     _error -> false
   end
 
+  defp open_cleanup_guard_port(guard_pid, port_spec) do
+    request_ref = make_ref()
+    guard_ref = Process.monitor(guard_pid)
+    send(guard_pid, {:open_antigravity_port, self(), request_ref, port_spec})
+
+    receive do
+      {:antigravity_port_result, ^request_ref, result} ->
+        Process.demonitor(guard_ref, [:flush])
+        result
+
+      {:DOWN, ^guard_ref, :process, ^guard_pid, _reason} ->
+        {:error, :antigravity_cleanup_guard_failed}
+    end
+  end
+
   defp arm_cleanup_guard(owner_pid, launch_state) do
     case TerminalFailure.begin_native_cleanup_fence() do
       {:ok, cleanup_fence_id} ->
@@ -709,6 +749,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
   defp start_cleanup_guard(owner_pid, session) do
     guard_pid =
       spawn(fn ->
+        Process.flag(:trap_exit, true)
+
         receive do
           {:monitor_owner, ^owner_pid} -> cleanup_guard_loop(owner_pid, session)
         end
@@ -732,12 +774,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
   defp cleanup_guard_receive(owner_pid, owner_ref, launch_state) do
     receive do
-      {:antigravity_port_opened, port, backend_process_pid} ->
-        cleanup_guard_receive(owner_pid, owner_ref, %{
-          launch_state
-          | port: port,
-            backend_process_pid: backend_process_pid
-        })
+      {:open_antigravity_port, ^owner_pid, request_ref, port_spec} ->
+        open_native_port(owner_pid, owner_ref, request_ref, port_spec, launch_state)
 
       {:antigravity_session_ready, session} ->
         cleanup_guard_receive(owner_pid, owner_ref, session)
@@ -751,12 +789,84 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
       {:DOWN, ^owner_ref, :process, ^owner_pid, _reason} ->
         complete_guard_cleanup(owner_pid, launch_state)
+
+      {port, _message} = port_message when is_port(port) ->
+        if port == Map.get(launch_state, :port), do: send(owner_pid, port_message)
+        cleanup_guard_receive(owner_pid, owner_ref, launch_state)
+
+      {:EXIT, port, _reason} when is_port(port) ->
+        cleanup_guard_receive(owner_pid, owner_ref, launch_state)
     end
+  end
+
+  defp open_native_port(
+         owner_pid,
+         owner_ref,
+         request_ref,
+         {port_name, port_options, port_opener},
+         launch_state
+       ) do
+    launch_state = Map.put(launch_state, :launch_requested?, true)
+
+    case guarded_port_open(port_opener, port_name, port_options) do
+      {:ok, port} ->
+        opened_state = %{
+          launch_state
+          | port: port,
+            backend_process_pid: port_os_pid(port)
+        }
+
+        case connect_port_owner(port, owner_pid) do
+          :ok ->
+            Process.unlink(port)
+            send(owner_pid, {:antigravity_port_result, request_ref, {:ok, port}})
+            cleanup_guard_receive(owner_pid, owner_ref, opened_state)
+
+          {:error, :port_owner_transfer_failed} ->
+            fail_guarded_port_open(
+              owner_pid,
+              request_ref,
+              opened_state,
+              :antigravity_port_owner_transfer_failed
+            )
+        end
+
+      {:error, reason} ->
+        no_port_state = Map.put(launch_state, :launch_requested?, false)
+        fail_guarded_port_open(owner_pid, request_ref, no_port_state, reason)
+    end
+  end
+
+  defp connect_port_owner(port, owner_pid) do
+    Port.connect(port, owner_pid)
+    :ok
+  rescue
+    _error -> {:error, :port_owner_transfer_failed}
+  end
+
+  defp guarded_port_open(port_opener, port_name, port_options) do
+    {:ok, port_opener.(port_name, port_options)}
+  rescue
+    error in [ArgumentError, ErlangError, File.Error] -> {:error, error}
+  end
+
+  defp fail_guarded_port_open(owner_pid, request_ref, launch_state, reason) do
+    cleanup_result = cleanup_guard_launch(launch_state)
+    cleanup_result = settle_cleanup_fence(cleanup_result, launch_state)
+    :ok = CleanupRegistry.complete(owner_pid, self(), cleanup_result)
+
+    result = if cleanup_result == :ok, do: {:error, reason}, else: cleanup_result
+    send(owner_pid, {:antigravity_port_result, request_ref, result})
   end
 
   defp complete_guard_cleanup(owner_pid, launch_state) do
     result = launch_state |> cleanup_guard_launch() |> settle_cleanup_fence(launch_state)
     :ok = CleanupRegistry.complete(owner_pid, self(), result)
+  end
+
+  defp cleanup_guard_launch(%{launch_requested?: false} = launch_state) do
+    runtime_result = remove_runtime_files(launch_state)
+    merge_cleanup_results(:ok, runtime_result)
   end
 
   defp cleanup_guard_launch(%{process_group_id: process_group_id} = launch_state)

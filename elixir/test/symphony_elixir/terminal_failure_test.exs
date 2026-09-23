@@ -40,6 +40,15 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert {:error, :invalid_native_cleanup_fence_id} =
              TerminalFailure.complete_native_cleanup_fence("not-a-fence")
 
+    traversal_id = String.duplicate("../", 20) <> "x123"
+    assert byte_size(traversal_id) == 64
+
+    assert {:error, :invalid_native_cleanup_fence_id} =
+             TerminalFailure.complete_native_cleanup_fence(traversal_id)
+
+    assert {:error, :invalid_native_cleanup_fence_id} =
+             TerminalFailure.complete_native_cleanup_fence(String.duplicate("A", 64))
+
     assert {:ok, unresolved_id} = TerminalFailure.begin_native_cleanup_fence()
     assert {:error, {:native_cleanup_incomplete, 1}} = TerminalFailure.storage_ready()
     assert :ok = TerminalFailure.complete_native_cleanup_fence(unresolved_id)
@@ -53,6 +62,16 @@ defmodule SymphonyElixir.TerminalFailureTest do
              TerminalFailure.storage_ready()
 
     File.rm!(malformed_path)
+
+    assert {:ok, repeated_suffix_id} = TerminalFailure.begin_native_cleanup_fence()
+    canonical_path = Path.join([state_root, "cleanups", "#{repeated_suffix_id}.json"])
+    repeated_suffix_path = canonical_path <> ".json"
+    File.rename!(canonical_path, repeated_suffix_path)
+
+    assert {:error, {:invalid_native_cleanup_fence, _, :invalid_payload}} =
+             TerminalFailure.storage_ready()
+
+    File.rm!(repeated_suffix_path)
     assert :ok = TerminalFailure.storage_ready()
   end
 
@@ -1319,6 +1338,51 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert_receive {:DOWN, ^holder_ref, :process, ^holder, :normal}, 1_000
     assert File.regular?(lock_path)
     File.rm!(lock_path)
+  end
+
+  test "stale final unlink serializes a replacement publisher through the namespace transaction" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("final-unlink")
+    on_exit(fn -> File.rm_rf!(root) end)
+    {holder, _owner} = start_lock_holder!(workspace, issue_id, lock_path)
+    kill_lock_holder!(holder)
+    parent = self()
+
+    reclaimer =
+      Task.async(fn ->
+        TerminalFailure.with_lock_overrides_for_test(
+          %{
+            public_remove: fn path ->
+              send(parent, :final_unlink_reached)
+
+              receive do
+                :finish_final_unlink -> File.rm(path)
+              end
+            end
+          },
+          &TerminalFailure.storage_ready/0
+        )
+      end)
+
+    assert_receive :final_unlink_reached, 1_000
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    replacement = Task.async(fn -> TerminalFailure.persist(workspace, evidence) end)
+    assert nil == Task.yield(replacement, 0)
+
+    send(reclaimer.pid, :finish_final_unlink)
+    assert :ok = Task.await(reclaimer, 1_000)
+    assert {:ok, _receipt} = Task.await(replacement, 1_000)
+    assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
   end
 
   test "lock namespace recovery fails closed on storage errors" do
