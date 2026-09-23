@@ -1482,6 +1482,13 @@ defmodule SymphonyElixir.TerminalFailure do
     defp valid_lock_override?(_entry), do: false
 
     @doc false
+    @spec settle_namespace_release_for_test(term(), :ok | {:error, term()}, :ok | {:error, term()}) ::
+            term()
+    def settle_namespace_release_for_test(operation_result, release_result, close_result) do
+      settle_namespace_lock_release(operation_result, release_result, fn -> close_result end)
+    end
+
+    @doc false
     @spec with_terminal_persist_hook_for_test((atom() -> term()), (-> result)) :: result when result: term()
     def with_terminal_persist_hook_for_test(hook, operation)
         when is_function(hook, 1) and is_function(operation, 0) do
@@ -1569,13 +1576,13 @@ defmodule SymphonyElixir.TerminalFailure do
       end
     end
 
-    defp run_lock_namespace_transaction(operation) do
+    defp with_filesystem_namespace_lock(operation) do
       case Process.get(@lock_test_overrides_key, %{}) do
         %{namespace_transaction: transaction} when is_function(transaction, 1) ->
           transaction.(operation)
 
         _overrides ->
-          :global.trans({@lock_namespace_mutex, self()}, operation, [node()])
+          operation.()
       end
     end
 
@@ -1607,14 +1614,6 @@ defmodule SymphonyElixir.TerminalFailure do
     defp cleanup_fence_lstat(path), do: File.lstat(path)
     defp run_native_cleanup_wait_hook, do: :ok
 
-    defp run_lock_namespace_transaction(operation) do
-      :global.trans(
-        {@lock_namespace_mutex, self()},
-        fn -> with_filesystem_namespace_lock(operation) end,
-        [node()]
-      )
-    end
-
     if :os.type() == {:unix, :linux} do
       defp with_filesystem_namespace_lock(operation), do: with_linux_namespace_lock(operation)
     else
@@ -1631,12 +1630,11 @@ defmodule SymphonyElixir.TerminalFailure do
         try do
           result = operation.()
 
-          case release_namespace_lock_port(port) do
-            :ok -> result
-            {:error, _reason} = error -> error
-          end
+          settle_namespace_lock_release(result, release_namespace_lock_port(port), fn ->
+            close_namespace_lock_port(port)
+          end)
         after
-          close_namespace_lock_port(port)
+          _ = close_namespace_lock_port(port)
         end
       end
     end
@@ -1705,16 +1703,42 @@ defmodule SymphonyElixir.TerminalFailure do
     end
 
     defp close_namespace_lock_port(port) do
-      Port.close(port)
-      :ok
+      case Port.info(port) do
+        nil ->
+          :ok
+
+        _info ->
+          Port.close(port)
+          :ok
+      end
     rescue
-      _error -> :ok
+      _error -> {:error, :lock_namespace_port_close_failed}
     end
 
     defp run_directory_sync(directory),
       do: System.cmd(@sync_path, ["-f", directory], stderr_to_stdout: true)
 
     defp run_terminal_persist_hook(_phase), do: :ok
+  end
+
+  defp settle_namespace_lock_release(operation_result, :ok, _close_port), do: operation_result
+
+  defp settle_namespace_lock_release(operation_result, {:error, release_reason}, close_port) do
+    case close_port.() do
+      :ok ->
+        operation_result
+
+      {:error, close_reason} ->
+        {:namespace_release_failed, release_reason, close_reason, operation_result}
+    end
+  end
+
+  defp run_lock_namespace_transaction(operation) do
+    :global.trans(
+      {@lock_namespace_mutex, self()},
+      fn -> with_filesystem_namespace_lock(operation) end,
+      [node()]
+    )
   end
 
   defp with_active_marker_locks(paths, operation) do
@@ -1729,6 +1753,10 @@ defmodule SymphonyElixir.TerminalFailure do
           release_marker_locks(acquired)
         end
 
+      {:error, {:terminal_lock_namespace_release_failed, release_reason, close_reason, {:ok, acquired}}} ->
+        release_marker_locks(acquired)
+        {:error, {:terminal_lock_namespace_release_failed, release_reason, close_reason}}
+
       {:error, reason, acquired} ->
         release_marker_locks(acquired)
         {:error, reason}
@@ -1740,8 +1768,14 @@ defmodule SymphonyElixir.TerminalFailure do
 
   defp with_lock_namespace_mutex(operation) do
     case run_lock_namespace_transaction(operation) do
-      {:aborted, reason} -> {:error, {:terminal_lock_namespace_serialization_failed, reason}}
-      result -> result
+      {:aborted, reason} ->
+        {:error, {:terminal_lock_namespace_serialization_failed, reason}}
+
+      {:namespace_release_failed, release_reason, close_reason, operation_result} ->
+        {:error, {:terminal_lock_namespace_release_failed, release_reason, close_reason, operation_result}}
+
+      result ->
+        result
     end
   end
 

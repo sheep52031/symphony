@@ -59,7 +59,9 @@ and carries a VM-stable runtime identity plus strict machine, boot, PID-namespac
 process-start ownership. Stale reclamation fences the observed inode generation so it cannot delete
 a replacement lock. Reclaim publication, replacement publication, and startup namespace recovery
 share a VM-wide serialization boundary; on Linux they also hold one stable advisory filesystem lock
-across processes through the final generation check and unlink. Startup therefore removes only
+across processes through the final generation check and unlink. A helper-release anomaly preserves
+a successful acquisition only after the helper port is positively closed, so the caller can still
+release its ownership marker; an unprovable close fails closed. Startup therefore removes only
 candidate/reclaim links that cannot belong to an in-progress compliant reclaimer, and rejects the
 prior directory-form lock format or any unsupported lock target. Only a proven reboot, absent PID, or PID reuse is reclaimed; unavailable probes
 and live, malformed, remote, cross-namespace, or ownerless locks fail closed. Stale, cleared, or concurrent events cannot overwrite or resurrect a hold.
@@ -89,8 +91,10 @@ cleanup acknowledgement latches a service-wide lifecycle fault and exposes no re
 The orchestrator registers that required acknowledgement before releasing the resumed task's start
 gate. Before opening the native port, the transport durably publishes an integrity-bound cleanup
 fence and registers its cleanup guard. The guard owns `Port.open` and transfers the opened port to the
-task, eliminating an unrepresented task-death launch window; a positively proven pre-port failure
-clears the fence without claiming native cleanup. The fence is removed only after positive process-group absence,
+task, eliminating an unrepresented task-death launch window; it arms owner monitoring before
+registry attachment can be acknowledged. A positively proven pre-port failure clears the fence
+without claiming native cleanup. Native command execution is conditional on successful dedicated
+process-group publication, and the outer port OS PID is never accepted as a fallback process group. The fence is removed only after positive process-group absence,
 runtime-file cleanup, and filesystem synchronization. Every forced resumed-task stop consumes cleanup
 proof before state settlement, reply, or workspace deletion. Cleanup registry, task supervisor, and
 orchestrator share one-for-all restart ownership; the detached guard and durable fence bridge that

@@ -572,7 +572,9 @@ Launch and protocol requirements:
   replacement owner's lock. Reclaim publication, replacement publication, and startup lock-namespace
   recovery MUST share a VM-wide serialization boundary. On Linux they MUST additionally hold one
   stable advisory filesystem lock across processes, so the final generation check and unlink cannot
-  race another publisher or startup transient cleanup. Startup therefore removes only
+  race another publisher or startup transient cleanup. Namespace-lock release handling MUST preserve
+  a successful ownership acquisition long enough for the caller to release its marker; a positively
+  closed lock-helper port may preserve the operation result, while an unprovable close fails closed. Startup therefore removes only
   candidate/reclaim links that cannot belong to an in-progress compliant reclaimer. Startup MUST fail closed on the prior directory-form lock format
   or any unsupported lock target. Runtime identity is fixed for the VM. A prior runtime
   is reclaimed only from positive proof: the same machine has rebooted, or the same boot and PID
@@ -595,7 +597,10 @@ Launch and protocol requirements:
   task's start gate. Before opening the native port, the transport MUST durably publish a strict,
   integrity-bound cleanup fence and register its cleanup guard. The guard MUST own `Port.open` and
   transfer the opened port to the task, so task death cannot create an unrepresented launch window;
-  a positively proven pre-port failure clears the fence without claiming that a process was cleaned. The fence may be removed only after
+  a positively proven pre-port failure clears the fence without claiming that a process was cleaned.
+  The guard MUST establish its owner monitor before registry attachment is acknowledged. Native
+  command execution MUST be conditional on successful process-group publication; the outer port OS
+  PID MUST NOT substitute for an unverified dedicated process-group ID. The fence may be removed only after
   positive native process-group absence and runtime-file cleanup, followed by a successful filesystem
   synchronization. Every orchestrator-forced resumed-task termination MUST stop the task and consume
   cleanup proof before replying, settling lifecycle state, or removing a workspace. Cleanup registry,

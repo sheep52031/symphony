@@ -1385,6 +1385,111 @@ defmodule SymphonyElixir.TerminalFailureTest do
     assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
   end
 
+  test "namespace wrapper preserves acquired ownership for outer cleanup after release handling" do
+    {root, workspace, issue_id, lock_path} = lock_fixture!("release-failure")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    evidence =
+      TerminalFailure.build(:worker_crashed, %{}, %{
+        backend: :antigravity,
+        issue_id: issue_id,
+        issue_identifier: "JARVIS-936",
+        attempt: 0,
+        session_id: nil,
+        workspace: workspace,
+        binding_id: nil
+      })
+
+    release_failure = :forced_namespace_release_failure
+    close_failure = :forced_namespace_close_failure
+    expected_release_error = {:error, {:terminal_lock_namespace_release_failed, release_failure, close_failure}}
+
+    assert ^expected_release_error =
+             TerminalFailure.with_lock_overrides_for_test(
+               %{
+                 namespace_transaction: fn operation ->
+                   operation_result = operation.()
+
+                   TerminalFailure.settle_namespace_release_for_test(
+                     operation_result,
+                     {:error, :forced_namespace_release_failure},
+                     {:error, :forced_namespace_close_failure}
+                   )
+                 end
+               },
+               fn -> TerminalFailure.persist(workspace, evidence) end
+             )
+
+    refute File.exists?(lock_path)
+
+    assert {:ok, :acquired} =
+             TerminalFailure.settle_namespace_release_for_test({:ok, :acquired}, :ok, :not_called)
+
+    assert {:ok, :acquired} =
+             TerminalFailure.settle_namespace_release_for_test(
+               {:ok, :acquired},
+               {:error, :forced_namespace_release_failure},
+               :ok
+             )
+
+    assert :ok = TerminalFailure.clear_active(workspace, issue_id, evidence.event_id)
+  end
+
+  test "production Linux namespace transaction waits for an external flock holder" do
+    if :os.type() == {:unix, :linux} do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-terminal-production-flock-#{System.unique_integer([:positive])}"
+        )
+
+      state_root = Path.join(root, "terminal-state")
+      guard_path = Path.join([state_root, "locks", ".namespace.guard"])
+      File.mkdir_p!(Path.dirname(guard_path))
+      File.write!(guard_path, "")
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      holder =
+        Port.open(
+          {:spawn_executable, ~c"/usr/bin/flock"},
+          [
+            :binary,
+            :exit_status,
+            args: [
+              ~c"-x",
+              String.to_charlist(guard_path),
+              ~c"/usr/bin/bash",
+              ~c"-c",
+              ~c"printf 'LOCKED\\n'; IFS= read -r _"
+            ],
+            line: 128
+          ]
+        )
+
+      assert_receive {^holder, {:data, {:eol, "LOCKED"}}}, 1_000
+
+      expression =
+        "Application.put_env(:symphony_elixir, :terminal_state_root, #{inspect(state_root)}); " <>
+          "IO.inspect(SymphonyElixir.TerminalFailure.storage_ready())"
+
+      waiter =
+        Task.async(fn ->
+          System.cmd("mix", ["run", "--no-start", "-e", expression],
+            cd: File.cwd!(),
+            env: [{"MIX_ENV", "dev"}],
+            stderr_to_stdout: true
+          )
+        end)
+
+      Process.sleep(200)
+      assert nil == Task.yield(waiter, 0)
+      Port.command(holder, "\n")
+      assert_receive {^holder, {:exit_status, 0}}, 1_000
+      assert {output, 0} = Task.await(waiter, 30_000)
+      assert output =~ ":ok"
+    end
+  end
+
   test "lock namespace recovery fails closed on storage errors" do
     {root, workspace, issue_id, lock_path} = lock_fixture!("namespace")
     on_exit(fn -> File.rm_rf!(root) end)

@@ -21,6 +21,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
   if Mix.env() == :test do
     @port_open_override_key {__MODULE__, :port_open_override}
+    @port_connect_override_key {__MODULE__, :port_connect_override}
+    @cleanup_guard_arm_hook_key {__MODULE__, :cleanup_guard_arm_hook}
+    @process_group_path_hook_key {__MODULE__, :process_group_path_hook}
   end
 
   @type session :: %{
@@ -54,11 +57,69 @@ defmodule SymphonyElixir.Antigravity.Transport do
       end
     end
 
-    defp port_opener do
-      Process.get(@port_open_override_key, &Port.open/2)
+    @doc false
+    @spec with_port_connect_override_for_test((port(), pid() -> true), (-> result)) :: result
+          when result: term()
+    def with_port_connect_override_for_test(port_connector, operation)
+        when is_function(port_connector, 2) and is_function(operation, 0) do
+      Process.put(@port_connect_override_key, port_connector)
+
+      try do
+        operation.()
+      after
+        Process.delete(@port_connect_override_key)
+      end
+    end
+
+    @doc false
+    @spec with_process_group_path_hook_for_test((Path.t() -> term()), (-> result)) :: result
+          when result: term()
+    def with_process_group_path_hook_for_test(hook, operation)
+        when is_function(hook, 1) and is_function(operation, 0) do
+      Process.put(@process_group_path_hook_key, hook)
+
+      try do
+        operation.()
+      after
+        Process.delete(@process_group_path_hook_key)
+      end
+    end
+
+    @doc false
+    @spec with_cleanup_guard_arm_hook_for_test((pid() -> term()), (-> result)) :: result
+          when result: term()
+    def with_cleanup_guard_arm_hook_for_test(hook, operation)
+        when is_function(hook, 1) and is_function(operation, 0) do
+      Process.put(@cleanup_guard_arm_hook_key, hook)
+
+      try do
+        operation.()
+      after
+        Process.delete(@cleanup_guard_arm_hook_key)
+      end
+    end
+
+    defp port_opener, do: Process.get(@port_open_override_key, &Port.open/2)
+    defp port_connector, do: Process.get(@port_connect_override_key, &Port.connect/2)
+
+    defp run_process_group_path_hook(path) do
+      case Process.get(@process_group_path_hook_key) do
+        hook when is_function(hook, 1) -> hook.(path)
+        _other -> :ok
+      end
+    end
+
+    defp run_cleanup_guard_arm_hook(guard_pid) do
+      case Process.get(@cleanup_guard_arm_hook_key) do
+        hook when is_function(hook, 1) -> hook.(guard_pid)
+        _other -> :ok
+      end
     end
   else
     defp port_opener, do: &Port.open/2
+    defp port_connector, do: &Port.connect/2
+    defp run_process_group_path_hook(_path), do: :ok
+    defp run_cleanup_guard_arm_hook(_guard_pid), do: :ok
   end
 
   @spec start(Path.t(), Path.t(), Path.t(), pos_integer(), keyword()) ::
@@ -140,6 +201,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
     with :ok <- prepare_runtime_file(stderr_path),
          :ok <- prepare_runtime_file(process_group_path),
+         :ok <- run_process_group_path_hook(process_group_path),
          :ok <- trusted_system_executable(@setsid_path, "setsid"),
          :ok <- trusted_system_executable(@bash_path, "bash"),
          :ok <- trusted_system_executable(@kill_path, "kill"),
@@ -147,7 +209,6 @@ defmodule SymphonyElixir.Antigravity.Transport do
          {:ok, guard_pid, cleanup_fence_id} <-
            arm_cleanup_guard(self(), %{
              port: nil,
-             backend_process_pid: nil,
              launch_requested?: false,
              process_group_id: nil,
              process_group_path: process_group_path,
@@ -156,7 +217,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
       command = Enum.map_join([launch.executable | launch.args], " ", &shell_escape/1)
 
       grouped_command =
-        "umask 077; printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{command}"
+        "umask 077; printf '%s' \"$$\" > #{shell_escape(process_group_path)} && exec #{command}"
 
       launch_command =
         "exec #{shell_escape(@setsid_path)} --wait #{shell_escape(@bash_path)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
@@ -170,7 +231,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
            cd: String.to_charlist(launch.workspace),
            env: secret_port_env(Keyword.get(opts, :secret_environment_names, [])),
            line: @line_bytes
-         ], port_opener()}
+         ], port_opener(), port_connector()}
 
       with {:ok, port} <- open_cleanup_guard_port(guard_pid, port_spec) do
         finalize_started_port(
@@ -747,29 +808,35 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp start_cleanup_guard(owner_pid, session) do
+    parent = self()
+
     guard_pid =
       spawn(fn ->
         Process.flag(:trap_exit, true)
-
-        receive do
-          {:monitor_owner, ^owner_pid} -> cleanup_guard_loop(owner_pid, session)
-        end
+        owner_ref = Process.monitor(owner_pid)
+        send(parent, {:cleanup_guard_armed, self()})
+        cleanup_guard_receive(owner_pid, owner_ref, session)
       end)
 
-    case CleanupRegistry.register(owner_pid, guard_pid) do
-      :ok ->
-        send(guard_pid, {:monitor_owner, owner_pid})
-        {:ok, guard_pid}
+    guard_ref = Process.monitor(guard_pid)
 
-      {:error, reason} ->
-        Process.exit(guard_pid, :kill)
-        {:error, reason}
+    receive do
+      {:cleanup_guard_armed, ^guard_pid} ->
+        Process.demonitor(guard_ref, [:flush])
+        run_cleanup_guard_arm_hook(guard_pid)
+
+        case CleanupRegistry.register(owner_pid, guard_pid) do
+          :ok ->
+            {:ok, guard_pid}
+
+          {:error, reason} ->
+            Process.exit(guard_pid, :kill)
+            {:error, reason}
+        end
+
+      {:DOWN, ^guard_ref, :process, ^guard_pid, _reason} ->
+        {:error, :cleanup_guard_failed}
     end
-  end
-
-  defp cleanup_guard_loop(owner_pid, launch_state) do
-    owner_ref = Process.monitor(owner_pid)
-    cleanup_guard_receive(owner_pid, owner_ref, launch_state)
   end
 
   defp cleanup_guard_receive(owner_pid, owner_ref, launch_state) do
@@ -803,20 +870,16 @@ defmodule SymphonyElixir.Antigravity.Transport do
          owner_pid,
          owner_ref,
          request_ref,
-         {port_name, port_options, port_opener},
+         {port_name, port_options, port_opener, port_connector},
          launch_state
        ) do
     launch_state = Map.put(launch_state, :launch_requested?, true)
 
     case guarded_port_open(port_opener, port_name, port_options) do
       {:ok, port} ->
-        opened_state = %{
-          launch_state
-          | port: port,
-            backend_process_pid: port_os_pid(port)
-        }
+        opened_state = %{launch_state | port: port}
 
-        case connect_port_owner(port, owner_pid) do
+        case connect_port_owner(port_connector, port, owner_pid) do
           :ok ->
             Process.unlink(port)
             send(owner_pid, {:antigravity_port_result, request_ref, {:ok, port}})
@@ -837,8 +900,8 @@ defmodule SymphonyElixir.Antigravity.Transport do
     end
   end
 
-  defp connect_port_owner(port, owner_pid) do
-    Port.connect(port, owner_pid)
+  defp connect_port_owner(port_connector, port, owner_pid) do
+    port_connector.(port, owner_pid)
     :ok
   rescue
     _error -> {:error, :port_owner_transfer_failed}
@@ -882,16 +945,11 @@ defmodule SymphonyElixir.Antigravity.Transport do
         cleanup_guard_launch(Map.put(launch_state, :process_group_id, process_group_id))
 
       _missing ->
-        cleanup_guard_from_port_process(launch_state)
+        cleanup_guard_without_process_group(launch_state)
     end
   end
 
-  defp cleanup_guard_from_port_process(%{backend_process_pid: backend_process_pid} = launch_state)
-       when is_integer(backend_process_pid) and backend_process_pid > 0 do
-    cleanup_guard_launch(Map.put(launch_state, :process_group_id, backend_process_pid))
-  end
-
-  defp cleanup_guard_from_port_process(launch_state) do
+  defp cleanup_guard_without_process_group(launch_state) do
     close_port(launch_state.port)
     runtime_result = remove_runtime_files(launch_state)
 

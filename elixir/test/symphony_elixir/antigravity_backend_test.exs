@@ -568,6 +568,80 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "cleanup guard monitors its owner before registry attachment" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        :ok = CleanupRegistry.require_ack(self())
+
+        Transport.with_cleanup_guard_arm_hook_for_test(
+          fn guard_pid ->
+            send(parent, {:cleanup_guard_monitor_armed, self(), guard_pid})
+            Process.sleep(:infinity)
+          end,
+          fn -> Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5) end
+        )
+      end)
+
+    assert_receive {:cleanup_guard_monitor_armed, ^owner, guard_pid}, 1_000
+    guard_ref = Process.monitor(guard_pid)
+    owner_ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    assert :ok = Transport.await_owner_cleanup(owner, 2_000)
+    assert_receive {:DOWN, ^guard_ref, :process, ^guard_pid, :normal}, 1_000
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    assert File.ls!(Path.join(state_root, "cleanups")) == []
+    File.rm_rf!(root)
+  end
+
+  test "connect failure cleans a verified native process group before fence settlement" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+
+    assert {:error, :antigravity_port_owner_transfer_failed} =
+             Transport.with_port_connect_override_for_test(
+               fn _port, _owner -> :erlang.error(:forced_port_connect) end,
+               fn -> Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5) end
+             )
+
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    assert File.ls!(Path.join(state_root, "cleanups")) == []
+    File.rm_rf!(root)
+  end
+
+  test "connect failure cannot settle a fence without a verified process group" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    launched_path = Path.join(workspace, "launched")
+
+    write_executable!(agy, "#!/bin/sh\nprintf launched > #{launched_path}\nsleep 10\n")
+    configure_backend!(agy, profile)
+
+    assert {:error, _reason} =
+             Transport.with_process_group_path_hook_for_test(
+               fn process_group_path -> File.mkdir!(process_group_path) end,
+               fn ->
+                 Transport.with_port_connect_override_for_test(
+                   fn _port, _owner -> :erlang.error(:forced_port_connect) end,
+                   fn ->
+                     Transport.start(workspace, agy, profile, 1_000, launcher: &direct_launcher/5)
+                   end
+                 )
+               end
+             )
+
+    refute File.exists?(launched_path)
+    state_root = Application.fetch_env!(:symphony_elixir, :terminal_state_root)
+    assert [fence_entry] = File.ls!(Path.join(state_root, "cleanups"))
+    cleanup_id = String.replace_suffix(fence_entry, ".json", "")
+    assert :ok = TerminalFailure.complete_native_cleanup_fence(cleanup_id)
+    File.rm_rf!(root)
+  end
+
   test "normal stop reaps a native descendant in the owned process group" do
     {root, workspace, profile, agy} = setup_fake_agy!()
     configure_backend!(agy, profile)
