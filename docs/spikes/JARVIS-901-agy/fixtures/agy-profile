@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+if [ "$#" -lt 1 ]; then
+  echo "Usage: agy-profile <slot> [agy arguments...]"
+  exit 2
+fi
+
+SLOT="$1"
+shift
+
+if [[ ! "$SLOT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; then
+  echo "Invalid slot name: $SLOT"
+  exit 2
+fi
+
+REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+PROFILE="$REAL_HOME/.agy-profiles/$SLOT"
+RUNTIME="$PROFILE/.runtime/agy"
+CURRENT_DIR="$PWD"
+
+mkdir -p \
+  "$PROFILE/.config" \
+  "$PROFILE/.local/share" \
+  "$PROFILE/.cache" \
+  "$RUNTIME"
+
+chmod 700 "$PROFILE" "$RUNTIME"
+
+export REAL_HOME
+export HOME="$PROFILE"
+export XDG_CONFIG_HOME="$PROFILE/.config"
+export XDG_DATA_HOME="$PROFILE/.local/share"
+export XDG_CACHE_HOME="$PROFILE/.cache"
+export XDG_RUNTIME_DIR="$RUNTIME"
+export JARVIS_AGY_ACCOUNT_SLOT_ID="$SLOT"
+export PAGER=cat
+
+exec dbus-run-session -- bash -c '
+  eval "$(gnome-keyring-daemon --start --components=secrets)"
+  cd "$1" && shift
+  exec "$REAL_HOME/.local/bin/agy" "$@"
+' bash "$CURRENT_DIR" "$@"
