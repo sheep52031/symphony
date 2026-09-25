@@ -176,16 +176,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
-
-      worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
-    end
+    remove_local_issue_workspace(issue)
+    Enum.each(Config.settings!().worker.ssh_hosts, &remove_issue_workspaces(issue, &1))
 
     :ok
   end
@@ -200,21 +192,20 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        case workspace_path_for_issue(workspace_key(identifier), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
-
-      worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
-    end
+    remove_local_issue_workspace(identifier)
+    Enum.each(Config.settings!().worker.ssh_hosts, &remove_issue_workspaces(identifier, &1))
 
     :ok
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  defp remove_local_issue_workspace(issue_or_identifier) do
+    case workspace_path_for_issue(workspace_key(issue_or_identifier), nil) do
+      {:ok, workspace} -> remove(workspace, nil)
+      {:error, _reason} -> :ok
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}

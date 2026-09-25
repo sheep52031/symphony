@@ -480,7 +480,31 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
-    select_worker_host(state, preferred_worker_host)
+    select_worker_host(state, Config.settings!().agent.backend, preferred_worker_host || :new_attempt)
+  end
+
+  @doc false
+  @spec select_worker_host_for_test(term(), String.t(), String.t() | nil | :new_attempt) ::
+          String.t() | nil | :no_worker_capacity | :worker_host_ineligible
+  def select_worker_host_for_test(%State{} = state, backend, selection) do
+    select_worker_host(state, backend, selection)
+  end
+
+  @doc false
+  @spec dispatch_active_retry_for_test(term(), Issue.t(), pos_integer(), map()) :: term()
+  def dispatch_active_retry_for_test(%State{} = state, %Issue{} = issue, attempt, metadata)
+      when is_integer(attempt) and attempt > 0 and is_map(metadata) do
+    case dispatch_active_retry(state, issue, attempt, metadata) do
+      {:noreply, updated_state} -> updated_state
+    end
+  end
+
+  @doc false
+  @spec restart_stalled_issue_for_test(term(), String.t(), map(), DateTime.t(), pos_integer()) :: term()
+  def restart_stalled_issue_for_test(%State{} = state, issue_id, running_entry, now, timeout_ms)
+      when is_binary(issue_id) and is_map(running_entry) and is_struct(now, DateTime) and
+             is_integer(timeout_ms) and timeout_ms > 0 do
+    restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -636,8 +660,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_backend_route_current?(%Issue{id: issue_id, identifier: identifier}, %State{} = state) do
     case Map.get(state.running, issue_id) do
-      %{backend: backend, backend_route_explicit?: route_explicit?} ->
-        Config.issue_backend_binding_matches?(identifier, backend, route_explicit?)
+      %{backend: backend, backend_route_explicit?: route_explicit?} = entry ->
+        worker_host = Map.get(entry, :worker_host)
+
+        Config.issue_backend_binding_matches?(identifier, backend, route_explicit?) and
+          Config.worker_host_binding_current?(backend, worker_host)
 
       _ ->
         false
@@ -648,20 +675,25 @@ defmodule SymphonyElixir.Orchestrator do
     running_entry = Map.get(state.running, issue_id, %{})
     backend = Map.get(running_entry, :backend)
     route_explicit? = Map.get(running_entry, :backend_route_explicit?)
+    worker_host = Map.get(running_entry, :worker_host)
+    backend_current? = Config.issue_backend_binding_matches?(issue.identifier, backend, route_explicit?)
+    disposition = if backend_current?, do: :worker_host_binding_revoked, else: :backend_route_revoked
+    cancellation_reason = if backend_current?, do: "worker_host_binding_revoked", else: "backend_route_revoked"
 
-    Logger.warning("Backend route revoked for #{issue_context(issue)} bound_backend=#{inspect(backend)}; stopping the active attempt")
+    Logger.warning("Backend/host route revoked for #{issue_context(issue)} bound_backend=#{inspect(backend)} worker_host=#{worker_host || "local"}; stopping the active attempt")
 
     state
-    |> terminate_running_issue(issue_id, false, "backend_route_revoked")
+    |> terminate_running_issue(issue_id, false, cancellation_reason)
     |> block_issue_from_retry(
       issue_id,
       %{
         issue: issue,
         identifier: issue.identifier,
         backend: backend,
-        backend_route_explicit?: route_explicit?
+        backend_route_explicit?: route_explicit?,
+        worker_host: worker_host
       },
-      :backend_route_revoked
+      disposition
     )
   end
 
@@ -766,6 +798,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: "stalled for #{elapsed_ms}ms without codex activity",
           backend: Map.get(running_entry, :backend),
           backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
           session_id: Map.get(running_entry, :session_id)
         })
       end
@@ -981,6 +1015,33 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp block_issue_from_retry(%State{} = state, issue_id, metadata, :worker_host_binding_revoked) do
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(metadata, :identifier, issue_id),
+      issue: Map.get(metadata, :issue),
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      backend: Map.get(metadata, :backend),
+      backend_route_explicit?: Map.get(metadata, :backend_route_explicit?),
+      disposition: :worker_host_binding_revoked,
+      reason: "selected worker host is no longer configured or compatible with the bound backend",
+      error: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id),
+        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
   defp block_issue_from_retry(%State{} = state, issue_id, metadata, :backend_route_unknown_after_restart) do
     blocked_entry = %{
       issue_id: issue_id,
@@ -1056,7 +1117,7 @@ defmodule SymphonyElixir.Orchestrator do
       !writer_conflict?(issue, running) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      issue_worker_slots_available?(issue, state)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
@@ -1198,10 +1259,16 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, backend_binding} ->
         recipient = self()
 
-        case select_worker_host(state, preferred_worker_host) do
+        worker_host_selection = if bound_backend == :new_attempt, do: :new_attempt, else: preferred_worker_host
+
+        case select_worker_host(state, backend_binding.backend, worker_host_selection) do
           :no_worker_capacity ->
             Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
             state
+
+          :worker_host_ineligible ->
+            Logger.warning("Holding retry with stale worker host for #{issue_context(issue)} backend=#{backend_binding.backend} worker_host=#{inspect(preferred_worker_host)}")
+            hold_changed_bound_attempt(state, issue, backend_binding, preferred_worker_host)
 
           worker_host ->
             spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, backend_binding)
@@ -1223,6 +1290,17 @@ defmodule SymphonyElixir.Orchestrator do
       issue.id,
       Map.merge(binding, %{issue: issue, identifier: issue.identifier}),
       :backend_route_revoked
+    )
+  end
+
+  defp hold_changed_bound_attempt(state, issue, %{backend: _backend} = bound_backend, worker_host) do
+    binding = bound_backend_metadata(bound_backend)
+
+    block_issue_from_retry(
+      state,
+      issue.id,
+      Map.merge(binding, %{issue: issue, identifier: issue.identifier, worker_host: worker_host}),
+      :worker_host_binding_revoked
     )
   end
 
@@ -1567,9 +1645,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
+    backend = Map.get(metadata, :backend)
+    worker_host = Map.get(metadata, :worker_host)
+
+    if Config.worker_host_binding_current?(backend, worker_host) do
+      dispatch_active_retry_on_current_host(state, issue, attempt, metadata, backend, worker_host)
+    else
+      Logger.warning(
+        "Retry worker host is no longer configured or compatible for #{issue_context(issue)} backend=#{inspect(backend)} worker_host=#{inspect(worker_host)}; retaining a fail-closed hold"
+      )
+
+      {:noreply,
+       block_issue_from_retry(
+         state,
+         issue.id,
+         Map.merge(metadata, %{issue: issue, identifier: issue.identifier}),
+         :worker_host_binding_revoked
+       )}
+    end
+  end
+
+  defp dispatch_active_retry_on_current_host(state, issue, attempt, metadata, backend, worker_host) do
+    can_dispatch? =
+      retry_candidate_issue?(issue, terminal_state_set()) and
+        dispatch_slots_available?(issue, state) and
+        worker_slots_available?(state, backend, worker_host)
+
+    if can_dispatch? do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply,
@@ -1579,7 +1681,7 @@ defmodule SymphonyElixir.Orchestrator do
              attempt,
              metadata[:worker_host],
              %{
-               backend: Map.get(metadata, :backend),
+               backend: backend,
                route_explicit?: Map.get(metadata, :backend_route_explicit?)
              }
            )}
@@ -1681,33 +1783,31 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
-  defp select_worker_host(%State{} = state, preferred_worker_host) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        nil
+  defp select_worker_host(%State{} = state, backend, :new_attempt) do
+    available_hosts =
+      backend
+      |> Config.worker_hosts_for_backend()
+      |> Enum.filter(&worker_host_slots_available?(state, &1))
 
-      hosts ->
-        available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
-
-        cond do
-          available_hosts == [] ->
-            :no_worker_capacity
-
-          preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
-            preferred_worker_host
-
-          true ->
-            least_loaded_worker_host(state, available_hosts)
-        end
+    case available_hosts do
+      [] -> :no_worker_capacity
+      [nil | _] -> nil
+      hosts -> least_loaded_worker_host(state, hosts)
     end
   end
 
-  defp preferred_worker_host_available?(preferred_worker_host, hosts)
-       when is_binary(preferred_worker_host) and is_list(hosts) do
-    preferred_worker_host != "" and preferred_worker_host in hosts
-  end
+  defp select_worker_host(%State{} = state, backend, preferred_worker_host) do
+    cond do
+      not Config.worker_host_binding_current?(backend, preferred_worker_host) ->
+        :worker_host_ineligible
 
-  defp preferred_worker_host_available?(_preferred_worker_host, _hosts), do: false
+      not worker_host_slots_available?(state, preferred_worker_host) ->
+        :no_worker_capacity
+
+      true ->
+        preferred_worker_host
+    end
+  end
 
   defp least_loaded_worker_host(%State{} = state, hosts) when is_list(hosts) do
     hosts
@@ -1725,13 +1825,21 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp worker_slots_available?(%State{} = state) do
-    select_worker_host(state, nil) != :no_worker_capacity
+  defp issue_worker_slots_available?(%Issue{identifier: identifier}, %State{} = state) do
+    case Config.issue_backend_binding(identifier) do
+      {:ok, %{backend: backend}} ->
+        select_worker_host(state, backend, :new_attempt) != :no_worker_capacity
+
+      {:error, _reason} ->
+        false
+    end
   end
 
-  defp worker_slots_available?(%State{} = state, preferred_worker_host) do
-    select_worker_host(state, preferred_worker_host) != :no_worker_capacity
+  defp worker_slots_available?(%State{} = state, backend, preferred_worker_host) do
+    select_worker_host(state, backend, preferred_worker_host) not in [:no_worker_capacity, :worker_host_ineligible]
   end
+
+  defp worker_host_slots_available?(%State{} = _state, nil), do: true
 
   defp worker_host_slots_available?(%State{} = state, worker_host) when is_binary(worker_host) do
     case Config.settings!().worker.max_concurrent_agents_per_host do
@@ -2129,6 +2237,18 @@ defmodule SymphonyElixir.Orchestrator do
       Map.get(blocked_entry, :backend),
       Map.get(blocked_entry, :backend_route_explicit?)
     )
+  end
+
+  defp hold_released_by_config?(_state, _issue_id, %{disposition: :worker_host_binding_revoked} = blocked_entry) do
+    Config.issue_backend_binding_matches?(
+      Map.get(blocked_entry, :identifier),
+      Map.get(blocked_entry, :backend),
+      Map.get(blocked_entry, :backend_route_explicit?)
+    ) and
+      Config.worker_host_binding_current?(
+        Map.get(blocked_entry, :backend),
+        Map.get(blocked_entry, :worker_host)
+      )
   end
 
   defp hold_released_by_config?(_state, _issue_id, %{disposition: :backend_route_unknown_after_restart}),

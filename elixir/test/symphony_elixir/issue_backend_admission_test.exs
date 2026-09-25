@@ -64,6 +64,155 @@ defmodule SymphonyElixir.IssueBackendAdmissionTest do
     refute Orchestrator.should_dispatch_issue_for_test(duplicate_writer, %{state | max_concurrent_agents: 4})
   end
 
+  test "a full remote Codex host does not suppress local Pi or Antigravity admission" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["m2-air"],
+      worker_max_concurrent_agents_per_host: 1,
+      agent_backend: "codex",
+      issue_backends: %{"JARVIS-988-PI" => "pi", "JARVIS-988-AGY" => "antigravity"},
+      accepted_antigravity_issue_identifiers: ["JARVIS-988-AGY"],
+      antigravity_executable: "/bin/true",
+      antigravity_profile_root: "/tmp/symphony-jarvis-988-profile"
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.worker_hosts_for_backend("pi") == [nil]
+    assert Config.worker_hosts_for_backend("antigravity") == [nil]
+
+    remote_codex_issue = issue("remote-codex", "JARVIS-988-CODEX", "codex-branch")
+    remote_pid = start_fake_backend()
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{
+        remote_codex_issue.id => %{
+          pid: remote_pid,
+          ref: nil,
+          backend: "codex",
+          worker_host: "m2-air",
+          identifier: remote_codex_issue.identifier,
+          issue: remote_codex_issue
+        }
+      },
+      claimed: MapSet.new([remote_codex_issue.id]),
+      blocked: %{},
+      retry_attempts: %{},
+      attempts: %{}
+    }
+
+    on_exit(fn -> send(remote_pid, :stop) end)
+
+    assert Orchestrator.select_worker_host_for_test(state, "codex", :new_attempt) ==
+             :no_worker_capacity
+
+    assert Orchestrator.select_worker_host_for_test(state, "pi", :new_attempt) == nil
+    assert Orchestrator.select_worker_host_for_test(state, "antigravity", :new_attempt) == nil
+    refute Config.worker_host_binding_current?("pi", "m2-air")
+    refute Config.worker_host_binding_current?("antigravity", "m2-air")
+  end
+
+  test "a retry pinned to a removed Codex host is held instead of migrating" do
+    issue = issue("issue-host-retry", "JARVIS-988-RETRY", "retry-branch")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_ssh_hosts: ["m2-air"],
+      issue_backends: %{"JARVIS-988-RETRY" => "codex"}
+    )
+
+    assert Config.worker_host_binding_current?("codex", "m2-air")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_ssh_hosts: ["other-host"],
+      issue_backends: %{"JARVIS-988-RETRY" => "codex"}
+    )
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue.id]),
+      blocked: %{},
+      retry_attempts: %{issue.id => %{attempt: 1, worker_host: "m2-air"}},
+      attempts: %{}
+    }
+
+    held =
+      Orchestrator.dispatch_active_retry_for_test(state, issue, 2, %{
+        issue: issue,
+        identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: true,
+        worker_host: "m2-air"
+      })
+
+    assert %{disposition: :worker_host_binding_revoked, worker_host: "m2-air"} = held.blocked[issue.id]
+    assert MapSet.member?(held.claimed, issue.id)
+    refute Map.has_key?(held.retry_attempts, issue.id)
+    assert Orchestrator.select_worker_host_for_test(held, "codex", "m2-air") == :worker_host_ineligible
+  end
+
+  test "a stalled remote Codex attempt preserves its host and workspace in the retry" do
+    issue = issue("issue-stalled-codex", "JARVIS-988-STALL", "stall-branch")
+    workspace_path = "/fake/m2-air/workspaces/JARVIS-988-STALL"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_ssh_hosts: ["m2-air"],
+      issue_backends: %{"JARVIS-988-STALL" => "codex"},
+      max_retry_backoff_ms: 60_000
+    )
+
+    {:ok, pid} =
+      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> fake_backend_loop() end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :shutdown)
+    end)
+
+    old_activity = DateTime.add(DateTime.utc_now(), -60, :second)
+
+    running_entry = %{
+      pid: pid,
+      ref: nil,
+      identifier: issue.identifier,
+      issue: issue,
+      backend: "codex",
+      backend_route_explicit?: true,
+      worker_host: "m2-air",
+      workspace_path: workspace_path,
+      started_at: old_activity,
+      last_codex_timestamp: old_activity
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 2,
+      running: %{issue.id => running_entry},
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{},
+      blocked: %{},
+      attempts: %{issue.id => 1},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    retried =
+      Orchestrator.restart_stalled_issue_for_test(
+        state,
+        issue.id,
+        running_entry,
+        DateTime.utc_now(),
+        10
+      )
+
+    retry = retried.retry_attempts[issue.id]
+    assert retry.worker_host == "m2-air"
+    assert retry.workspace_path == workspace_path
+    assert retry.backend == "codex"
+    assert Config.worker_host_binding_current?(retry.backend, retry.worker_host)
+    assert Orchestrator.select_worker_host_for_test(retried, "codex", retry.worker_host) == "m2-air"
+    assert Orchestrator.should_dispatch_issue_for_test(issue, retried)
+    refute Map.has_key?(retried.running, issue.id)
+    Process.cancel_timer(retry.timer_ref)
+  end
+
   test "active attempt is stopped and held when its exact backend route is revoked" do
     issue = issue("issue-revoked", "JARVIS-979-REVOKED", "revoked-branch")
 

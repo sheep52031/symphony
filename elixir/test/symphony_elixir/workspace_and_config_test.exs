@@ -1769,4 +1769,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "workspace cleanup removes the local candidate even when SSH hosts are configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-mixed-workspace-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    fake_ssh = Path.join(test_root, "ssh")
+    trace_file = Path.join(test_root, "ssh.trace")
+    workspace_root = Path.join(test_root, "workspaces")
+    System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf '%s\\n' "$*" >> "${SYMP_TEST_SSH_TRACE}"
+    exit 0
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: ["m2-air"]
+    )
+
+    issue = %Issue{id: "mixed-workspace-cleanup", identifier: "JARVIS-988-LOCAL"}
+    assert {:ok, local_workspace} = Workspace.create_for_issue(issue, nil)
+    assert File.dir?(local_workspace)
+
+    assert :ok = Workspace.remove_issue_workspaces(issue, nil)
+    refute File.exists?(local_workspace)
+    assert File.read!(trace_file) =~ "m2-air"
+    assert File.read!(trace_file) =~ "rm -rf"
+  end
 end
