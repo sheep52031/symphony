@@ -150,6 +150,69 @@ defmodule SymphonyElixir.IssueBackendAdmissionTest do
     assert Orchestrator.select_worker_host_for_test(held, "codex", "m2-air") == :worker_host_ineligible
   end
 
+  test "a stalled remote Codex attempt preserves its host and workspace in the retry" do
+    issue = issue("issue-stalled-codex", "JARVIS-988-STALL", "stall-branch")
+    workspace_path = "/fake/m2-air/workspaces/JARVIS-988-STALL"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      worker_ssh_hosts: ["m2-air"],
+      issue_backends: %{"JARVIS-988-STALL" => "codex"},
+      max_retry_backoff_ms: 60_000
+    )
+
+    {:ok, pid} =
+      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> fake_backend_loop() end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :shutdown)
+    end)
+
+    old_activity = DateTime.add(DateTime.utc_now(), -60, :second)
+
+    running_entry = %{
+      pid: pid,
+      ref: nil,
+      identifier: issue.identifier,
+      issue: issue,
+      backend: "codex",
+      backend_route_explicit?: true,
+      worker_host: "m2-air",
+      workspace_path: workspace_path,
+      started_at: old_activity,
+      last_codex_timestamp: old_activity
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 2,
+      running: %{issue.id => running_entry},
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{},
+      blocked: %{},
+      attempts: %{issue.id => 1},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    retried =
+      Orchestrator.restart_stalled_issue_for_test(
+        state,
+        issue.id,
+        running_entry,
+        DateTime.utc_now(),
+        10
+      )
+
+    retry = retried.retry_attempts[issue.id]
+    assert retry.worker_host == "m2-air"
+    assert retry.workspace_path == workspace_path
+    assert retry.backend == "codex"
+    assert Config.worker_host_binding_current?(retry.backend, retry.worker_host)
+    assert Orchestrator.select_worker_host_for_test(retried, "codex", retry.worker_host) == "m2-air"
+    assert Orchestrator.should_dispatch_issue_for_test(issue, retried)
+    refute Map.has_key?(retried.running, issue.id)
+    Process.cancel_timer(retry.timer_ref)
+  end
+
   test "active attempt is stopped and held when its exact backend route is revoked" do
     issue = issue("issue-revoked", "JARVIS-979-REVOKED", "revoked-branch")
 

@@ -499,6 +499,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc false
+  @spec restart_stalled_issue_for_test(term(), String.t(), map(), DateTime.t(), pos_integer()) :: term()
+  def restart_stalled_issue_for_test(%State{} = state, issue_id, running_entry, now, timeout_ms)
+      when is_binary(issue_id) and is_map(running_entry) and is_struct(now, DateTime) and
+             is_integer(timeout_ms) and timeout_ms > 0 do
+    restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -790,6 +798,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: "stalled for #{elapsed_ms}ms without codex activity",
           backend: Map.get(running_entry, :backend),
           backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
           session_id: Map.get(running_entry, :session_id)
         })
       end
