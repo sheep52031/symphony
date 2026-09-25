@@ -89,8 +89,13 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert subsequence?(launch.args, ["--tmpfs", "/run/user"])
     assert subsequence?(launch.args, ["--tmpfs", "/tmp"])
     assert_home_masked_or_private(launch.args, Path.expand(System.user_home!()))
-    assert subsequence?(launch.args, ["--dir", Path.expand(workspace)])
-    assert subsequence?(launch.args, ["--dir", Path.expand(profile)])
+    # Only paths under the private /tmp mount need explicit destination directories.
+    # Dedicated /var/tmp paths already exist under the read-only root bind.
+    if String.starts_with?(launch.workspace, "/tmp/") do
+      assert subsequence?(launch.args, ["--dir", launch.workspace])
+      assert subsequence?(launch.args, ["--dir", launch.profile_root])
+    end
+
     assert subsequence?(launch.args, ["--dir", "/tmp/symphony-antigravity-runtime", "--chmod", "0700", "/tmp/symphony-antigravity-runtime"])
     assert subsequence?(launch.args, ["--bind", Path.expand(workspace), Path.expand(workspace)])
 
