@@ -66,6 +66,55 @@ defmodule SymphonyElixir.Config do
 
   def issue_identifier_allowed?(_identifier), do: false
 
+  @spec issue_backend(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def issue_backend(identifier) when is_binary(identifier) do
+    with {:ok, binding} <- issue_backend_binding(identifier) do
+      {:ok, binding.backend}
+    end
+  end
+
+  def issue_backend(identifier), do: {:error, {:invalid_issue_identifier, identifier}}
+
+  @spec issue_backend_binding(String.t()) ::
+          {:ok, %{backend: String.t(), route_explicit?: boolean()}} | {:error, term()}
+  def issue_backend_binding(identifier) when is_binary(identifier) do
+    settings = settings!()
+    route_explicit? = Map.has_key?(settings.agent.issue_backends, identifier)
+    backend = Map.get(settings.agent.issue_backends, identifier, settings.agent.backend)
+
+    case AgentBackend.resolve(backend) do
+      {:ok, _backend_id, _module} -> {:ok, %{backend: backend, route_explicit?: route_explicit?}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def issue_backend_binding(identifier), do: {:error, {:invalid_issue_identifier, identifier}}
+
+  @spec issue_backend_matches?(String.t(), term()) :: boolean()
+  def issue_backend_matches?(identifier, backend) when is_binary(identifier) do
+    with {:ok, selected_backend} <- issue_backend(identifier),
+         {:ok, backend_id, _module} <- AgentBackend.resolve(backend) do
+      selected_backend == Atom.to_string(backend_id)
+    else
+      _ -> false
+    end
+  end
+
+  def issue_backend_matches?(_identifier, _backend), do: false
+
+  @spec issue_backend_binding_matches?(String.t(), term(), term()) :: boolean()
+  def issue_backend_binding_matches?(identifier, backend, route_explicit?) when is_binary(identifier) do
+    with {:ok, backend_id, _module} <- AgentBackend.resolve(backend),
+         {:ok, binding} <- issue_backend_binding(identifier) do
+      binding.backend == Atom.to_string(backend_id) and
+        binding.route_explicit? == route_explicit?
+    else
+      _ -> false
+    end
+  end
+
+  def issue_backend_binding_matches?(_identifier, _backend, _route_explicit?), do: false
+
   @spec hold_after_normal_completion?() :: boolean()
   def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
 
@@ -142,10 +191,23 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      with :ok <- AgentBackend.validate_config(settings.agent.backend, settings) do
+      with :ok <- AgentBackend.validate_config(settings.agent.backend, settings),
+           :ok <- validate_issue_backend_configs(settings) do
         Tracker.validate_config(settings.tracker)
       end
     end
+  end
+
+  defp validate_issue_backend_configs(settings) do
+    settings.agent.issue_backends
+    |> Map.values()
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn backend, :ok ->
+      case AgentBackend.validate_config(backend, settings) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp format_config_error(reason) do
