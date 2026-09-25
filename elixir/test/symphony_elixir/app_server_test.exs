@@ -1403,14 +1403,31 @@ defmodule SymphonyElixir.AppServerTest do
 
     custom_secret_env = "SYMP_CUSTOM_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
     profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
+
+    host_auth_aliases = [
+      "ASANA_PAT",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "GH_ENTERPRISE_TOKEN",
+      "GITLAB_PAT",
+      "GITLAB_ACCESS_TOKEN",
+      "GITLAB_TOKEN",
+      "OAUTH_TOKEN",
+      "JIRA_API_TOKEN",
+      "LINEAR_API_KEY"
+    ]
+
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
+    previous_host_auth = Map.new(host_auth_aliases, &{&1, System.get_env(&1)})
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
     on_exit(fn ->
       restore_env("LINEAR_API_KEY", previous_secret)
       restore_env(custom_secret_env, previous_custom_secret)
+      Enum.each(previous_host_auth, fn {name, value} -> restore_env(name, value) end)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -1425,14 +1442,21 @@ defmodule SymphonyElixir.AppServerTest do
       File.mkdir_p!(bash_home)
       File.mkdir_p!(workspace)
 
+      profile_host_auth =
+        Enum.map_join(host_auth_aliases, "\n", fn name ->
+          "export #{name}='synthetic-host-auth-value-that-must-not-reach-child'"
+        end)
+
       File.write!(Path.join(bash_home, ".bash_profile"), """
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
       export #{profile_marker_env}=1
+      #{profile_host_auth}
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
+      Enum.each(host_auth_aliases, &System.put_env(&1, "synthetic-ambient-host-auth-value"))
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -1440,8 +1464,23 @@ defmodule SymphonyElixir.AppServerTest do
       #!/bin/sh
       trace_file="$SYMP_TEST_CODEx_TRACE"
       printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
-      printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
-      printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      if [ -n "${LINEAR_API_KEY:-}" ]; then
+        printf 'CANONICAL_SECRET:present\n' >> "$trace_file"
+      else
+        printf 'CANONICAL_SECRET:absent\n' >> "$trace_file"
+      fi
+      if [ -n "${#{custom_secret_env}:-}" ]; then
+        printf 'CUSTOM_SECRET:present\n' >> "$trace_file"
+      else
+        printf 'CUSTOM_SECRET:absent\n' >> "$trace_file"
+      fi
+      for name in #{Enum.join(host_auth_aliases, " ")}; do
+        if printenv "$name" >/dev/null; then
+          printf 'HOST_AUTH:%s:present\n' "$name" >> "$trace_file"
+        else
+          printf 'HOST_AUTH:%s:absent\n' "$name" >> "$trace_file"
+        fi
+      done
       count=0
 
       while IFS= read -r line; do
@@ -1487,10 +1526,34 @@ defmodule SymphonyElixir.AppServerTest do
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Do not inherit tracker auth", issue)
-      assert File.read!(trace_file) =~ "PROFILE_LOADED:1\n"
-      assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
-      assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
-      refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
+      linear_trace = File.read!(trace_file)
+      assert linear_trace =~ "CANONICAL_SECRET:absent\n"
+      assert linear_trace =~ "CUSTOM_SECRET:absent\n"
+
+      Enum.each(host_auth_aliases, fn name ->
+        assert linear_trace =~ "HOST_AUTH:#{name}:absent\n"
+      end)
+
+      for tracker_kind <- ["github", "gitlab"] do
+        write_host_auth_tracker_workflow!(
+          Workflow.workflow_file_path(),
+          tracker_kind,
+          workspace_root,
+          "#{codex_binary} app-server"
+        )
+
+        assert {:ok, _result} = AppServer.run(workspace, "Do not inherit tracker auth", issue)
+      end
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "PROFILE_LOADED:1\n")) == 4
+
+      Enum.each(host_auth_aliases, fn name ->
+        assert length(String.split(trace, "HOST_AUTH:#{name}:absent\n")) == 4
+      end)
+
+      refute trace =~ "synthetic-ambient-host-auth-value"
+      refute trace =~ "synthetic-host-auth-value-that-must-not-reach-child"
     after
       File.rm_rf(test_root)
     end
@@ -1583,7 +1646,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
+      assert argv_line =~ "unset "
+      assert argv_line =~ "GITHUB_TOKEN"
+      assert argv_line =~ "GITLAB_PAT"
+      assert argv_line =~ "LINEAR_API_KEY"
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 
@@ -1627,5 +1693,38 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp write_host_auth_tracker_workflow!(path, tracker_kind, workspace_root, codex_command) do
+    {provider, active_states, terminal_states} =
+      case tracker_kind do
+        "github" ->
+          {"    repo: \"octo/repo\"\n    token: \"$GITHUB_TOKEN\"", ["open"], ["closed"]}
+
+        "gitlab" ->
+          {"    project_path: \"octo/repo\"\n    api_key: \"$GITLAB_PAT\"", ["opened"], ["closed"]}
+      end
+
+    File.write!(
+      path,
+      """
+      ---
+      tracker:
+        kind: #{tracker_kind}
+        provider:
+      #{provider}
+        active_states: #{Jason.encode!(active_states)}
+        terminal_states: #{Jason.encode!(terminal_states)}
+      workspace:
+        root: #{Jason.encode!(workspace_root)}
+      codex:
+        command: #{Jason.encode!(codex_command)}
+      ---
+
+      Test only.
+      """
+    )
+
+    assert :ok = SymphonyElixir.WorkflowStore.force_reload()
   end
 end

@@ -14,6 +14,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @host_auth_environment_names [
+    "ASANA_PAT",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITLAB_PAT",
+    "GITLAB_ACCESS_TOKEN",
+    "GITLAB_TOKEN",
+    "OAUTH_TOKEN",
+    "JIRA_API_TOKEN",
+    "LINEAR_API_KEY"
+  ]
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -248,16 +261,24 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
+    dynamic_tool_binding
+    |> tracker_secret_names()
     |> valid_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
   defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+    case dynamic_tool_binding |> tracker_secret_names() |> valid_environment_names() do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
+  end
+
+  defp tracker_secret_names(dynamic_tool_binding) do
+    # Stable host-known tracker credentials are scrubbed regardless of the
+    # selected provider; configured custom names remain tracker-scoped.
+    (@host_auth_environment_names ++ dynamic_tool_binding.secret_environment_names)
+    |> Enum.uniq()
   end
 
   defp valid_environment_names(names) do
