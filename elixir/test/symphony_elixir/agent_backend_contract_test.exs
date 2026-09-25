@@ -14,6 +14,22 @@ defmodule SymphonyElixir.AgentBackendContractTest do
     assert :ok = AgentBackend.validate_turn_result(%{session_id: "agy-session", backend: :antigravity})
   end
 
+  test "declares backend worker-host compatibility and local-only policy" do
+    assert AgentBackend.worker_host_compatible?("codex", nil)
+    assert AgentBackend.worker_host_compatible?(:codex, "m2-air")
+    refute AgentBackend.worker_host_compatible?("codex", "  ")
+    assert AgentBackend.worker_host_compatible?("pi", nil)
+    refute AgentBackend.worker_host_compatible?("pi", "m2-air")
+    assert AgentBackend.worker_host_compatible?("antigravity", nil)
+    refute AgentBackend.worker_host_compatible?("antigravity", "m2-air")
+    refute AgentBackend.worker_host_compatible?("unknown", nil)
+
+    refute AgentBackend.local_only?("codex")
+    assert AgentBackend.local_only?("pi")
+    assert AgentBackend.local_only?("antigravity")
+    refute AgentBackend.local_only?("unknown")
+  end
+
   test "rejects malformed adapter updates and turn results" do
     assert {:error, {:invalid_backend_update, %{event: :missing_timestamp}}} =
              AgentBackend.validate_update(%{event: :missing_timestamp})
