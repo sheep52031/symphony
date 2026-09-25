@@ -154,6 +154,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:issue_backends, :map, default: %{})
+      field(:issue_backend_routing_enabled, :boolean, default: false)
+      field(:accepted_antigravity_issue_identifiers, {:array, :string}, default: [])
       field(:allowed_issue_identifiers, {:array, :string})
       field(:hold_after_normal_completion, :boolean, default: false)
       field(:max_attempts_per_issue, :integer)
@@ -171,6 +174,9 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
+          :issue_backends,
+          :issue_backend_routing_enabled,
+          :accepted_antigravity_issue_identifiers,
           :allowed_issue_identifiers,
           :hold_after_normal_completion,
           :max_attempts_per_issue,
@@ -184,9 +190,80 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:max_attempts_per_issue, greater_than: 0)
+      |> validate_issue_backends()
+      |> validate_exact_identifiers(:accepted_antigravity_issue_identifiers)
+      |> validate_antigravity_routes()
       |> validate_allowed_issue_identifiers()
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+
+    defp validate_issue_backends(changeset) do
+      validate_change(changeset, :issue_backends, fn :issue_backends, bindings ->
+        if valid_issue_backend_bindings?(bindings),
+          do: [],
+          else: [issue_backends: "must map exact nonblank issue identifiers to a closed AgentBackend name"]
+      end)
+    end
+
+    defp valid_issue_backend_bindings?(bindings) do
+      Enum.all?(bindings, fn
+        {identifier, backend} ->
+          String.trim(identifier) != "" and String.trim(identifier) == identifier and
+            backend in AgentBackend.supported_names()
+      end)
+    end
+
+    defp validate_exact_identifiers(changeset, field) do
+      validate_change(changeset, field, fn ^field, identifiers ->
+        cond do
+          Enum.any?(identifiers, &(not is_binary(&1) or String.trim(&1) == "")) ->
+            [{field, "must contain only nonblank exact issue identifiers"}]
+
+          Enum.any?(identifiers, &(String.trim(&1) != &1)) ->
+            [{field, "identifiers must not include surrounding whitespace"}]
+
+          length(identifiers) != length(Enum.uniq(identifiers)) ->
+            [{field, "must not contain duplicate identifiers"}]
+
+          true ->
+            []
+        end
+      end)
+    end
+
+    defp validate_antigravity_routes(changeset) do
+      bindings = get_field(changeset, :issue_backends, %{})
+      accepted = get_field(changeset, :accepted_antigravity_issue_identifiers, [])
+
+      antigravity_identifiers =
+        bindings
+        |> Enum.flat_map(fn
+          {identifier, "antigravity"} -> [identifier]
+          _ -> []
+        end)
+        |> Enum.sort()
+
+      accepted_identifiers = Enum.sort(accepted)
+
+      cond do
+        antigravity_identifiers != [] and accepted_identifiers != antigravity_identifiers ->
+          add_error(
+            changeset,
+            :issue_backends,
+            "AntiGravity routes require an exact matching accepted_antigravity_issue_identifiers gate"
+          )
+
+        accepted_identifiers != [] and accepted_identifiers != antigravity_identifiers ->
+          add_error(
+            changeset,
+            :accepted_antigravity_issue_identifiers,
+            "must name exactly the issues routed to AntiGravity"
+          )
+
+        true ->
+          changeset
+      end
     end
 
     defp validate_allowed_issue_identifiers(changeset) do

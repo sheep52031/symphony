@@ -56,6 +56,55 @@ defmodule SymphonyElixir.AgentBackendContractTest do
              Config.Schema.parse(%{"pi" => %{"turn_timeout_ms" => 0}})
   end
 
+  test "parses exact per-issue backend bindings and gates AntiGravity candidates" do
+    assert {:ok, defaults} = Config.Schema.parse(%{})
+    assert defaults.agent.backend == "codex"
+    assert defaults.agent.issue_backends == %{}
+
+    assert {:ok, routed} =
+             Config.Schema.parse(%{
+               "agent" => %{
+                 "issue_backends" => %{"JARVIS-979-PI" => "pi"}
+               }
+             })
+
+    assert routed.agent.issue_backends == %{"JARVIS-979-PI" => "pi"}
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{"JARVIS-979-X" => "deepseek"}}})
+
+    assert message =~ "issue_backends"
+
+    assert {:error, {:invalid_workflow_config, exact_identifier_message}} =
+             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{" JARVIS-979-X " => "pi"}}})
+
+    assert exact_identifier_message =~ "issue_backends"
+
+    agy_route = %{
+      "agent" => %{
+        "issue_backends" => %{"JARVIS-979-AGY" => "antigravity"}
+      }
+    }
+
+    assert {:error, {:invalid_workflow_config, gate_message}} = Config.Schema.parse(agy_route)
+    assert gate_message =~ "accepted_antigravity_issue_identifiers"
+
+    assert {:ok, accepted} =
+             Config.Schema.parse(put_in(agy_route, ["agent", "accepted_antigravity_issue_identifiers"], ["JARVIS-979-AGY"]))
+
+    assert accepted.agent.accepted_antigravity_issue_identifiers == ["JARVIS-979-AGY"]
+
+    assert {:error, {:invalid_workflow_config, extra_gate_message}} =
+             Config.Schema.parse(put_in(agy_route, ["agent", "accepted_antigravity_issue_identifiers"], ["JARVIS-979-OTHER"]))
+
+    assert extra_gate_message =~ "accepted_antigravity_issue_identifiers"
+
+    assert {:error, {:invalid_workflow_config, unused_gate_message}} =
+             Config.Schema.parse(%{"agent" => %{"accepted_antigravity_issue_identifiers" => ["JARVIS-979-OTHER"]}})
+
+    assert unused_gate_message =~ "accepted_antigravity_issue_identifiers"
+  end
+
   test "validates lifecycle return envelopes and delegates backend-owned config" do
     assert {:ok, :session} = AgentBackend.validate_start_result({:ok, :session})
     assert {:error, :startup_failed} = AgentBackend.validate_start_result({:error, :startup_failed})
