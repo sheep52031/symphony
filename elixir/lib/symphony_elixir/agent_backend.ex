@@ -38,6 +38,29 @@ defmodule SymphonyElixir.AgentBackend do
   @spec supported_names() :: [String.t()]
   def supported_names, do: @backends |> Map.keys() |> Enum.sort()
 
+  @spec worker_host_compatible?(String.t() | atom(), String.t() | nil) :: boolean()
+  def worker_host_compatible?(backend, worker_host) do
+    case resolve(backend) do
+      {:ok, :codex, _module} ->
+        is_nil(worker_host) or (is_binary(worker_host) and String.trim(worker_host) != "")
+
+      {:ok, _local_backend, _module} ->
+        is_nil(worker_host)
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  @spec local_only?(String.t() | atom()) :: boolean()
+  def local_only?(backend) do
+    case resolve(backend) do
+      {:ok, :codex, _module} -> false
+      {:ok, _backend_id, _module} -> true
+      {:error, _reason} -> false
+    end
+  end
+
   @spec resolve(String.t() | atom()) :: {:ok, backend_id(), backend()} | {:error, term()}
   def resolve(backend) when is_atom(backend), do: backend |> Atom.to_string() |> resolve()
 

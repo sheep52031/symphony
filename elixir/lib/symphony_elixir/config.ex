@@ -115,6 +115,50 @@ defmodule SymphonyElixir.Config do
 
   def issue_backend_binding_matches?(_identifier, _backend, _route_explicit?), do: false
 
+  @spec worker_hosts_for_backend(String.t() | atom()) :: [String.t() | nil]
+  def worker_hosts_for_backend(backend) do
+    settings = settings!()
+
+    cond do
+      AgentBackend.local_only?(backend) ->
+        [nil]
+
+      AgentBackend.worker_host_compatible?(backend, nil) and settings.worker.ssh_hosts == [] ->
+        [nil]
+
+      AgentBackend.worker_host_compatible?(backend, nil) ->
+        settings.worker.ssh_hosts
+        |> normalize_worker_hosts()
+        |> Enum.filter(&AgentBackend.worker_host_compatible?(backend, &1))
+
+      true ->
+        settings.worker.ssh_hosts
+        |> normalize_worker_hosts()
+        |> Enum.filter(&AgentBackend.worker_host_compatible?(backend, &1))
+    end
+  end
+
+  @spec worker_host_binding_current?(String.t() | atom(), String.t() | nil) :: boolean()
+  def worker_host_binding_current?(backend, worker_host) do
+    worker_host in worker_hosts_for_backend(backend)
+  end
+
+  @spec default_worker_host(String.t() | atom()) :: {:ok, String.t() | nil} | {:error, term()}
+  def default_worker_host(backend) do
+    case worker_hosts_for_backend(backend) do
+      [worker_host | _] -> {:ok, worker_host}
+      [] -> {:error, {:no_compatible_worker_host, backend}}
+    end
+  end
+
+  defp normalize_worker_hosts(hosts) when is_list(hosts) do
+    hosts
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
   @spec hold_after_normal_completion?() :: boolean()
   def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
 
@@ -203,7 +247,14 @@ defmodule SymphonyElixir.Config do
     |> Map.values()
     |> Enum.uniq()
     |> Enum.reduce_while(:ok, fn backend, :ok ->
-      case AgentBackend.validate_config(backend, settings) do
+      backend_settings =
+        if AgentBackend.local_only?(backend) do
+          %{settings | worker: %{settings.worker | ssh_hosts: []}}
+        else
+          settings
+        end
+
+      case AgentBackend.validate_config(backend, backend_settings) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end

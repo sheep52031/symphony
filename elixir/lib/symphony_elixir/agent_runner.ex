@@ -19,13 +19,20 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
-    # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
-
     if Config.issue_identifier_allowed?(issue.identifier) do
-      Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+      run_allowed_issue(issue, codex_update_recipient, opts)
+    else
+      Logger.warning("Skipping agent run; issue identifier is not allowed: #{issue_context(issue)}")
+      :ok
+    end
+  end
 
-      case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+  defp run_allowed_issue(issue, codex_update_recipient, opts) do
+    with {:ok, backend_name} <- selected_backend_name(issue, opts),
+         {:ok, worker_host} <- selected_worker_host(backend_name, opts) do
+      Logger.info("Starting agent run for #{issue_context(issue)} backend=#{backend_name} worker_host=#{worker_host_for_log(worker_host)}")
+
+      case run_on_worker_host(issue, codex_update_recipient, Keyword.put(opts, :backend, backend_name), worker_host) do
         :ok ->
           :ok
 
@@ -34,8 +41,9 @@ defmodule SymphonyElixir.AgentRunner do
           raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
       end
     else
-      Logger.warning("Skipping agent run; issue identifier is not allowed: #{issue_context(issue)}")
-      :ok
+      {:error, reason} ->
+        Logger.error("Refusing incompatible agent route for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "Refusing incompatible agent route for #{issue_context(issue)}: #{inspect(reason)}"
     end
   end
 
@@ -252,19 +260,43 @@ defmodule SymphonyElixir.AgentRunner do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
-  defp selected_worker_host(nil, []), do: nil
+  defp selected_backend_name(issue, opts) do
+    case Keyword.fetch(opts, :backend) do
+      {:ok, backend} ->
+        case AgentBackend.resolve(backend) do
+          {:ok, backend_id, _module} -> {:ok, Atom.to_string(backend_id)}
+          {:error, reason} -> {:error, reason}
+        end
 
-  defp selected_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
-    hosts =
-      configured_hosts
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.uniq()
+      :error ->
+        Config.issue_backend(issue.identifier)
+    end
+  end
 
-    case preferred_host do
-      host when is_binary(host) and host != "" -> host
-      _ when hosts == [] -> nil
-      _ -> List.first(hosts)
+  defp selected_worker_host(backend_name, opts) do
+    result =
+      case Keyword.fetch(opts, :worker_host) do
+        {:ok, worker_host} ->
+          if Config.worker_host_binding_current?(backend_name, worker_host) do
+            {:ok, worker_host}
+          else
+            {:error, {:incompatible_or_unconfigured_worker_host, backend_name, worker_host}}
+          end
+
+        :error ->
+          Config.default_worker_host(backend_name)
+      end
+
+    case result do
+      {:ok, worker_host} ->
+        if AgentBackend.worker_host_compatible?(backend_name, worker_host) do
+          {:ok, worker_host}
+        else
+          {:error, {:incompatible_worker_host, backend_name, worker_host}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

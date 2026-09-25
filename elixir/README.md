@@ -34,6 +34,14 @@ Symphony uses Pi's native RPC/session lifecycle only: it does not inject tracker
 bridge, or a host-side handoff into Pi. Configured tracker credential environment names are removed
 from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
 
+Worker-host eligibility is evaluated together with the selected backend. Codex may use the local
+host or a configured `worker.ssh_hosts` entry; Pi and AntiGravity always use the local host, even
+when SSH workers are configured for Codex. Per-host capacity limits apply only to that SSH host and
+do not suppress local Pi/AntiGravity admission. Retries remain pinned to the backend and host chosen
+for the attempt; if that binding is removed or becomes incompatible, Symphony holds the issue rather
+than migrating the attempt to another host or backend. Remote Pi/AntiGravity are not supported by
+this routing contract.
+
 An optional `agent.issue_backends` map binds exact issue identifiers to `codex`, `pi`, or
 `antigravity` while the existing single orchestrator keeps ownership of selection, retries, and
 workspace leases. Unlisted issues use `agent.backend`. A backend is captured for each attempt;
@@ -287,8 +295,10 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` and `antigravity`
-  are explicit, local-only opt-ins in this fork; configured SSH workers are rejected for both.
+- `agent.backend` selects the default execution adapter and defaults to `codex`. `pi` and
+  `antigravity` are local-only opt-ins in this fork. A workflow may configure SSH workers for
+  Codex while routing exact issue identifiers to local Pi/AntiGravity; a global Pi/AntiGravity
+  default with configured SSH workers remains invalid.
 - Pi completion waits for the authoritative `agent_settled` event; `agent_end` with `willRetry: false`
   is not treated as final evidence. Pi returns lifecycle outcomes and neutral session/runtime evidence
   only; it does not receive a tracker bridge, host handoff path, or receipt store.
