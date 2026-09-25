@@ -1699,10 +1699,10 @@ defmodule SymphonyElixir.AppServerTest do
     {provider, active_states, terminal_states} =
       case tracker_kind do
         "github" ->
-          {"    repo: \"octo/repo\"\n    token: \"$GITHUB_TOKEN\"", ["open"], ["closed"]}
+          {~s(    repo: "octo/repo"\n    token: "$GITHUB_TOKEN"), ["open"], ["closed"]}
 
         "gitlab" ->
-          {"    project_path: \"octo/repo\"\n    api_key: \"$GITLAB_PAT\"", ["opened"], ["closed"]}
+          {~s(    project_path: "octo/repo"\n    api_key: "$GITLAB_PAT"), ["opened"], ["closed"]}
       end
 
     File.write!(
