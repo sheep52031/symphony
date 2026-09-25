@@ -261,15 +261,26 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp selected_backend_name(issue, opts) do
+    with {:ok, configured_backend} <- Config.issue_backend(issue.identifier),
+         {:ok, requested_backend} <- requested_backend_name(opts, configured_backend) do
+      if requested_backend == configured_backend do
+        {:ok, configured_backend}
+      else
+        {:error, {:backend_route_mismatch, configured_backend, requested_backend}}
+      end
+    end
+  end
+
+  defp requested_backend_name(opts, configured_backend) do
     case Keyword.fetch(opts, :backend) do
+      :error ->
+        {:ok, configured_backend}
+
       {:ok, backend} ->
         case AgentBackend.resolve(backend) do
           {:ok, backend_id, _module} -> {:ok, Atom.to_string(backend_id)}
           {:error, reason} -> {:error, reason}
         end
-
-      :error ->
-        Config.issue_backend(issue.identifier)
     end
   end
 

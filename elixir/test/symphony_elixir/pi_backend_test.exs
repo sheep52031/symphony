@@ -272,6 +272,33 @@ defmodule SymphonyElixir.Pi.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "AgentRunner refuses an explicit backend that conflicts with the configured issue route" do
+    root = Path.join(System.tmp_dir!(), "symphony-pi-route-mismatch-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(root, "workspaces")
+    script = Path.join(root, "fake-pi")
+    File.mkdir_p!(root)
+    write_fake_pi!(script)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      pi_command: script,
+      workspace_root: workspace_root,
+      issue_backends: %{"JARVIS-988-BOUND" => "pi"}
+    )
+
+    issue = %Issue{id: "issue-route-mismatch", identifier: "JARVIS-988-BOUND", title: "Bound Pi route"}
+
+    assert_raise RuntimeError, ~r/backend_route_mismatch/, fn ->
+      AgentRunner.run(issue, nil,
+        backend: "codex",
+        issue_state_fetcher: fn _ -> {:ok, []} end
+      )
+    end
+
+    refute File.exists?(Path.join(workspace_root, issue.identifier))
+    File.rm_rf!(root)
+  end
+
   test "aborts a timed-out Pi turn and returns a typed failure" do
     {root, workspace, script} = setup_fake_pi!()
     write_workflow_file!(Workflow.workflow_file_path(), agent_backend: "pi", pi_command: script)
