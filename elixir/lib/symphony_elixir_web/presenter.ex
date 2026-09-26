@@ -118,7 +118,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
 
   defp issue_status(nil, nil, %{disposition: disposition})
-       when disposition in [:normal_completion_hold, :attempt_limit_hold],
+       when disposition in [:normal_completion_hold, :attempt_limit_hold, :backend_route_unknown_after_restart],
        do: "held"
 
   defp issue_status(nil, nil, _blocked), do: "blocked"
@@ -207,7 +207,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp held_entry?(%{disposition: disposition})
-       when disposition in [:normal_completion_hold, :attempt_limit_hold],
+       when disposition in [:normal_completion_hold, :attempt_limit_hold, :backend_route_unknown_after_restart],
        do: true
 
   defp held_entry?(_entry), do: false

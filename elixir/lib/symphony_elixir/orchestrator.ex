@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :startup_backend_hold_pending?,
       :tick_timer_ref,
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
@@ -62,6 +63,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = %State{
           poll_interval_ms: config.polling.interval_ms,
           max_concurrent_agents: config.agent.max_concurrent_agents,
+          startup_backend_hold_pending?: config.agent.issue_backend_routing_enabled or map_size(config.agent.issue_backends) > 0,
           next_poll_due_at_ms: now_ms,
           poll_check_in_progress: false,
           tick_timer_ref: nil,
@@ -235,6 +237,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(running_entry, :worker_host),
           workspace_path: Map.get(running_entry, :workspace_path),
           backend: Map.get(running_entry, :backend),
+          backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
           session_id: Map.get(running_entry, :session_id)
         })
     end
@@ -268,6 +271,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       backend: Map.get(running_entry, :backend),
+      backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
       session_id: Map.get(running_entry, :session_id)
     })
   end
@@ -279,9 +283,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      state = hold_unknown_startup_backend_routes(issues, state)
+      if available_slots(state) > 0, do: choose_issues(issues, state), else: state
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -320,10 +324,47 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
         state
-
-      false ->
-        state
     end
+  end
+
+  defp hold_unknown_startup_backend_routes(
+         issues,
+         %State{startup_backend_hold_pending?: true} = state
+       ) do
+    bindings = Config.settings!().agent.issue_backends
+
+    state =
+      Enum.reduce(issues, state, fn
+        %Issue{identifier: identifier, state: issue_state} = issue, state_acc
+        when is_binary(identifier) and is_binary(issue_state) ->
+          if (Map.has_key?(bindings, identifier) or
+                Config.settings!().agent.issue_backend_routing_enabled) and
+               normalize_issue_state(issue_state) == "in progress" do
+            Logger.warning("Holding startup issue with unknown backend attempt identity: #{issue_context(issue)}")
+
+            block_issue_from_retry(
+              state_acc,
+              issue.id,
+              %{issue: issue, identifier: identifier},
+              :backend_route_unknown_after_restart
+            )
+          else
+            state_acc
+          end
+
+        _issue, state_acc ->
+          state_acc
+      end)
+
+    %{state | startup_backend_hold_pending?: false}
+  end
+
+  defp hold_unknown_startup_backend_routes(_issues, state), do: state
+
+  @doc false
+  @spec hold_unknown_startup_backend_routes_for_test([Issue.t()], term()) :: term()
+  def hold_unknown_startup_backend_routes_for_test(issues, %State{} = state) when is_list(issues) do
+    hold_unknown_startup_backend_routes(issues, state)
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -470,6 +511,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false, "identifier_revoked")
 
+      !running_backend_route_current?(issue, state) ->
+        revoke_running_backend_route(state, issue)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -506,6 +550,11 @@ defmodule SymphonyElixir.Orchestrator do
 
       !issue_identifier_allowed?(issue.identifier) ->
         Logger.info("Blocked issue is no longer allowed: #{issue_context(issue)}; releasing block")
+        release_issue_claim(state, issue.id)
+
+      startup_backend_identity_unknown?(state, issue.id) and
+          normalize_issue_state(issue.state) == "todo" ->
+        Logger.info("Startup backend identity reconciled by requeue: #{issue_context(issue)}; admitting as a fresh attempt")
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -583,6 +632,37 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         state
     end
+  end
+
+  defp running_backend_route_current?(%Issue{id: issue_id, identifier: identifier}, %State{} = state) do
+    case Map.get(state.running, issue_id) do
+      %{backend: backend, backend_route_explicit?: route_explicit?} ->
+        Config.issue_backend_binding_matches?(identifier, backend, route_explicit?)
+
+      _ ->
+        false
+    end
+  end
+
+  defp revoke_running_backend_route(%State{} = state, %Issue{id: issue_id} = issue) do
+    running_entry = Map.get(state.running, issue_id, %{})
+    backend = Map.get(running_entry, :backend)
+    route_explicit? = Map.get(running_entry, :backend_route_explicit?)
+
+    Logger.warning("Backend route revoked for #{issue_context(issue)} bound_backend=#{inspect(backend)}; stopping the active attempt")
+
+    state
+    |> terminate_running_issue(issue_id, false, "backend_route_revoked")
+    |> block_issue_from_retry(
+      issue_id,
+      %{
+        issue: issue,
+        identifier: issue.identifier,
+        backend: backend,
+        backend_route_explicit?: route_explicit?
+      },
+      :backend_route_revoked
+    )
   end
 
   defp refresh_blocked_issue_state(%State{} = state, %Issue{} = issue) do
@@ -685,6 +765,7 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: running_entry.issue.url,
           error: "stalled for #{elapsed_ms}ms without codex activity",
           backend: Map.get(running_entry, :backend),
+          backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
           session_id: Map.get(running_entry, :session_id)
         })
       end
@@ -824,6 +905,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       backend: Map.get(running_entry, :backend),
+      backend_route_explicit?: Map.get(running_entry, :backend_route_explicit?),
       disposition: disposition,
       reason: reason,
       error: if(disposition == :input_required, do: reason),
@@ -854,8 +936,63 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(metadata, :workspace_path),
       session_id: Map.get(metadata, :session_id),
       backend: Map.get(metadata, :backend),
+      backend_route_explicit?: Map.get(metadata, :backend_route_explicit?),
       disposition: :attempt_limit_hold,
       reason: "attempt limit reached (#{count}/#{limit})",
+      error: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id),
+        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
+  defp block_issue_from_retry(%State{} = state, issue_id, metadata, :backend_route_revoked) do
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(metadata, :identifier, issue_id),
+      issue: Map.get(metadata, :issue),
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      backend: Map.get(metadata, :backend),
+      backend_route_explicit?: Map.get(metadata, :backend_route_explicit?),
+      disposition: :backend_route_revoked,
+      reason: "configured backend route no longer matches the bound attempt",
+      error: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id),
+        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
+  defp block_issue_from_retry(%State{} = state, issue_id, metadata, :backend_route_unknown_after_restart) do
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(metadata, :identifier, issue_id),
+      issue: Map.get(metadata, :issue),
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      backend: nil,
+      backend_route_explicit?: nil,
+      disposition: :backend_route_unknown_after_restart,
+      reason: "controller restarted without durable backend attempt identity; move issue to Todo to admit a fresh attempt",
       error: nil,
       blocked_at: DateTime.utc_now(),
       last_codex_message: nil,
@@ -916,12 +1053,29 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
+      !writer_conflict?(issue, running) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp writer_conflict?(%Issue{} = issue, running) when is_map(running) do
+    issue_workspace_key = Workspace.workspace_key(issue)
+
+    Enum.any?(running, fn
+      {_issue_id, %{issue: %Issue{} = running_issue}} ->
+        Workspace.workspace_key(running_issue) == issue_workspace_key or
+          same_nonblank_value?(issue.branch_name, running_issue.branch_name)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp same_nonblank_value?(value, value) when is_binary(value) and value != "", do: true
+  defp same_nonblank_value?(_left, _right), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1000,10 +1154,16 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(
+         %State{} = state,
+         issue,
+         attempt \\ nil,
+         preferred_worker_host \\ nil,
+         bound_backend \\ :new_attempt
+       ) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, bound_backend)
 
       {:skip, _reason} ->
         state
@@ -1033,40 +1193,78 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
-    recipient = self()
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, bound_backend) do
+    case resolve_attempt_backend(issue, bound_backend) do
+      {:ok, backend_binding} ->
+        recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+        case select_worker_host(state, preferred_worker_host) do
+          :no_worker_capacity ->
+            Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+            state
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+          worker_host ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, backend_binding)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failing closed for #{issue_context(issue)}: #{inspect(reason)}")
+        hold_changed_bound_attempt(state, issue, bound_backend)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp hold_changed_bound_attempt(state, _issue, :new_attempt), do: state
+
+  defp hold_changed_bound_attempt(state, issue, %{backend: _backend} = bound_backend) do
+    binding = bound_backend_metadata(bound_backend)
+
+    block_issue_from_retry(
+      state,
+      issue.id,
+      Map.merge(binding, %{issue: issue, identifier: issue.identifier}),
+      :backend_route_revoked
+    )
+  end
+
+  defp bound_backend_metadata(%{backend: backend, route_explicit?: explicit?}) do
+    %{backend: backend, backend_route_explicit?: explicit?}
+  end
+
+  defp resolve_attempt_backend(%Issue{identifier: identifier}, :new_attempt) do
+    Config.issue_backend_binding(identifier)
+  end
+
+  defp resolve_attempt_backend(%Issue{identifier: identifier}, %{backend: backend, route_explicit?: explicit?} = binding) do
+    if Config.issue_backend_binding_matches?(identifier, backend, explicit?) do
+      {:ok, binding}
+    else
+      {:error, {:backend_route_changed, binding}}
+    end
+  end
+
+  defp resolve_attempt_backend(_issue, backend), do: {:error, {:missing_bound_backend, backend}}
+
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, backend_binding) do
     if issue_identifier_allowed?(issue.identifier) do
-      spawn_allowed_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+      spawn_allowed_issue_on_worker_host(state, issue, attempt, recipient, worker_host, backend_binding)
     else
       Logger.warning("Skipping agent spawn; issue identifier is not allowed: #{issue_context(issue)}")
       state
     end
   end
 
-  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_allowed_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, backend_binding) do
     case reserve_issue_attempt(state, issue) do
       {:ok, state} ->
-        spawn_reserved_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_reserved_issue_on_worker_host(state, issue, attempt, recipient, worker_host, backend_binding)
 
       {:exhausted, state} ->
         block_issue_from_retry(state, issue.id, %{issue: issue, identifier: issue.identifier}, :attempt_limit_hold)
     end
   end
 
-  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    backend_name = Config.settings!().agent.backend
+  defp spawn_reserved_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, backend_binding) do
+    backend_name = backend_binding.backend
 
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(
@@ -1089,6 +1287,7 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: issue.identifier,
             issue: issue,
             backend: backend_name,
+            backend_route_explicit?: backend_binding.route_explicit?,
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
@@ -1125,7 +1324,9 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          backend: backend_name,
+          backend_route_explicit?: backend_binding.route_explicit?
         })
     end
   end
@@ -1225,6 +1426,12 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: workspace_path,
             backend: backend,
+            backend_route_explicit?:
+              Map.get(
+                metadata,
+                :backend_route_explicit?,
+                Map.get(previous_retry, :backend_route_explicit?)
+              ),
             session_id: session_id
           })
     }
@@ -1240,6 +1447,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           backend: Map.get(retry_entry, :backend),
+          backend_route_explicit?: Map.get(retry_entry, :backend_route_explicit?),
           session_id: Map.get(retry_entry, :session_id)
         }
 
@@ -1339,12 +1547,42 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
+    if Config.issue_backend_binding_matches?(
+         issue.identifier,
+         Map.get(metadata, :backend),
+         Map.get(metadata, :backend_route_explicit?)
+       ) do
+      dispatch_active_retry(state, issue, attempt, metadata)
+    else
+      Logger.warning("Retry backend binding no longer matches configuration for #{issue_context(issue)}; retaining a fail-closed hold")
+
+      {:noreply,
+       block_issue_from_retry(
+         state,
+         issue.id,
+         Map.merge(metadata, %{issue: issue, identifier: issue.identifier}),
+         :backend_route_revoked
+       )}
+    end
+  end
+
+  defp dispatch_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
-          {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
+          {:noreply,
+           do_dispatch_issue(
+             state,
+             refreshed_issue,
+             attempt,
+             metadata[:worker_host],
+             %{
+               backend: Map.get(metadata, :backend),
+               route_explicit?: Map.get(metadata, :backend_route_explicit?)
+             }
+           )}
 
         {:skip, :missing} ->
           {:noreply, release_issue_claim(state, issue.id)}
@@ -1599,6 +1837,7 @@ defmodule SymphonyElixir.Orchestrator do
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
         |> maybe_put_runtime_value(:backend, Map.get(metadata, :backend))
+        |> maybe_put_runtime_value(:backend_route_explicit?, Map.get(metadata, :backend_route_explicit?))
         |> maybe_put_runtime_value(:backend_process_pid, Map.get(metadata, :backend_process_pid))
         |> maybe_put_runtime_value(:model, Map.get(metadata, :model))
         |> maybe_put_runtime_value(:thinking_level, Map.get(metadata, :thinking_level))
@@ -1622,6 +1861,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry, :workspace_path)
         }
         |> maybe_put_runtime_value(:backend, Map.get(retry, :backend))
+        |> maybe_put_runtime_value(:backend_route_explicit?, Map.get(retry, :backend_route_explicit?))
         |> maybe_put_runtime_value(:session_id, Map.get(retry, :session_id))
       end)
 
@@ -1645,6 +1885,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: Map.get(metadata, :last_codex_event)
         }
         |> maybe_put_runtime_value(:backend, Map.get(metadata, :backend))
+        |> maybe_put_runtime_value(:backend_route_explicit?, Map.get(metadata, :backend_route_explicit?))
       end)
 
     {:reply,
@@ -1882,7 +2123,22 @@ defmodule SymphonyElixir.Orchestrator do
     not attempt_budget_exhausted?(state, issue_id)
   end
 
+  defp hold_released_by_config?(_state, _issue_id, %{disposition: :backend_route_revoked} = blocked_entry) do
+    Config.issue_backend_binding_matches?(
+      Map.get(blocked_entry, :identifier),
+      Map.get(blocked_entry, :backend),
+      Map.get(blocked_entry, :backend_route_explicit?)
+    )
+  end
+
+  defp hold_released_by_config?(_state, _issue_id, %{disposition: :backend_route_unknown_after_restart}),
+    do: false
+
   defp hold_released_by_config?(_state, _issue_id, _blocked_entry), do: false
+
+  defp startup_backend_identity_unknown?(state, issue_id) do
+    match?(%{disposition: :backend_route_unknown_after_restart}, Map.get(state.blocked, issue_id))
+  end
 
   defp release_config_hold(%State{} = state, issue_id) do
     %{

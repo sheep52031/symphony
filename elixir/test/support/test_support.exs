@@ -108,6 +108,9 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          issue_backends: %{},
+          issue_backend_routing_enabled: false,
+          accepted_antigravity_issue_identifiers: [],
           allowed_issue_identifiers: nil,
           hold_after_normal_completion: false,
           max_attempts_per_issue: nil,
@@ -161,6 +164,9 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    issue_backends = Keyword.get(config, :issue_backends)
+    issue_backend_routing_enabled = Keyword.get(config, :issue_backend_routing_enabled)
+    accepted_antigravity_issue_identifiers = Keyword.get(config, :accepted_antigravity_issue_identifiers)
     allowed_issue_identifiers = Keyword.get(config, :allowed_issue_identifiers)
     hold_after_normal_completion = Keyword.get(config, :hold_after_normal_completion)
     max_attempts_per_issue = Keyword.get(config, :max_attempts_per_issue)
@@ -217,6 +223,9 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  issue_backends: #{yaml_value(issue_backends)}",
+        "  issue_backend_routing_enabled: #{yaml_value(issue_backend_routing_enabled)}",
+        "  accepted_antigravity_issue_identifiers: #{yaml_value(accepted_antigravity_issue_identifiers)}",
         !is_nil(allowed_issue_identifiers) &&
           "  allowed_issue_identifiers: #{yaml_value(allowed_issue_identifiers)}",
         "  hold_after_normal_completion: #{yaml_value(hold_after_normal_completion)}",
