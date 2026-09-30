@@ -59,7 +59,7 @@ defmodule SymphonyElixir.Antigravity.Launcher do
              canonical_profile_root,
              canonical_agy,
              turn_timeout_ms
-           ),
+           ) ++ model_args(opts),
          workspace: canonical_workspace,
          profile_root: canonical_profile_root,
          agy_executable: canonical_agy
@@ -139,6 +139,16 @@ defmodule SymphonyElixir.Antigravity.Launcher do
         "--print-timeout",
         native_timeout(turn_timeout_ms + 5_000)
       ]
+  end
+
+  # Optional per-workflow model and reasoning effort, appended after the agy options.
+  defp model_args(opts) do
+    Enum.flat_map([model: "--model", effort: "--effort"], fn {key, flag} ->
+      case Keyword.get(opts, key) do
+        value when is_binary(value) and value != "" -> [flag, value]
+        _ -> []
+      end
+    end)
   end
 
   defp home_mount_args(home) do

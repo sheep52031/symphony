@@ -272,6 +272,8 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:executable, :string)
       field(:profile_root, :string)
+      field(:model, :string)
+      field(:effort, :string)
       field(:first_event_timeout_ms, :integer, default: 30_000)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:cancel_grace_ms, :integer, default: 1_000)
@@ -287,12 +289,15 @@ defmodule SymphonyElixir.Config.Schema do
           :profile_root,
           :first_event_timeout_ms,
           :turn_timeout_ms,
-          :cancel_grace_ms
+          :cancel_grace_ms,
+          :model,
+          :effort
         ],
         empty_values: []
       )
       |> validate_nonblank(:executable)
       |> validate_nonblank(:profile_root)
+      |> validate_inclusion(:effort, ~w(low medium high max))
       |> validate_number(:first_event_timeout_ms, greater_than: 0)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:cancel_grace_ms, greater_than: 0)

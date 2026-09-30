@@ -36,7 +36,9 @@ from the Pi child, while tracker polling and lifecycle mutations remain owned by
 
 Set `agent.backend` to `antigravity` only on the accepted native Linux route. It is a local-only,
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
-`agy` executable and one explicit profile root. Symphony launches it through a mandatory
+`agy` executable and one explicit profile root. Optional `antigravity.model` and `antigravity.effort`
+(`low|medium|high|max`) are passed to `agy` as `--model` / `--effort`; when unset, the profile's
+default applies. Symphony launches it through a mandatory
 Bubblewrap boundary: host root is read-only, the real user home and host `/run/user` are masked,
 only the issue workspace and selected profile root are host-writable, the exact AGY executable is
 projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony` runtime metadata is
