@@ -242,6 +242,10 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.excluded_labels` is optional. An issue carrying any configured label
+  does not dispatch, and a running issue stops when the label is added. Use it
+  as an opt-out (for example `symphony-skip`) instead of gating every issue
+  behind a selector label.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
