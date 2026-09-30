@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import asyncio
 import json
 import random
@@ -544,7 +545,9 @@ async def wait_for_codex(pr_number: int, checks_done: asyncio.Event) -> None:
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
+async def wait_for_checks(
+    head_sha: str, checks_done: asyncio.Event, allow_no_checks: bool
+) -> None:
     print("Waiting for CI checks...", flush=True)
     empty_seconds = 0
     while True:
@@ -552,6 +555,13 @@ async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
         if not check_runs:
             empty_seconds += POLL_SECONDS
             if empty_seconds >= CHECKS_APPEAR_TIMEOUT_SECONDS:
+                if allow_no_checks:
+                    print(
+                        "No hosted checks after 120s; --allow-no-checks set, "
+                        "relying on the recorded local gate",
+                    )
+                    checks_done.set()
+                    return
                 print(
                     "No checks detected after 120s; check CI configuration",
                 )
@@ -572,25 +582,25 @@ async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
         await asyncio.sleep(POLL_SECONDS)
 
 
-async def watch_pr() -> None:
+async def watch_pr(allow_no_checks: bool) -> None:
     pr = await get_pr_info()
     if is_merge_conflicting(pr):
         print(
-            "PR has merge conflicts. Resolve/rebase against main and push before "
+            "PR has merge conflicts. Resolve/rebase against the PR base branch and push before "
             "running land_watch again.",
         )
         raise SystemExit(5)
     head_sha = pr.head_sha
     checks_done = asyncio.Event()
     codex_task = asyncio.create_task(wait_for_codex(pr.number, checks_done))
-    checks_task = asyncio.create_task(wait_for_checks(head_sha, checks_done))
+    checks_task = asyncio.create_task(wait_for_checks(head_sha, checks_done, allow_no_checks))
 
     async def head_monitor() -> None:
         while True:
             current = await get_pr_info()
             if is_merge_conflicting(current):
                 print(
-                    "PR has merge conflicts. Resolve/rebase against main and push "
+                    "PR has merge conflicts. Resolve/rebase against the PR base branch and push "
                     "before running land_watch again.",
                 )
                 raise SystemExit(5)
@@ -614,8 +624,22 @@ async def watch_pr() -> None:
             raise exc
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Watch a PR until it is ready to land.")
+    parser.add_argument(
+        "--allow-no-checks",
+        action="store_true",
+        help=(
+            "Treat a PR with no hosted checks as ready once the appear timeout "
+            "passes. Only for repositories whose workflow uses a local gate."
+        ),
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        asyncio.run(watch_pr())
+        asyncio.run(watch_pr(args.allow_no_checks))
     except SystemExit as exc:
         raise SystemExit(exc.code) from None

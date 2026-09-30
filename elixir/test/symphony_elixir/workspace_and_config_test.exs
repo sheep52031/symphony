@@ -1051,6 +1051,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: [" "])
     assert Config.settings!().tracker.required_labels == [""]
 
+    assert Config.settings!().tracker.excluded_labels == []
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_excluded_labels: [" Symphony-Skip ", "symphony-skip", "Manual"]
+    )
+
+    assert Config.settings!().tracker.excluded_labels == ["symphony-skip", "manual"]
+
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
     )

@@ -925,6 +925,60 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "issue routing honors excluded labels alongside required labels" do
+    issue = %Issue{id: "i", identifier: "MT-1", state: "Todo", dispatchable: true, labels: ["Backend"]}
+
+    assert Issue.routable?(issue, [], [])
+    assert Issue.routable?(issue, ["backend"], ["symphony-skip"])
+    refute Issue.routable?(%{issue | labels: ["backend", " Symphony-Skip "]}, [], ["symphony-skip"])
+    refute Issue.routable?(%{issue | labels: ["symphony-skip"]}, ["symphony-skip"], ["symphony-skip"])
+    refute Issue.routable?(%{issue | dispatchable: false}, [], [])
+  end
+
+  test "reconcile stops running issue when an excluded label is added" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_excluded_labels: ["symphony-skip"])
+
+    issue_id = "issue-excluded"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    running_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      state: "In Progress",
+      dispatchable: true,
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-563",
+          issue: running_issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %{running_issue | title: "Owner took over", labels: ["symphony-skip"]}
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+  end
+
   test "reconcile releases a blocked issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 

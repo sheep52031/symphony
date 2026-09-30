@@ -392,6 +392,12 @@ Fields:
   - An issue MUST contain every configured label to dispatch or continue.
   - Matching ignores case and surrounding whitespace.
   - A blank configured label matches no issue.
+- `excluded_labels` (list of strings)
+  - Default: `[]`.
+  - An issue carrying any configured label MUST NOT dispatch or continue.
+  - Matching ignores case and surrounding whitespace.
+  - Use it as an opt-out (for example `symphony-skip`) when every other active issue should be
+    eligible without a selector label.
 - `active_states` (list of strings)
   - REQUIRED unless the selected adapter profile documents a default.
   - Values are provider-native state names compared case-insensitively by the scheduler.
@@ -705,6 +711,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.kind`: string, REQUIRED, selects one supported adapter
 - `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings
 - `tracker.required_labels`: list of strings, default `[]`
+- `tracker.excluded_labels`: list of strings, default `[]`
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
 - `polling.interval_ms`: integer, default `30000`
@@ -860,13 +867,15 @@ An issue is dispatch-eligible only if all are true:
 - Its state is in `active_states` and not in `terminal_states`.
 - Its adapter-provided `dispatchable` value is `true`.
 - It contains every label in `tracker.required_labels`.
+- It contains no label in `tracker.excluded_labels`.
 - It is not already in `running`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
 
 For refresh and continuation checks, `issue_routable(issue)` means only that adapter-provided
-`dispatchable` is true and all `tracker.required_labels` match. State, claims, and concurrency are
+`dispatchable` is true, all `tracker.required_labels` match, and no `tracker.excluded_labels`
+match. State, claims, and concurrency are
 checked separately by the surrounding algorithm.
 
 Sorting order (stable intent):

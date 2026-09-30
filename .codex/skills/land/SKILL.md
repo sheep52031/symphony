@@ -10,7 +10,8 @@ description:
 
 ## Goals
 
-- Ensure the PR is conflict-free with main.
+- Ensure the PR is conflict-free with its base branch (`gh pr view --json baseRefName`;
+  `main` upstream, `develop` in repositories that integrate there).
 - Keep CI green and fix failures when they occur.
 - Squash-merge the PR once checks pass.
 - Do not yield to the user until the PR is merged; keep the watcher loop running
@@ -29,12 +30,14 @@ description:
 2. Confirm the full gauntlet is green locally before any push.
 3. If the working tree has uncommitted changes, commit with the `commit` skill
    and push with the `push` skill before proceeding.
-4. Check mergeability and conflicts against main.
-5. If conflicts exist, use the `pull` skill to fetch/merge `origin/main` and
+4. Check mergeability and conflicts against the PR base branch.
+5. If conflicts exist, use the `pull` skill to fetch/merge `origin/<base>` and
    resolve conflicts, then use the `push` skill to publish the updated branch.
 6. Ensure Codex review comments (if present) are acknowledged and any required
    fixes are handled before merging.
-7. Watch checks until complete.
+7. Watch checks until complete. If the repository's workflow declares a local gate
+   instead of hosted CI, run `land_watch.py --allow-no-checks` after recording that
+   gate's command and result; a PR with no hosted checks then lands on the local gate.
 8. If checks fail, pull logs, fix the issue, commit with the `commit` skill,
    push with the `push` skill, and re-run checks.
 9. When all checks are green and review feedback is addressed, squash-merge and
@@ -112,6 +115,10 @@ Exit codes:
 - 2: Review comments detected (address feedback)
 - 3: CI checks failed
 - 4: PR head updated (autofix commit detected)
+- 5: PR has merge conflicts with its base branch
+
+Pass `--allow-no-checks` only for repositories whose workflow uses a local
+verification gate instead of hosted CI.
 
 ## Failure Handling
 
@@ -122,10 +129,10 @@ Exit codes:
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not
   trigger a fresh CI run. Detect the updated PR head, pull locally, merge
-  `origin/main` if needed, add a real author commit, and force-push to retrigger
+  `origin/<base>` if needed, add a real author commit, and force-push to retrigger
   CI, then restart the checks loop.
 - If all jobs fail with corrupted pnpm lockfile errors on the merge commit, the
-  remediation is to fetch latest `origin/main`, merge, force-push, and rerun CI.
+  remediation is to fetch latest `origin/<base>`, merge, force-push, and rerun CI.
 - If mergeability is `UNKNOWN`, wait and re-check.
 - Do not merge while review comments (human or Codex review) are outstanding.
 - Codex review jobs retry on failure and are non-blocking; use the presence of
