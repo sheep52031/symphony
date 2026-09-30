@@ -81,6 +81,16 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     end)
 
     assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, bubblewrap_executable: bwrap)
+    refute "--model" in launch.args
+
+    assert {:ok, tuned} =
+             Launcher.build(workspace, agy, profile, 1_234,
+               bubblewrap_executable: bwrap,
+               model: "gemini-flash",
+               effort: "high"
+             )
+
+    assert Enum.take(tuned.args, -4) == ["--model", "gemini-flash", "--effort", "high"]
     assert launch.workspace == Path.expand(workspace)
     assert launch.profile_root == Path.expand(profile)
     assert launch.executable == Path.expand(bwrap)

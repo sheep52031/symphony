@@ -36,7 +36,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
           {:ok, session()} | {:error, term()}
   def start(workspace, agy_executable, profile_root, turn_timeout_ms, opts \\ []) do
     launcher = Keyword.get(opts, :launcher, &Launcher.build/5)
-    launcher_opts = Keyword.take(opts, [:bubblewrap_executable])
+    launcher_opts = Keyword.take(opts, [:bubblewrap_executable, :model, :effort])
 
     with {:ok, launch} <- launcher.(workspace, agy_executable, profile_root, turn_timeout_ms, launcher_opts),
          :ok <- prepare_runtime_directory(launch.workspace) do

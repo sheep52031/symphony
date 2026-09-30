@@ -79,6 +79,8 @@ defmodule SymphonyElixir.Antigravity.Backend do
       opts
       |> Keyword.take([:launcher])
       |> Keyword.put(:secret_environment_names, config.tracker.secret_environment_names)
+      |> maybe_put(:model, config.antigravity.model)
+      |> maybe_put(:effort, config.antigravity.effort)
 
     with :ok <- validate_local_config(config.antigravity),
          {:ok, transport} <-
@@ -255,4 +257,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
   defp reason_code(_reason), do: "antigravity_protocol_error"
 
   defp default_on_message(_message), do: :ok
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 end
