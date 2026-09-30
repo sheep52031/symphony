@@ -34,6 +34,28 @@ Symphony uses Pi's native RPC/session lifecycle only: it does not inject tracker
 bridge, or a host-side handoff into Pi. Configured tracker credential environment names are removed
 from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
 
+An optional `agent.issue_backends` map binds exact issue identifiers to `codex`, `pi`, or
+`antigravity` while the existing single orchestrator keeps ownership of selection, retries, and
+workspace leases. Unlisted issues use `agent.backend`. A backend is captured for each attempt;
+retry or active-run reconciliation stops and holds the issue if the configured route no longer
+matches. AntiGravity mappings also require `agent.accepted_antigravity_issue_identifiers` to name
+the exact mapped issue identifiers. No model, effort, or credential settings belong in this map.
+When per-issue routing is enabled, the first successful startup tracker poll holds issues already in
+`In Progress` because this runtime has no durable attempt-to-backend ledger. Move an issue to `Todo`
+to reconcile the unknown identity and admit a fresh attempt under current config. Other states,
+including newly queued `Todo` issues, retain normal admission. With routing disabled,
+unmapped/global-default operation is unchanged.
+If removing the last mapping while active attempts may still exist, keep
+`agent.issue_backend_routing_enabled: true` through the restart; it makes startup hold all active
+issues, including identifiers whose mapping was removed. The flag defaults to `false`.
+If the flag itself is disabled before unresolved active attempts are reconciled, the controller has
+no durable provenance to distinguish those attempts from ordinary global-default work; restart
+identity safety is therefore conditional on keeping the opt-in enabled through reconciliation.
+The accepted AntiGravity identifier list is a configuration gate only; it does not attest that the
+J906 canary or any live three-backend acceptance has passed. This change's tests do not yet exercise
+three heterogeneous backend processes overlapped through one controller; that remains an acceptance
+gap, and no production mixed-routing claim follows from the configuration or fake protocol tests.
+
 Set `agent.backend` to `antigravity` only on the accepted native Linux route. It is a local-only,
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
 `agy` executable and one explicit profile root. Symphony launches it through a mandatory
@@ -155,6 +177,12 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  issue_backends:
+    "JARVIS-917": "pi"
+  # AntiGravity must also appear in this exact-candidate gate.
+  # issue_backends:
+  #   "JARVIS-918": "antigravity"
+  # accepted_antigravity_issue_identifiers: ["JARVIS-918"]
   # Optional canary controls; omit all three to preserve current scheduler behavior.
   allowed_issue_identifiers: ["JARVIS-917"]
   hold_after_normal_completion: true

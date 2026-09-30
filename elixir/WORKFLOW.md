@@ -32,6 +32,14 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  # Optional exact issue bindings. Unlisted issues continue using `backend`.
+  # issue_backends: {"JARVIS-917": "pi"}
+  # Keep enabled through restarts while previous mixed attempts may be active,
+  # including after removing the last mapping; startup then holds all active issues.
+  # issue_backend_routing_enabled: true
+  # AntiGravity requires an exact separate acceptance gate for each mapped issue.
+  # issue_backends: {"JARVIS-918": "antigravity"}
+  # accepted_antigravity_issue_identifiers: ["JARVIS-918"]
   # Optional exact-issue canary gate; omit all three for current behavior.
   # allowed_issue_identifiers: ["JARVIS-917"]
   # hold_after_normal_completion: true

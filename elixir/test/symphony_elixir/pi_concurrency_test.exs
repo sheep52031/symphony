@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Pi.ConcurrencyTest do
   use SymphonyElixir.TestSupport
 
-  test "memory tracker admits exactly three overlapping isolated Pi workers" do
+  test "one controller admits three overlapping exact-routed Pi workers" do
     suffix = System.unique_integer([:positive])
     root = Path.join(System.tmp_dir!(), "symphony-pi-three-#{suffix}")
     workspace_root = Path.join(root, "workspaces")
@@ -22,7 +22,7 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
           id: "pi-three-#{number}",
           identifier: "PI-#{number}",
           title: "Pi barrier #{number}",
-          state: "In Progress",
+          state: "Todo",
           url: "https://example.invalid/PI-#{number}",
           dispatchable: true
         }
@@ -52,7 +52,8 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
       agent_backend: "pi",
       pi_command: "#{script} #{barrier_root}",
       max_concurrent_agents: 3,
-      max_concurrent_agents_by_state: %{"In Progress" => 3},
+      max_concurrent_agents_by_state: %{"Todo" => 3},
+      issue_backends: Map.new(1..4, fn number -> {"PI-#{number}", "pi"} end),
       max_turns: 1
     )
 
