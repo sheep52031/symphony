@@ -1738,6 +1738,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
+  test "workflow prompt keeps multibyte characters whose UTF-8 contains 0x85" do
+    # "兩" is E5 85 A9; a non-unicode \\R split treats the 0x85 byte as a line break.
+    workflow_prompt = "寫一到兩句白話摘要。\n第二行"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+    assert Config.workflow_prompt() == workflow_prompt
+    assert String.valid?(Config.workflow_prompt())
+  end
+
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
     test_root =
       Path.join(
