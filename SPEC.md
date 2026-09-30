@@ -398,6 +398,13 @@ Fields:
   - Matching ignores case and surrounding whitespace.
   - Use it as an opt-out (for example `symphony-skip`) when every other active issue should be
     eligible without a selector label.
+- `reply_wake_states` (list of strings)
+  - Default: `[]`. Linear adapter extension.
+  - An issue in one of these states is dispatchable only when its newest comment does not contain
+    `agent_comment_marker`, i.e. a person replied after the agent's last signed comment. List the
+    same states in `active_states` so the woken issue can run.
+- `agent_comment_marker` (string)
+  - Default: `"🤖 Symphony"`. Agents end every tracker comment with it; a blank value disables waking.
 - `active_states` (list of strings)
   - REQUIRED unless the selected adapter profile documents a default.
   - Values are provider-native state names compared case-insensitively by the scheduler.
@@ -712,6 +719,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings
 - `tracker.required_labels`: list of strings, default `[]`
 - `tracker.excluded_labels`: list of strings, default `[]`
+- `tracker.reply_wake_states`: list of strings, default `[]` (Linear)
+- `tracker.agent_comment_marker`: string, default `"🤖 Symphony"` (Linear)
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
 - `polling.interval_ms`: integer, default `30000`

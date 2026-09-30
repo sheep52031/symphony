@@ -57,6 +57,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
       field(:excluded_labels, {:array, :string}, default: [])
+      field(:reply_wake_states, {:array, :string}, default: [])
+      field(:agent_comment_marker, :string, default: "🤖 Symphony")
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
     end
@@ -75,6 +77,8 @@ defmodule SymphonyElixir.Config.Schema do
           :provider,
           :required_labels,
           :excluded_labels,
+          :reply_wake_states,
+          :agent_comment_marker,
           :active_states,
           :terminal_states
         ],

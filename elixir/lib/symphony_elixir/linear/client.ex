@@ -44,6 +44,12 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
+        comments(first: 5, orderBy: createdAt) {
+          nodes {
+            body
+            createdAt
+          }
+        }
         createdAt
         updatedAt
       }
@@ -87,6 +93,12 @@ defmodule SymphonyElixir.Linear.Client do
                 name
               }
             }
+          }
+        }
+        comments(first: 5, orderBy: createdAt) {
+          nodes {
+            body
+            createdAt
           }
         }
         createdAt
@@ -481,7 +493,9 @@ defmodule SymphonyElixir.Linear.Client do
         assignee_id: assignee_field(assignee, "id"),
         blocked_by: blockers,
         labels: extract_labels(issue),
-        dispatchable: dispatchable?(state_name, blockers, assignee, assignee_filter),
+        dispatchable:
+          dispatchable?(state_name, blockers, assignee, assignee_filter) and
+            not awaiting_owner_reply?(state_name, issue),
         created_at: parse_datetime(issue["createdAt"]),
         updated_at: parse_datetime(issue["updatedAt"])
       }
@@ -497,6 +511,36 @@ defmodule SymphonyElixir.Linear.Client do
     assigned_to_worker?(assignee, assignee_filter) and
       not blocked_before_dispatch?(state_name, blockers)
   end
+
+  # An issue in a reply-wake state (for example `Human Review`) only dispatches once the
+  # newest comment was written by a person rather than by an agent. Agents sign their
+  # comments with `tracker.agent_comment_marker`, so an owner reply wakes the worker and the
+  # worker's own signed follow-up puts the issue back to sleep.
+  defp awaiting_owner_reply?(state_name, issue) when is_binary(state_name) do
+    tracker = Config.settings!().tracker
+    wake_states = MapSet.new(tracker.reply_wake_states, &normalize_state_name/1)
+
+    if MapSet.member?(wake_states, normalize_state_name(state_name)) do
+      case latest_comment_body(issue) do
+        body when is_binary(body) -> String.contains?(body, tracker.agent_comment_marker)
+        _ -> true
+      end
+    else
+      false
+    end
+  end
+
+  defp latest_comment_body(%{"comments" => %{"nodes" => comments}}) when is_list(comments) do
+    comments
+    |> Enum.filter(&(is_map(&1) and is_binary(&1["body"])))
+    |> Enum.max_by(&(&1["createdAt"] || ""), fn -> nil end)
+    |> case do
+      %{"body" => body} -> body
+      nil -> nil
+    end
+  end
+
+  defp latest_comment_body(_issue), do: nil
 
   defp blocked_before_dispatch?(state_name, blockers)
        when is_binary(state_name) and is_list(blockers) do

@@ -246,6 +246,11 @@ Notes:
   does not dispatch, and a running issue stops when the label is added. Use it
   as an opt-out (for example `symphony-skip`) instead of gating every issue
   behind a selector label.
+- `tracker.reply_wake_states` (Linear) lets an issue parked in a state such as
+  `Human Review` wake up when a person replies in the issue's comments. It is
+  dispatchable only while its newest comment lacks `tracker.agent_comment_marker`
+  (default `🤖 Symphony`), so agents must sign their comments with that marker.
+  Also list the state in `active_states`.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
