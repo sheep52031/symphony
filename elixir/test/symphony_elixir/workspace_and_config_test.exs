@@ -440,6 +440,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 
+  test "linear client wakes reply-wait issues only on a person's latest comment" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_reply_wake_states: ["Human Review"])
+
+    raw = fn state, comments ->
+      %{
+        "id" => "issue-9",
+        "identifier" => "MT-9",
+        "title" => "Needs owner",
+        "state" => %{"name" => state},
+        "labels" => %{"nodes" => []},
+        "inverseRelations" => %{"nodes" => []},
+        "comments" => %{"nodes" => comments}
+      }
+    end
+
+    agent = %{"body" => "Question for you\n\n🤖 Symphony", "createdAt" => "2026-01-01T00:00:00Z"}
+    owner = %{"body" => "Go with option B", "createdAt" => "2026-01-02T00:00:00Z"}
+
+    refute Client.normalize_issue_for_test(raw.("Human Review", [agent])).dispatchable
+    refute Client.normalize_issue_for_test(raw.("Human Review", [])).dispatchable
+    assert Client.normalize_issue_for_test(raw.("Human Review", [agent, owner])).dispatchable
+    assert Client.normalize_issue_for_test(raw.("human review", [owner, agent])).dispatchable
+
+    later_agent = %{agent | "createdAt" => "2026-01-03T00:00:00Z"}
+    refute Client.normalize_issue_for_test(raw.("Human Review", [owner, later_agent])).dispatchable
+
+    assert Client.normalize_issue_for_test(raw.("In Progress", [agent])).dispatchable
+  end
+
   test "linear client normalizes blockers from inverse relations" do
     raw_issue = %{
       "id" => "issue-1",
@@ -1058,6 +1087,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert Config.settings!().tracker.excluded_labels == ["symphony-skip", "manual"]
+    assert Config.settings!().tracker.reply_wake_states == []
+    assert Config.settings!().tracker.agent_comment_marker == "🤖 Symphony"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
