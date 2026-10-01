@@ -50,9 +50,10 @@ defmodule SymphonyElixir.Tracker.Issue do
     labels
   end
 
-  @spec routable?(t(), [String.t()], [String.t()]) :: boolean()
-  def routable?(issue, required_labels, excluded_labels \\ [])
+  @spec routable?(t(), [String.t()]) :: boolean()
+  def routable?(issue, required_labels), do: routable?(issue, required_labels, [])
 
+  @spec routable?(t(), [String.t()], [String.t()]) :: boolean()
   def routable?(%__MODULE__{dispatchable: true, labels: labels}, required_labels, excluded_labels)
       when is_list(labels) and is_list(required_labels) and is_list(excluded_labels) do
     issue_labels = MapSet.new(labels, &normalize_label/1)
