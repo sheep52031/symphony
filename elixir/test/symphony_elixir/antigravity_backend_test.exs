@@ -502,6 +502,14 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert :ok = Backend.stop_session(session)
   end
 
+  test "starts a session when model and effort are configured" do
+    {_root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile, antigravity_model: "gemini-flash", antigravity_effort: "high")
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    assert :ok = Backend.stop_session(session)
+  end
+
   test "rejects unsafe init, duplicate init, and non-cumulative usage" do
     {root, workspace, profile, agy} = setup_fake_agy!()
     configure_backend!(agy, profile)
