@@ -124,6 +124,7 @@ defmodule SymphonyElixir.TestSupport do
           antigravity_first_event_timeout_ms: 30_000,
           antigravity_turn_timeout_ms: 3_600_000,
           antigravity_cancel_grace_ms: 1_000,
+          antigravity_skip_permissions: false,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -179,6 +180,7 @@ defmodule SymphonyElixir.TestSupport do
     antigravity_first_event_timeout_ms = Keyword.get(config, :antigravity_first_event_timeout_ms)
     antigravity_turn_timeout_ms = Keyword.get(config, :antigravity_turn_timeout_ms)
     antigravity_cancel_grace_ms = Keyword.get(config, :antigravity_cancel_grace_ms)
+    antigravity_skip_permissions = Keyword.get(config, :antigravity_skip_permissions)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -241,6 +243,7 @@ defmodule SymphonyElixir.TestSupport do
         "  first_event_timeout_ms: #{yaml_value(antigravity_first_event_timeout_ms)}",
         "  turn_timeout_ms: #{yaml_value(antigravity_turn_timeout_ms)}",
         "  cancel_grace_ms: #{yaml_value(antigravity_cancel_grace_ms)}",
+        "  skip_permissions: #{yaml_value(antigravity_skip_permissions)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

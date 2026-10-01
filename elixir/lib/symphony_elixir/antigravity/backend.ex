@@ -81,6 +81,7 @@ defmodule SymphonyElixir.Antigravity.Backend do
       |> Keyword.put(:secret_environment_names, config.tracker.secret_environment_names)
       |> maybe_put(:model, config.antigravity.model)
       |> maybe_put(:effort, config.antigravity.effort)
+      |> Keyword.put(:skip_permissions, config.antigravity.skip_permissions == true)
 
     with :ok <- validate_local_config(config.antigravity),
          {:ok, transport} <-

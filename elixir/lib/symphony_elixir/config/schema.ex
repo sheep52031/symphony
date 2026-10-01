@@ -274,6 +274,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:profile_root, :string)
       field(:model, :string)
       field(:effort, :string)
+      field(:skip_permissions, :boolean, default: false)
       field(:first_event_timeout_ms, :integer, default: 30_000)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:cancel_grace_ms, :integer, default: 1_000)
@@ -291,7 +292,8 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_timeout_ms,
           :cancel_grace_ms,
           :model,
-          :effort
+          :effort,
+          :skip_permissions
         ],
         empty_values: []
       )

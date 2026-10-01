@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
           process_group_id: non_neg_integer(),
           os_pid: non_neg_integer() | nil,
           cleanup_guard_pid: pid() | nil,
+          expected_permission_mode: String.t(),
           launch: Launcher.launch()
         }
 
@@ -36,7 +37,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
           {:ok, session()} | {:error, term()}
   def start(workspace, agy_executable, profile_root, turn_timeout_ms, opts \\ []) do
     launcher = Keyword.get(opts, :launcher, &Launcher.build/5)
-    launcher_opts = Keyword.take(opts, [:bubblewrap_executable, :model, :effort])
+    launcher_opts = Keyword.take(opts, [:bubblewrap_executable, :model, :effort, :skip_permissions])
 
     with {:ok, launch} <- launcher.(workspace, agy_executable, profile_root, turn_timeout_ms, launcher_opts),
          :ok <- prepare_runtime_directory(launch.workspace) do
@@ -123,11 +124,11 @@ defmodule SymphonyElixir.Antigravity.Transport do
           ]
         )
 
-      finalize_started_port(port, launch, stderr_path, process_group_path)
+      finalize_started_port(port, launch, stderr_path, process_group_path, opts)
     end
   end
 
-  defp finalize_started_port(port, launch, stderr_path, process_group_path) do
+  defp finalize_started_port(port, launch, stderr_path, process_group_path, opts) do
     process_group_id = read_process_group_id(process_group_path)
 
     if is_nil(process_group_id) do
@@ -155,11 +156,17 @@ defmodule SymphonyElixir.Antigravity.Transport do
         process_group_id: process_group_id,
         os_pid: port_os_pid(port),
         cleanup_guard_pid: nil,
+        expected_permission_mode: expected_permission_mode(opts),
         launch: launch
       }
 
       {:ok, %{base | cleanup_guard_pid: start_cleanup_guard(self(), base)}}
     end
+  end
+
+  # Default `request-review`; an explicit `skip_permissions` opt-in expects exactly `always-proceed`.
+  defp expected_permission_mode(opts) do
+    if Keyword.get(opts, :skip_permissions) == true, do: "always-proceed", else: "request-review"
   end
 
   defp receive_turn(loop) do
@@ -252,7 +259,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
       cwd != session.workspace ->
         {:error, :antigravity_workspace_mismatch}
 
-      permission_mode != "request-review" ->
+      permission_mode != Map.get(session, :expected_permission_mode, "request-review") ->
         {:error, :unsafe_antigravity_permission_mode}
 
       true ->

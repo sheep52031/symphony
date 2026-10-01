@@ -38,11 +38,13 @@ Set `agent.backend` to `antigravity` only on the accepted native Linux route. It
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
 `agy` executable and one explicit profile root. Optional `antigravity.model` and `antigravity.effort`
 (`low|medium|high|max`) are passed to `agy` as `--model` / `--effort`; when unset, the profile's
-default applies. Symphony launches it through a mandatory
+default applies. `antigravity.skip_permissions: true` (default `false`) is an explicit owner opt-in that passes
+`--dangerously-skip-permissions` instead of `--mode accept-edits` and then requires `agy` to report
+`always-proceed`; use it only for a lane of simple, bounded issues. Symphony launches it through a mandatory
 Bubblewrap boundary: host root is read-only, the real user home and host `/run/user` are masked,
 only the issue workspace and selected profile root are host-writable, the exact AGY executable is
 projected read-only at a private path, `XDG_RUNTIME_DIR` is private, `.symphony` runtime metadata is
-read-only to the child, and native `--sandbox` remains enabled. Missing containment, a non-`request-review` permission mode, identity drift, non-cumulative
+read-only to the child, and native `--sandbox` remains enabled. Missing containment, a permission mode other than the one the config selects (`request-review`, or `always-proceed` when `skip_permissions` is on), identity drift, non-cumulative
 usage, or permission/input denial fails visibly. Codex remains the default and rollback path; Pi
 remains supported.
 
