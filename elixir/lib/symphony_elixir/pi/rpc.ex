@@ -242,28 +242,27 @@ defmodule SymphonyElixir.Pi.Rpc do
          {process_table, 0} <- System.cmd("/usr/bin/ps", ["-axo", "pid=,ppid=,pgid="], stderr_to_stdout: true) do
       process_table
       |> String.split("\n", trim: true)
-      |> Enum.find_value(fn row ->
-        case String.split(row) do
-          [pid, parent_pid, process_group_id] ->
-            with {pid, ""} <- Integer.parse(pid),
-                 {parent_pid, ""} <- Integer.parse(parent_pid),
-                 {process_group_id, ""} <- Integer.parse(process_group_id),
-                 true <- pid == process_group_id,
-                 true <- pid == port_pid or parent_pid == port_pid do
-              pid
-            else
-              _ -> nil
-            end
-
-          _ ->
-            nil
-        end
-      end)
+      |> Enum.find_value(&group_leader_pid(&1, port_pid))
     else
       _ -> nil
     end
   rescue
     _error -> nil
+  end
+
+  # A `ps -axo pid=,ppid=,pgid=` row names the port's process group when it is a group leader
+  # that is the port process itself or a direct child of it.
+  defp group_leader_pid(row, port_pid) do
+    with [pid, parent_pid, process_group_id] <- String.split(row),
+         {pid, ""} <- Integer.parse(pid),
+         {parent_pid, ""} <- Integer.parse(parent_pid),
+         {process_group_id, ""} <- Integer.parse(process_group_id),
+         true <- pid == process_group_id,
+         true <- pid == port_pid or parent_pid == port_pid do
+      pid
+    else
+      _ -> nil
+    end
   end
 
   defp receive_response(%{session: %{port: port}} = state) do
