@@ -169,12 +169,12 @@ defmodule SymphonyElixir.Pi.Rpc do
       case setsid do
         path when is_binary(path) ->
           grouped_command =
-            "printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{command}"
+            "printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{shell_escape(executable)} -c #{shell_escape(command)}"
 
           "exec #{shell_escape(path)} --wait #{shell_escape(executable)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
 
         _ ->
-          "exec #{command} 2> #{shell_escape(stderr_path)}"
+          "exec #{shell_escape(executable)} -c #{shell_escape(command)} 2> #{shell_escape(stderr_path)}"
       end
 
     %{executable: executable, setsid: setsid, command: launch_command}
@@ -199,7 +199,8 @@ defmodule SymphonyElixir.Pi.Rpc do
       if is_binary(setsid), do: read_process_group_id(process_group_path), else: nil
 
     if is_binary(setsid) and is_nil(process_group_id) do
-      close_port(port)
+      close_failed_port(port)
+      File.rm(process_group_path)
       {:error, :process_group_setup_failed}
     else
       session = %{
@@ -222,6 +223,47 @@ defmodule SymphonyElixir.Pi.Rpc do
       {:os_pid, pid} when is_integer(pid) and pid >= 0 -> pid
       _ -> nil
     end
+  end
+
+  defp close_failed_port(port) do
+    case process_group_for_port(port) do
+      process_group_id when is_integer(process_group_id) ->
+        terminate_process_group(%{process_group_id: process_group_id})
+
+      _ ->
+        :ok
+    end
+
+    close_port(port)
+  end
+
+  defp process_group_for_port(port) do
+    with port_pid when is_integer(port_pid) and port_pid > 0 <- port_os_pid(port),
+         {process_table, 0} <- System.cmd("/usr/bin/ps", ["-axo", "pid=,ppid=,pgid="], stderr_to_stdout: true) do
+      process_table
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn row ->
+        case String.split(row) do
+          [pid, parent_pid, process_group_id] ->
+            with {pid, ""} <- Integer.parse(pid),
+                 {parent_pid, ""} <- Integer.parse(parent_pid),
+                 {process_group_id, ""} <- Integer.parse(process_group_id),
+                 true <- pid == process_group_id,
+                 true <- pid == port_pid or parent_pid == port_pid do
+              pid
+            else
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end)
+    else
+      _ -> nil
+    end
+  rescue
+    _error -> nil
   end
 
   defp receive_response(%{session: %{port: port}} = state) do
