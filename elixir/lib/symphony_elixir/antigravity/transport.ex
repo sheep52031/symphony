@@ -7,6 +7,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @max_identity_bytes 256
   @max_text_delta_bytes 65_536
   @step_types ~w(user_input agent_response tool checkpoint system_message subagent)
+  # `agy` adds progress step kinds between releases. A well-formed unknown kind is progress telemetry,
+  # not a protocol violation: accept it as an opaque `other` and never forward its name or payload.
+  @opaque_step_type ~r/\A[a-z][a-z0-9_]{0,31}\z/
   @terminal_statuses ~w(SUCCESS ERROR CANCELED INTERRUPTED INVALID WAITING RUNNING)
   @process_group_detection_attempts 400
   @graceful_close_ms 250
@@ -332,14 +335,12 @@ defmodule SymphonyElixir.Antigravity.Transport do
   end
 
   defp validate_step_update(update) do
-    step_type = Map.get(update, "step_type")
-
-    with :ok <- validate_step_type(step_type),
+    with {:ok, step_type} <- validate_step_type(Map.get(update, "step_type")),
          :ok <- validate_text_delta(update) do
       sanitized = %{"conversation_id" => Map.fetch!(update, "conversation_id"), "step_type" => step_type}
 
       sanitized =
-        if Map.has_key?(update, "text_delta"),
+        if step_type != "other" and Map.has_key?(update, "text_delta"),
           do: Map.put(sanitized, "text_delta", Map.fetch!(update, "text_delta")),
           else: sanitized
 
@@ -347,7 +348,14 @@ defmodule SymphonyElixir.Antigravity.Transport do
     end
   end
 
-  defp validate_step_type(step_type) when step_type in @step_types, do: :ok
+  defp validate_step_type(step_type) when step_type in @step_types, do: {:ok, step_type}
+
+  defp validate_step_type(step_type) when is_binary(step_type) do
+    if Regex.match?(@opaque_step_type, step_type),
+      do: {:ok, "other"},
+      else: {:error, :invalid_antigravity_step_type}
+  end
+
   defp validate_step_type(_step_type), do: {:error, :invalid_antigravity_step_type}
 
   defp validate_text_delta(update) do

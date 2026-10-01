@@ -438,6 +438,23 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "accepts a well-formed unknown step kind as opaque progress without forwarding it" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    on_message = fn message -> send(self(), {:agy_message, message}) end
+    issue = %{id: "issue-unknown-step", identifier: "JARVIS-1098", title: "Unknown step"}
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    assert {:ok, result} = Backend.run_turn(session, "future_step", issue, on_message: on_message)
+    assert result.result == "future-done"
+
+    assert_receive {:agy_message, %{event: :step_update, payload: %{"step_update" => update}}}
+    assert update == %{"conversation_id" => "agy-session", "step_type" => "other"}
+
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
   test "rejects malformed step updates without retaining native values" do
     secret = "STEP_SECRET_907"
 
@@ -698,6 +715,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
         *system_message*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"system_message"}}'
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"system-message-done","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
+          ;;
+        *future_step*)
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"future_kind","text_delta":"FUTURE_SECRET_1098"}}'
+          printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"future-done","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
           ;;
         *subagent_step*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"subagent","tool_name":"invoke_subagent","subagent_info":{"subagents":[{"role":"SUBAGENT_SECRET_1098"}]}}}'
