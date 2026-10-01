@@ -58,7 +58,8 @@ defmodule SymphonyElixir.Antigravity.Launcher do
              canonical_workspace,
              canonical_profile_root,
              canonical_agy,
-             turn_timeout_ms
+             turn_timeout_ms,
+             permission_args(opts)
            ) ++ model_args(opts),
          workspace: canonical_workspace,
          profile_root: canonical_profile_root,
@@ -81,7 +82,7 @@ defmodule SymphonyElixir.Antigravity.Launcher do
   @spec trusted_path() :: String.t()
   def trusted_path, do: @trusted_path
 
-  defp bubblewrap_args(home, workspace, profile_root, agy_executable, turn_timeout_ms) do
+  defp bubblewrap_args(home, workspace, profile_root, agy_executable, turn_timeout_ms, permission_args) do
     [
       "--die-with-parent",
       "--new-session",
@@ -129,9 +130,10 @@ defmodule SymphonyElixir.Antigravity.Launcher do
       [
         "--",
         @private_agy_path,
-        "--sandbox",
-        "--mode",
-        "accept-edits",
+        "--sandbox"
+      ] ++
+      permission_args ++
+      [
         "--input-format",
         "stream-json",
         "--output-format",
@@ -139,6 +141,14 @@ defmodule SymphonyElixir.Antigravity.Launcher do
         "--print-timeout",
         native_timeout(turn_timeout_ms + 5_000)
       ]
+  end
+
+  # `agy` approves nothing but edits by default; a workflow may opt in to approving every tool
+  # request. The bubblewrap boundary and native `--sandbox` stay in force either way.
+  defp permission_args(opts) do
+    if Keyword.get(opts, :skip_permissions) == true,
+      do: ["--dangerously-skip-permissions"],
+      else: ["--mode", "accept-edits"]
   end
 
   # Optional per-workflow model and reasoning effort, appended after the agy options.

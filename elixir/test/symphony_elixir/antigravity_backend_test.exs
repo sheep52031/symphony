@@ -91,6 +91,17 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
              )
 
     assert Enum.take(tuned.args, -4) == ["--model", "gemini-flash", "--effort", "high"]
+    assert subsequence?(launch.args, ["--sandbox", "--mode", "accept-edits", "--input-format"])
+    refute "--dangerously-skip-permissions" in launch.args
+
+    assert {:ok, skipping} =
+             Launcher.build(workspace, agy, profile, 1_234,
+               bubblewrap_executable: bwrap,
+               skip_permissions: true
+             )
+
+    assert subsequence?(skipping.args, ["--sandbox", "--dangerously-skip-permissions", "--input-format"])
+    refute "--mode" in skipping.args
     assert launch.workspace == Path.expand(workspace)
     assert launch.profile_root == Path.expand(profile)
     assert launch.executable == Path.expand(bwrap)
@@ -474,6 +485,21 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
+  end
+
+  test "skip_permissions expects exactly always-proceed and rejects request-review" do
+    {_root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile, antigravity_skip_permissions: true)
+    issue = %{id: "issue-skip", identifier: "JARVIS-1097", title: "Skip permissions"}
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    assert {:error, :unsafe_antigravity_permission_mode} = Backend.run_turn(session, "plain", issue, [])
+    assert :ok = Backend.stop_session(session)
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    assert {:error, reason} = Backend.run_turn(session, "unsafe_permission_secret", issue, [])
+    assert reason == :unsafe_antigravity_permission_mode
+    assert :ok = Backend.stop_session(session)
   end
 
   test "rejects unsafe init, duplicate init, and non-cumulative usage" do
