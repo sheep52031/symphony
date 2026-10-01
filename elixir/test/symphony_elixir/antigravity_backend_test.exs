@@ -420,6 +420,24 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.rm_rf!(root)
   end
 
+  test "accepts native subagent steps without forwarding their details" do
+    {root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile)
+    on_message = fn message -> send(self(), {:agy_message, message}) end
+    issue = %{id: "issue-subagent", identifier: "JARVIS-1098", title: "Subagent"}
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    assert {:ok, result} = Backend.run_turn(session, "subagent_step", issue, on_message: on_message)
+    assert result.result == "subagent-done"
+
+    assert_receive {:agy_message, %{event: :step_update, payload: %{"step_update" => update}}}
+    assert update["step_type"] == "subagent"
+    refute Map.has_key?(update, "subagent_info")
+
+    assert :ok = Backend.stop_session(session)
+    File.rm_rf!(root)
+  end
+
   test "rejects malformed step updates without retaining native values" do
     secret = "STEP_SECRET_907"
 
@@ -499,6 +517,14 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
     assert {:error, reason} = Backend.run_turn(session, "unsafe_permission_secret", issue, [])
     assert reason == :unsafe_antigravity_permission_mode
+    assert :ok = Backend.stop_session(session)
+  end
+
+  test "starts a session when model and effort are configured" do
+    {_root, workspace, profile, agy} = setup_fake_agy!()
+    configure_backend!(agy, profile, antigravity_model: "gemini-flash", antigravity_effort: "high")
+
+    assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
     assert :ok = Backend.stop_session(session)
   end
 
@@ -672,6 +698,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
         *system_message*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"system_message"}}'
           printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"system-message-done","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
+          ;;
+        *subagent_step*)
+          printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"subagent","tool_name":"invoke_subagent","subagent_info":{"subagents":[{"role":"SUBAGENT_SECRET_1098"}]}}}'
+          printf '{"event":"result","result":{"conversation_id":"agy-session","status":"SUCCESS","response":"subagent-done","duration_seconds":1,"num_turns":%s,"usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":2,"cache_read_tokens":0,"total_tokens":15}}}\n' "$turn"
           ;;
         *bad_step_type*)
           printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-session","step_type":"STEP_SECRET_907"}}'
