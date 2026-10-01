@@ -269,6 +269,61 @@ defmodule SymphonyElixir.Pi.RpcTest do
     File.rm_rf!(test_root)
   end
 
+  test "launches assignment-prefixed Pi commands and keeps their process group" do
+    test_root = temp_root!()
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    state_path = Path.join(test_root, "command-state")
+    File.mkdir_p!(workspace)
+
+    write_script!(script, """
+    #!/bin/sh
+    printf '%s\\n%s\\n%s' "$PI_RPC_TEST_VALUE" "$PI_RPC_EXTRA" "$$" > '#{state_path}'
+    while IFS= read -r line; do
+      id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+      printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+    done
+    """)
+
+    command = "PI_RPC_TEST_VALUE='workflow value' PI_RPC_EXTRA=second #{script}"
+    assert {:ok, session} = Rpc.start(workspace, command)
+    assert is_integer(session.process_group_id)
+
+    assert {:ok, %{"success" => true}} = Rpc.request(session, "get_state")
+
+    [value, extra, worker_pid] = state_path |> File.read!() |> String.split("\n")
+    assert value == "workflow value"
+    assert extra == "second"
+    worker_pid = String.to_integer(worker_pid)
+    assert {worker_pgid, 0} = System.cmd("ps", ["-o", "pgid=", "-p", Integer.to_string(worker_pid)])
+    assert String.trim(worker_pgid) == Integer.to_string(session.process_group_id)
+    assert process_alive?(worker_pid)
+    assert :ok = Rpc.close(session)
+    refute eventually_process_alive?(worker_pid)
+    File.rm_rf!(test_root)
+  end
+
+  test "startup failure cleans up its owned live process group" do
+    test_root = temp_root!()
+    workspace = Path.join(test_root, "workspace")
+    script = Path.join(test_root, "fake-pi")
+    worker_pid_path = Path.join(test_root, "worker.pid")
+    File.mkdir_p!(workspace)
+
+    write_script!(script, """
+    #!/bin/sh
+    echo "$$" > '#{worker_pid_path}'
+    while IFS= read -r _line; do :; done
+    """)
+
+    assert {:error, :process_group_setup_failed} =
+             Rpc.start(workspace, script, env: [{~c"BASH_FUNC_printf%%", ~c"() { command printf invalid; }"}])
+
+    worker_pid = eventually_read_pid!(worker_pid_path)
+    refute eventually_process_alive?(worker_pid)
+    File.rm_rf!(test_root)
+  end
+
   test "owner death triggers bounded orphan process-group cleanup" do
     test_root = temp_root!()
     workspace = Path.join(test_root, "workspace")
