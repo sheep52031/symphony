@@ -1,0 +1,101 @@
+{
+  "schema": "jarvis-901-agy-native-linux-acceptance-v1",
+  "decision": "GO_FOR_JARVIS_907_WITH_MANDATORY_OS_CONTAINMENT",
+  "observed": {
+    "agy_version": "1.2.7",
+    "architecture": "x86_64",
+    "git_head": "83bb21f6acbb97a2f6e87407afa3b6b1872fd745",
+    "git_tree": "b2622796101708eadab81dfb909e080821713858",
+    "kernel": "7.2.5-3-omarchy",
+    "os": "Linux",
+    "safe_wrapper_sha256": "6f51a53038fe98f434bb483a6288ac747f8d76b1984fd695910644b3668627bb",
+    "underlying_executable_sha256": "9991515b6d5307bcf701069622b0537b6b206e605f3c891c0cf3a3d208dea8b0"
+  },
+  "environment": {
+    "dangerous_permission_flag_used": false,
+    "passed_names": [
+      "DBUS_SESSION_BUS_ADDRESS",
+      "HOME",
+      "LANG",
+      "PATH",
+      "XDG_RUNTIME_DIR"
+    ],
+    "tracker_credentials_inherited": false
+  },
+  "protocol": {
+    "clean_exit": true,
+    "completed_turns": 2,
+    "cumulative_turn_and_usage_counters": true,
+    "dropped_or_malformed_events": 0,
+    "expected_turns": 2,
+    "init_events": 1,
+    "process_group_empty": true,
+    "stable_identity": true,
+    "statuses": [
+      "SUCCESS",
+      "SUCCESS"
+    ]
+  },
+  "resume": {
+    "cross_slot_source_identity_recovered": false,
+    "cross_slot_started_distinct_identity": true,
+    "required_adapter_policy": "reject a requested resume when returned identity differs",
+    "same_slot_context_recall_exact": true,
+    "same_slot_identity_match": true,
+    "same_slot_status": "SUCCESS"
+  },
+  "permissions": {
+    "denied_actions_count": 1,
+    "permission_mode": "request-review",
+    "sentinel_created": false,
+    "soft_denial_observed": true,
+    "status": "SUCCESS",
+    "stderr_notice_observed": true
+  },
+  "cancellation": {
+    "activity_seen_before_signal": true,
+    "adapter_normalization_required": true,
+    "native_error_class": "interrupt_or_cancel",
+    "native_status": "ERROR",
+    "process_group_empty": true,
+    "signal": "SIGINT",
+    "terminal_observed": true
+  },
+  "timeout": {
+    "cleanup_failed": false,
+    "init_events": 1,
+    "process_group_empty": true,
+    "signals": [
+      "SIGTERM"
+    ],
+    "timed_out": "first-token"
+  },
+  "native_containment_negative_control": {
+    "native_sandbox_flag_used": true,
+    "outside_workspace_write_succeeded": true,
+    "required_conclusion": "cwd and native --sandbox are not filesystem containment"
+  },
+  "os_containment": {
+    "bubblewrap_version": "0.12.0",
+    "hardened_authenticated_inference": true,
+    "hardened_policy": "unshare-all, share-net, unshare-user, disable-userns, read-only root, private dev/proc/tmp, writable workspace, writable selected profile root",
+    "outside_host_sentinel_unchanged": true,
+    "symlink_escape_target_unchanged": true,
+    "workspace_write_exact": true
+  },
+  "profile_isolation": {
+    "cross_slot_source_identity_recovered": false,
+    "selected_slots": [
+      "acc1",
+      "acc2"
+    ],
+    "separate_authenticated_processes_completed": true
+  },
+  "raw_evidence": {
+    "main_manifest_sha256": "ae99c5fb89b26457b80b5328b315ce72e51fcfa5927f4268ac559d6f54e5caae",
+    "main_stderr_sha256": "a4d42b453a243b65bfc32494f4cc36229145cf58f5d0d64609ae195d721ff6ec",
+    "main_stdin_sha256": "1cbdc75976c604661cba0b803d2fea61778bba5ad0b7abb9ad6d2e0ca5f24ee3",
+    "main_stdout_sha256": "26d22cca2c2a43fd8643c45bd8b7e8cb70281acf194933de4bd4723613198b6d",
+    "retention": "ignored local capture; never force-add raw envelopes"
+  }
+}
