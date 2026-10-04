@@ -6,18 +6,18 @@ defmodule SymphonyElixir.Claude.Backend do
 
   @behaviour SymphonyElixir.AgentBackend
 
-  alias SymphonyElixir.{Claude.Stream, Config}
+  alias SymphonyElixir.{Claude.Stream, Config, Workflow}
 
   @impl true
-  def validate_config(%{worker: %{ssh_hosts: hosts}}) do
+  def validate_config(%{worker: %{ssh_hosts: hosts}} = settings) do
     if Enum.any?(hosts, &(is_binary(&1) and String.trim(&1) != "")) do
       {:error, {:unsupported_backend_worker_hosts, :claude}}
     else
-      executable_available()
+      validate_local_config(settings)
     end
   end
 
-  def validate_config(_settings), do: executable_available()
+  def validate_config(settings), do: validate_local_config(settings)
 
   @impl true
   def start_session(workspace, opts \\ []) do
@@ -28,9 +28,11 @@ defmodule SymphonyElixir.Claude.Backend do
   end
 
   defp start_local(workspace) do
-    with :ok <- executable_available(),
+    with {:ok, workflow} <- Workflow.current(),
+         {:ok, config} <- local_config(Map.get(workflow.config, "claude", %{})),
+         {:ok, executable} <- resolve_executable(config.command),
          true <- File.dir?(workspace) or {:error, {:workspace_not_found, workspace}} do
-      Stream.start(Path.expand(workspace), System.find_executable("claude"))
+      Stream.start(Path.expand(workspace), executable, config.config_dir)
     end
   end
 
@@ -73,8 +75,48 @@ defmodule SymphonyElixir.Claude.Backend do
   @impl true
   def stop_session(session), do: Stream.close(session)
 
-  defp executable_available do
-    if System.find_executable("claude"), do: :ok, else: {:error, {:backend_executable_not_found, :claude, "claude"}}
+  defp validate_local_config(settings) do
+    # WorkflowStore calls validation while loading: never call Workflow.current/0 here.
+    with {:ok, raw} <- raw_config(settings),
+         {:ok, config} <- local_config(raw),
+         {:ok, _executable} <- resolve_executable(config.command) do
+      :ok
+    end
+  end
+
+  defp raw_config(%{claude: config}), do: {:ok, config}
+
+  defp raw_config(_settings) do
+    with {:ok, workflow} <- Workflow.load() do
+      {:ok, Map.get(workflow.config, "claude", %{})}
+    end
+  end
+
+  defp local_config(raw) when is_map(raw) do
+    command = Map.get(raw, "command", Map.get(raw, :command, "claude"))
+    operator_home = System.get_env("HOME") || System.user_home!()
+    default_dir = System.get_env("CLAUDE_CONFIG_DIR") || Path.join(operator_home, ".claude")
+    config_dir = Map.get(raw, "config_dir", Map.get(raw, :config_dir, default_dir))
+
+    cond do
+      not is_binary(command) or String.trim(command) == "" ->
+        {:error, {:invalid_claude_config, "claude.command must be a nonblank executable name or path"}}
+
+      not is_binary(config_dir) or String.trim(config_dir) == "" ->
+        {:error, {:invalid_claude_config, "claude.config_dir must be a nonblank directory path"}}
+
+      true ->
+        {:ok, %{command: command, config_dir: Path.expand(config_dir)}}
+    end
+  end
+
+  defp local_config(_raw), do: {:error, {:invalid_claude_config, "claude must be a map"}}
+
+  defp resolve_executable(command) do
+    case System.find_executable(command) do
+      nil -> {:error, {:backend_executable_not_found, :claude, command}}
+      executable -> {:ok, executable}
+    end
   end
 
   defp fail_turn(on_message, reason) do

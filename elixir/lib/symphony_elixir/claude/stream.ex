@@ -24,8 +24,8 @@ defmodule SymphonyElixir.Claude.Stream do
     "CLAUDE_CODE_SIMPLE"
   ]
 
-  @spec start(Path.t(), Path.t()) :: GenServer.on_start()
-  def start(workspace, executable), do: GenServer.start(__MODULE__, {self(), workspace, executable})
+  @spec start(Path.t(), Path.t(), Path.t()) :: GenServer.on_start()
+  def start(workspace, executable, config_dir), do: GenServer.start(__MODULE__, {self(), workspace, executable, config_dir})
 
   @spec turn(pid(), String.t(), pos_integer()) :: {:ok, reference()} | {:error, term()}
   def turn(pid, prompt, timeout_ms), do: GenServer.call(pid, {:turn, self(), prompt, timeout_ms}, :infinity)
@@ -40,8 +40,16 @@ defmodule SymphonyElixir.Claude.Stream do
   end
 
   @impl true
-  def init({owner, workspace, executable}) do
-    {:ok, %{owner: Process.monitor(owner), workspace: workspace, executable: executable, session_id: nil, active: nil}}
+  def init({owner, workspace, executable, config_dir}) do
+    {:ok,
+     %{
+       owner: Process.monitor(owner),
+       workspace: workspace,
+       executable: executable,
+       config_dir: config_dir,
+       session_id: nil,
+       active: nil
+     }}
   end
 
   @impl true
@@ -51,7 +59,7 @@ defmodule SymphonyElixir.Claude.Stream do
     # provider selection restored by managed/user settings before any print-mode model request.
     command = shell_command([state.executable | isolation_args() ++ ["auth", "status", "--json"]])
 
-    case start_transport(state.workspace, command, stderr_path) do
+    case start_transport(state, command, stderr_path) do
       {:ok, transport} ->
         ref = make_ref()
         timer = Process.send_after(self(), {:deadline, ref}, timeout_ms)
@@ -71,7 +79,7 @@ defmodule SymphonyElixir.Claude.Stream do
         {:reply, {:ok, ref}, %{state | active: active}}
 
       {:error, reason} ->
-        {:reply, {:error, {:claude_start_failed, reason}}, state}
+        {:reply, {:error, {:claude_start_failed, state.executable, reason}}, state}
     end
   end
 
@@ -131,15 +139,18 @@ defmodule SymphonyElixir.Claude.Stream do
     active = state.active
 
     case {status, Jason.decode(active.pending)} do
+      {_, {:ok, %{"loggedIn" => false}}} ->
+        finish(state, {:error, :claude_not_logged_in})
+
       {0, {:ok, %{"authMethod" => "claude.ai"}}} ->
         close_transport(active.transport)
 
-        case start_transport(state.workspace, command(state, active.prompt), active.transport.stderr_path) do
+        case start_transport(state, command(state, active.prompt), active.transport.stderr_path) do
           {:ok, transport} ->
             {:noreply, %{state | active: %{active | phase: :stream, transport: transport, pending: ""}}}
 
           {:error, reason} ->
-            finish(state, {:error, {:claude_start_failed, reason}})
+            finish(state, {:error, {:claude_start_failed, state.executable, reason}})
         end
 
       {_, {:ok, %{"authMethod" => "none"}}} ->
@@ -148,8 +159,11 @@ defmodule SymphonyElixir.Claude.Stream do
       {_, {:ok, %{"authMethod" => method}}} ->
         finish(state, {:error, {:claude_subscription_required, method}})
 
-      {_, _} ->
+      {0, _} ->
         finish(state, {:error, :claude_invalid_auth_status})
+
+      {_, _} ->
+        finish(state, {:error, {:claude_preflight_failed, state.executable, status, "Check claude.command: PATH wrappers may fail under rewritten HOME; configure the real executable"}})
     end
   end
 
@@ -257,12 +271,12 @@ defmodule SymphonyElixir.Claude.Stream do
     ["--safe-mode", "--setting-sources", "user", "--settings", Jason.encode!(settings)]
   end
 
-  defp start_transport(workspace, command, stderr_path) do
+  defp start_transport(state, command, stderr_path) do
     # Rpc startup verifies a live process-group leader. Hold short-lived print/status commands
     # until that verification completes, then release the shell gate (not a Pi RPC request).
     launch = "IFS= read -r _symphony_ready && exec " <> command
 
-    with {:ok, transport} <- Rpc.start(workspace, launch, stderr_path: stderr_path, env: child_environment()) do
+    with {:ok, transport} <- Rpc.start(state.workspace, launch, stderr_path: stderr_path, env: child_environment(state.config_dir)) do
       Port.command(transport.port, "\n")
       {:ok, transport}
     end
@@ -295,13 +309,17 @@ defmodule SymphonyElixir.Claude.Stream do
 
   defp signal_group(_transport, _signal), do: :ok
 
-  defp child_environment do
+  defp child_environment(config_dir) do
     names = System.get_env() |> Map.keys() |> Enum.filter(&Regex.match?(@secret_name, &1))
     tracker_names = SymphonyElixir.Config.settings!().tracker.secret_environment_names || []
 
-    (names ++ @provider_environment ++ tracker_names)
-    |> Enum.uniq()
-    |> Enum.map(&{String.to_charlist(&1), false})
+    scrubbed =
+      (names ++ @provider_environment ++ tracker_names)
+      |> Enum.uniq()
+      |> Enum.map(&{String.to_charlist(&1), false})
+
+    # Pass only the directory path, never inspect or copy anything inside it.
+    [{~c"CLAUDE_CONFIG_DIR", String.to_charlist(config_dir)} | Enum.reject(scrubbed, fn {name, _} -> name == ~c"CLAUDE_CONFIG_DIR" end)]
   end
 
   defp shell_escape(value), do: "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

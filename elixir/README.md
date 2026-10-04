@@ -35,7 +35,10 @@ bridge, or a host-side handoff into Pi. Configured tracker credential environmen
 from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
 
 Set `agent.backend: claude` for local Claude Code reviews using the official `claude` executable on
-PATH. Symphony checks `claude auth status --json` for `authMethod: "claude.ai"` before each turn,
+PATH, or set `claude.command` to the real executable's absolute path (a single executable, not a
+shell command). If a PATH wrapper depends on HOME, configure the real binary, e.g. the path reported
+by `mise which claude` in the operator's normal environment. Symphony does not guess wrapper paths.
+Symphony checks `claude auth status --json` for `authMethod: "claude.ai"` before each turn,
 then runs `claude -p --output-format stream-json --verbose --include-partial-messages`.
 The prompt is passed as an argument; auth preflight and print mode get stdin EOF via `/dev/null`,
 rather than waiting on the process launcher's open RPC input pipe. A Claude-local shell gate holds
@@ -49,14 +52,32 @@ Safe mode disables hooks/plugins/project customizations while preserving CLI aut
 Use a current Claude Code version supporting these flags (verified against local `claude --help`).
 Turns resume the CLI session with `--resume`; success requires both a successful `result` with a
 nonblank session ID and exit status zero. `codex.turn_timeout_ms` supplies the absolute Claude turn
-deadline, including auth preflight; no new configuration section is required. Stderr is retained in
+deadline, including auth preflight. Stderr is retained in
 `<workspace>/.symphony/claude/turn.stderr.log`. The existing Pi process launcher is reused without
 sending Pi RPC messages or changing Pi behavior; dedicated process groups are cleaned up even after
 the CLI exits. No tracker tools are injected. Scheduler retry policy is unchanged and stays on Claude.
 
-Tests use a fake executable and stored, official-schema-shaped stream samples, not live service calls.
-The real `claude -p` canary under Symphony's sandbox is owner-gated: rewritten HOME may hide the
-operator's login. Do not copy login files into the sandbox or log in automatically to resolve this gap.
+Symphony passes `CLAUDE_CONFIG_DIR` to both auth preflight and the turn, independently of the child's
+HOME. `claude.config_dir` overrides the operator process's `CLAUDE_CONFIG_DIR`, otherwise the default
+is `<operator HOME>/.claude`. The path is captured at session start; Symphony never reads, copies,
+or logs anything inside it. If Symphony itself starts with HOME already rewritten, explicitly set
+`claude.config_dir` (or `CLAUDE_CONFIG_DIR`) to the real operator config directory.
+
+```yaml
+agent:
+  backend: claude
+claude:
+  command: /absolute/path/to/real/claude
+  config_dir: /absolute/path/to/operator/.claude
+```
+
+Giving the child this directory exposes the operator's login to whatever tools the permitted turn
+can run. `dontAsk` limits tool permissions but is not credential isolation; this lane is review-only.
+A nonzero preflight exit without valid auth metadata returns a typed error naming the executable
+and a `claude.command` hint; valid logged-out metadata still returns `:claude_not_logged_in`.
+Tests use fake executables and stored, official-schema-shaped stream samples, not live service calls.
+The real check is owner-gated: run one `claude -p` turn launched by Symphony itself with its actual
+HOME rewrite. Do not copy login files into the sandbox or log in automatically.
 Protocol references: [headless usage](https://code.claude.com/docs/en/headless),
 [CLI reference](https://code.claude.com/docs/en/cli-reference), and
 [message types](https://code.claude.com/docs/en/agent-sdk/typescript#sdkmessage).
