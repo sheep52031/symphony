@@ -14,6 +14,22 @@ defmodule SymphonyElixir.AgentBackendContractTest do
     assert :ok = AgentBackend.validate_turn_result(%{session_id: "agy-session", backend: :antigravity})
   end
 
+  test "declares backend worker-host compatibility and local-only policy" do
+    assert AgentBackend.worker_host_compatible?("codex", nil)
+    assert AgentBackend.worker_host_compatible?(:codex, "m2-air")
+    refute AgentBackend.worker_host_compatible?("codex", "  ")
+    assert AgentBackend.worker_host_compatible?("pi", nil)
+    refute AgentBackend.worker_host_compatible?("pi", "m2-air")
+    assert AgentBackend.worker_host_compatible?("antigravity", nil)
+    refute AgentBackend.worker_host_compatible?("antigravity", "m2-air")
+    refute AgentBackend.worker_host_compatible?("unknown", nil)
+
+    refute AgentBackend.local_only?("codex")
+    assert AgentBackend.local_only?("pi")
+    assert AgentBackend.local_only?("antigravity")
+    refute AgentBackend.local_only?("unknown")
+  end
+
   test "rejects malformed adapter updates and turn results" do
     assert {:error, {:invalid_backend_update, %{event: :missing_timestamp}}} =
              AgentBackend.validate_update(%{event: :missing_timestamp})
@@ -54,6 +70,55 @@ defmodule SymphonyElixir.AgentBackendContractTest do
 
     assert {:error, {:invalid_workflow_config, "pi.turn_timeout_ms must be greater than 0"}} =
              Config.Schema.parse(%{"pi" => %{"turn_timeout_ms" => 0}})
+  end
+
+  test "parses exact per-issue backend bindings and gates AntiGravity candidates" do
+    assert {:ok, defaults} = Config.Schema.parse(%{})
+    assert defaults.agent.backend == "codex"
+    assert defaults.agent.issue_backends == %{}
+
+    assert {:ok, routed} =
+             Config.Schema.parse(%{
+               "agent" => %{
+                 "issue_backends" => %{"JARVIS-979-PI" => "pi"}
+               }
+             })
+
+    assert routed.agent.issue_backends == %{"JARVIS-979-PI" => "pi"}
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{"JARVIS-979-X" => "deepseek"}}})
+
+    assert message =~ "issue_backends"
+
+    assert {:error, {:invalid_workflow_config, exact_identifier_message}} =
+             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{" JARVIS-979-X " => "pi"}}})
+
+    assert exact_identifier_message =~ "issue_backends"
+
+    agy_route = %{
+      "agent" => %{
+        "issue_backends" => %{"JARVIS-979-AGY" => "antigravity"}
+      }
+    }
+
+    assert {:error, {:invalid_workflow_config, gate_message}} = Config.Schema.parse(agy_route)
+    assert gate_message =~ "accepted_antigravity_issue_identifiers"
+
+    assert {:ok, accepted} =
+             Config.Schema.parse(put_in(agy_route, ["agent", "accepted_antigravity_issue_identifiers"], ["JARVIS-979-AGY"]))
+
+    assert accepted.agent.accepted_antigravity_issue_identifiers == ["JARVIS-979-AGY"]
+
+    assert {:error, {:invalid_workflow_config, extra_gate_message}} =
+             Config.Schema.parse(put_in(agy_route, ["agent", "accepted_antigravity_issue_identifiers"], ["JARVIS-979-OTHER"]))
+
+    assert extra_gate_message =~ "accepted_antigravity_issue_identifiers"
+
+    assert {:error, {:invalid_workflow_config, unused_gate_message}} =
+             Config.Schema.parse(%{"agent" => %{"accepted_antigravity_issue_identifiers" => ["JARVIS-979-OTHER"]}})
+
+    assert unused_gate_message =~ "accepted_antigravity_issue_identifiers"
   end
 
   test "validates lifecycle return envelopes and delegates backend-owned config" do

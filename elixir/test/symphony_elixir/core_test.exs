@@ -800,6 +800,8 @@ defmodule SymphonyElixir.CoreTest do
           pid: self(),
           ref: nil,
           identifier: "MT-557",
+          backend: "codex",
+          backend_route_explicit?: false,
           issue: %Issue{
             id: issue_id,
             identifier: "MT-557",
@@ -1031,6 +1033,8 @@ defmodule SymphonyElixir.CoreTest do
     updated_state =
       Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
         identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: false,
         error: "agent exited"
       })
 
@@ -1075,6 +1079,8 @@ defmodule SymphonyElixir.CoreTest do
       updated_state =
         Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
           identifier: issue.identifier,
+          backend: "codex",
+          backend_route_explicit?: false,
           error: "agent exited"
         })
 
