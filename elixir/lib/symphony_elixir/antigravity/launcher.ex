@@ -294,13 +294,24 @@ defmodule SymphonyElixir.Antigravity.Launcher do
   defp unsafe_writable_root?(path, label, home) do
     path == "/" or path_contains?(path, home) or
       (path_contains?(home, path) and not dedicated_home_root?(path, label, home)) or
-      security_sensitive_path?(path) or path in @broad_writable_roots or top_level_path?(path)
+      security_sensitive_path?(path) or path in canonical_roots(@broad_writable_roots) or top_level_path?(path)
   end
 
   defp dedicated_writable_root?(path, label, home) do
     if path_contains?(home, path),
       do: dedicated_home_root?(path, label, home),
-      else: Enum.any?(@dedicated_parent_roots, &strictly_contains?(&1, path))
+      else: Enum.any?(canonical_roots(@dedicated_parent_roots), &strictly_contains?(&1, path))
+  end
+
+  # macOS aliases /var and /tmp into /private. Compare canonical roots to the
+  # already canonical workspace, without granting any additional writable root.
+  defp canonical_roots(roots) do
+    Enum.map(roots, fn root ->
+      case PathSafety.canonicalize(root) do
+        {:ok, canonical} -> canonical
+        _ -> root
+      end
+    end)
   end
 
   defp dedicated_home_root?(path, :profile_root, home) do

@@ -153,7 +153,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     home = Path.expand(System.user_home!())
     home_parent = Path.dirname(home)
     workspace = Path.join(root, "workspace")
-    workspace_two = Path.join(System.tmp_dir!(), "symphony-antigravity-workspace-two-#{System.unique_integer([:positive])}")
+    workspace_two = temporary_root("workspace-two")
     profile = Path.join(workspace, "profile")
     profile_two = Path.join(root, "profile-two")
     agy = Path.join(root, "agy")
@@ -216,8 +216,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
                Launcher.build(unsafe_root, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
     end
 
-    assert {:error, {:antigravity_directory_not_found, :profile_root, "/var/lib/agy-profile"}} =
-             Launcher.build(workspace_two, agy, "/var/lib/agy-profile", 1_000, bubblewrap_executable: bwrap)
+    assert {:ok, missing_profile} = SymphonyElixir.PathSafety.canonicalize("/var/lib/agy-profile")
+
+    assert {:error, {:antigravity_directory_not_found, :profile_root, ^missing_profile}} =
+             Launcher.build(workspace_two, agy, missing_profile, 1_000, bubblewrap_executable: bwrap)
 
     File.rm_rf!(root)
     File.rm_rf!(workspace_two)
@@ -284,7 +286,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   end
 
   test "masks the real home and projects only the canonical writable roots and AGY file" do
-    root = Path.join("/var/tmp", "symphony-antigravity-topology-#{System.unique_integer([:positive])}")
+    root = temporary_root("topology")
     home = Path.expand(System.user_home!())
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
@@ -493,10 +495,17 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     for {prompt, expected, secret} <- cases do
       {root, workspace, profile, agy} = setup_fake_agy!()
-      configure_backend!(agy, profile, first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100)
+
+      overrides =
+        if expected == :timeout,
+          do: [first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100],
+          else: []
+
+      configure_backend!(agy, profile, overrides)
       on_message = fn message -> send(self(), {:agy_message, message}) end
       issue = %{id: "issue-redaction", identifier: "JARVIS-907", title: "Redaction"}
       assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+      await_fake_ready!(session)
 
       result = Backend.run_turn(session, prompt, issue, on_message: on_message)
       assert_redacted_result(result, expected)
@@ -618,6 +627,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     on_message = fn message -> send(self(), {:agy_message, message}) end
 
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    await_fake_ready!(session)
 
     assert {:error, {:antigravity_turn_timeout, :first_event, terminal}} =
              Backend.run_turn(session, "silent", issue, on_message: on_message)
@@ -661,8 +671,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           agent_backend: "antigravity",
           antigravity_executable: agy,
           antigravity_profile_root: profile,
-          antigravity_first_event_timeout_ms: 500,
-          antigravity_turn_timeout_ms: 1_000,
+          # Protocol tests are not startup microbenchmarks. Short deadlines are
+          # reserved for timeout tests, after the fake process proves readiness.
+          antigravity_first_event_timeout_ms: 5_000,
+          antigravity_turn_timeout_ms: 10_000,
           antigravity_cancel_grace_ms: 200
         ],
         overrides
@@ -701,6 +713,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     turn=0
     interrupted=0
     trap 'interrupted=1' INT
+    printf '%s' "$$" > "$PWD/fake-agy.ready"
     while IFS= read -r line; do
       turn=$((turn + 1))
       if [ "$turn" -eq 1 ]; then
@@ -796,13 +809,31 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     """)
   end
 
+  defp await_fake_ready!(session) do
+    path = Path.join(session.workspace, "fake-agy.ready")
+    expected = Integer.to_string(session.transport.process_group_id)
+    await_fake_ready!(path, expected, System.monotonic_time(:millisecond) + 5_000)
+  end
+
+  defp await_fake_ready!(path, expected, deadline) do
+    if File.read(path) != {:ok, expected} do
+      assert System.monotonic_time(:millisecond) < deadline, "fake AntiGravity did not become ready"
+      Process.sleep(10)
+      await_fake_ready!(path, expected, deadline)
+    end
+  end
+
   defp write_executable!(path, contents) do
     File.write!(path, contents)
     File.chmod!(path, 0o755)
   end
 
   defp temporary_root(label) do
-    Path.join(System.tmp_dir!(), "symphony-antigravity-#{label}-#{System.unique_integer([:positive])}")
+    # Use a dedicated allowed root, not macOS's /var/folders temporary directory.
+    # Randomness also prevents collisions with leftovers from an earlier BEAM run.
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    {:ok, parent} = SymphonyElixir.PathSafety.canonicalize("/var/tmp")
+    Path.join(parent, "symphony-antigravity-#{label}-#{suffix}")
   end
 
   defp receive_messages(messages) do

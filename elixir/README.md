@@ -55,6 +55,9 @@ sending Pi RPC messages or changing Pi behavior; dedicated process groups are cl
 the CLI exits. No tracker tools are injected. Scheduler retry policy is unchanged and stays on Claude.
 
 Tests use a fake executable and stored, official-schema-shaped stream samples, not live service calls.
+Fake-backend tests run with a temporary HOME so login-shell startup cannot source the operator's
+profile. On macOS, run `cd elixir && mise exec -- mix test`; fake AntiGravity tests exercise transport
+and cleanup without Bubblewrap. This does not enable the mandatory Linux Bubblewrap boundary on macOS.
 The real `claude -p` canary under Symphony's sandbox is owner-gated: rewritten HOME may hide the
 operator's login. Do not copy login files into the sandbox or log in automatically to resolve this gap.
 Protocol references: [headless usage](https://code.claude.com/docs/en/headless),
@@ -230,9 +233,11 @@ Notes:
   - `pi.first_event_timeout_ms` bounds the first valid response or event after a request is sent.
   - `pi.turn_timeout_ms` bounds the entire provider turn through authoritative `agent_settled`.
   - `pi.post_result_timeout_ms` is one shared budget for assistant-text and usage reads after settlement.
-  On timeout Symphony sends a bounded native abort. On hosts with `setsid`, session shutdown then
-  terminates the dedicated Pi process group, including descendants; other hosts retain bounded
-  direct-child shutdown. The Pi fields fall back to the compatible Codex read/turn defaults when omitted.
+  On timeout Symphony sends a bounded native abort. Session shutdown terminates the dedicated Pi
+  process group, including descendants, using `setsid --wait` when available or stock macOS Perl's
+  `POSIX::setsid` with a fork/wait launcher. Claude reuses this launcher, as does the AntiGravity
+  transport. Pi retains bounded direct-child shutdown only if neither `setsid` nor Perl exists.
+  The Pi fields fall back to the compatible Codex read/turn defaults when omitted.
 - `antigravity.executable` and `antigravity.profile_root` are required absolute paths when the
   AntiGravity backend is selected. The executable must be outside both writable roots. The profile
   root must be a dedicated directory: `/`, top-level or security-sensitive host trees (including

@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Pi.Rpc do
   @graceful_close_ms 250
   @forced_close_ms 250
   @process_group_detection_attempts 400
+  @ps_path if(File.exists?("/usr/bin/ps"), do: "/usr/bin/ps", else: "/bin/ps")
   @dialog_ui_methods ["select", "confirm", "input", "editor"]
   @fire_and_forget_ui_methods ["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]
 
@@ -157,27 +158,27 @@ defmodule SymphonyElixir.Pi.Rpc do
       File.rm(process_group_path)
       launch = build_launch(command, stderr_path, process_group_path)
       port = open_rpc_port(launch, workspace, opts)
-      finalize_started_port(port, workspace, command, stderr_path, process_group_path, launch.setsid)
+      finalize_started_port(port, workspace, command, stderr_path, process_group_path, launch.session_prefix)
     end
   end
 
   defp build_launch(command, stderr_path, process_group_path) do
     executable = System.find_executable("bash")
-    setsid = System.find_executable("setsid")
+    session_prefix = SymphonyElixir.ProcessSession.prefix()
 
     launch_command =
-      case setsid do
-        path when is_binary(path) ->
+      case session_prefix do
+        prefix when is_binary(prefix) ->
           grouped_command =
             "printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{shell_escape(executable)} -c #{shell_escape(command)}"
 
-          "exec #{shell_escape(path)} --wait #{shell_escape(executable)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
+          "exec #{prefix} #{shell_escape(executable)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
 
         _ ->
           "exec #{shell_escape(executable)} -c #{shell_escape(command)} 2> #{shell_escape(stderr_path)}"
       end
 
-    %{executable: executable, setsid: setsid, command: launch_command}
+    %{executable: executable, session_prefix: session_prefix, command: launch_command}
   end
 
   defp open_rpc_port(launch, workspace, opts) do
@@ -194,11 +195,11 @@ defmodule SymphonyElixir.Pi.Rpc do
     )
   end
 
-  defp finalize_started_port(port, workspace, command, stderr_path, process_group_path, setsid) do
+  defp finalize_started_port(port, workspace, command, stderr_path, process_group_path, session_prefix) do
     process_group_id =
-      if is_binary(setsid), do: read_process_group_id(process_group_path), else: nil
+      if is_binary(session_prefix), do: read_process_group_id(process_group_path), else: nil
 
-    if is_binary(setsid) and is_nil(process_group_id) do
+    if is_binary(session_prefix) and is_nil(process_group_id) do
       close_failed_port(port)
       File.rm(process_group_path)
       {:error, :process_group_setup_failed}
@@ -210,7 +211,7 @@ defmodule SymphonyElixir.Pi.Rpc do
         command: command,
         os_pid: process_group_id || port_os_pid(port),
         process_group_id: process_group_id,
-        process_group_path: if(is_binary(setsid), do: process_group_path),
+        process_group_path: if(is_binary(session_prefix), do: process_group_path),
         cleanup_guard_pid: nil
       }
 
@@ -239,7 +240,7 @@ defmodule SymphonyElixir.Pi.Rpc do
 
   defp process_group_for_port(port) do
     with port_pid when is_integer(port_pid) and port_pid > 0 <- port_os_pid(port),
-         {process_table, 0} <- System.cmd("/usr/bin/ps", ["-axo", "pid=,ppid=,pgid="], stderr_to_stdout: true) do
+         {process_table, 0} <- System.cmd(@ps_path, ["-axo", "pid=,ppid=,pgid="], stderr_to_stdout: true) do
       process_table
       |> String.split("\n", trim: true)
       |> Enum.find_value(&group_leader_pid(&1, port_pid))
