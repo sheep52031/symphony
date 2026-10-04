@@ -51,6 +51,17 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       end
     end
 
+    test "reports deleted workspaces and validates default config envelopes", context do
+      assert :ok = Backend.validate_config(%{})
+      missing = Path.join(context.root, "missing")
+      assert {:error, {:workspace_not_found, ^missing}} = Backend.start_session(missing)
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      File.rm_rf!(context.workspace)
+      assert {:error, {:claude_start_failed, {:workspace_not_found, _}}} = Backend.run_turn(session, "review", %{}, [])
+      assert :ok = Backend.stop_session(session)
+      assert {:error, {:claude_session_exit, _}} = Backend.run_turn(session, "review", %{}, [])
+    end
+
     test "stream fixtures meet the shared lifecycle contract, resume and stop idempotently", context do
       assert {:ok, session} = Backend.start_session(context.workspace)
 
@@ -136,7 +147,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
           {"api_key_source", {:claude_subscription_required, "ANTHROPIC_API_KEY"}},
           {"missing_result", :claude_missing_result},
           {"blank_session", :claude_missing_session_id},
-          {"malformed", :claude_invalid_stream_json}
+          {"malformed", :claude_invalid_stream_json},
+          {"oversized_stream", :claude_stream_line_too_large}
         ] do
       test "typed failure without fallback: #{prompt}", context do
         assert {:ok, session} = Backend.start_session(context.workspace)
@@ -186,6 +198,145 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         assert result == {:error, expected}
         assert calls(context.workspace) == []
         assert :ok = Backend.stop_session(session)
+      end
+    end
+
+    for mode <- ["invalid", "oversized", "block_print_start"] do
+      test "rejects #{mode} auth output without fallback", context do
+        File.mkdir_p!(Path.join(context.workspace, ".symphony"))
+        File.write!(Path.join(context.workspace, ".symphony/auth-output-mode"), unquote(mode))
+        assert {:ok, session} = Backend.start_session(context.workspace)
+        result = Backend.run_turn(session, "review", %{}, [])
+
+        if unquote(mode) == "block_print_start" do
+          assert {:error, {:claude_start_failed, _}} = result
+        else
+          assert {:error, :claude_invalid_auth_status} = result
+        end
+
+        assert calls(context.workspace) == []
+        assert :ok = Backend.stop_session(session)
+      end
+    end
+
+    test "handles native notifications, non-text blocks and fragmented JSON lines", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, _} = Backend.run_turn(session, "fragmented", %{}, on_message: fn event -> send(self(), {:native, event}) end)
+      assert_receive {:native, %{event: :notification, payload: %{"subtype" => "api_retry"}}}
+      assert_receive {:native, %{event: :message_ended, assistant_text: text}}
+      assert byte_size(text) > 1_048_576
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "reports non-auth result failures even when stderr disappears", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:error, {:claude_result_failed, %{"is_error" => true}}} = Backend.run_turn(session, "result_error", %{}, [])
+      assert {:ok, _} = Backend.run_turn(session, "missing_stderr", %{}, [])
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "rejects concurrent turns while keeping the original turn alive", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      parent = self()
+      task = Task.async(fn -> Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(parent, {:busy, event}) end) end)
+      assert_receive {:busy, %{event: :session_started}}, 2_000
+      assert {:error, :claude_turn_in_progress} = Backend.run_turn(session, "second", %{}, [])
+      assert :ok = Backend.stop_session(session)
+      assert {:error, {:claude_session_exit, :normal}} = Task.await(task, 2_000)
+    end
+
+    test "owner exit terminates the session and active CLI", context do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, session} = Backend.start_session(context.workspace)
+          send(parent, {:owned_session, session})
+          Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(parent, {:owned, event}) end)
+        end)
+
+      on_exit(fn -> Process.exit(owner, :kill) end)
+      assert_receive {:owned_session, session}
+      monitor = Process.monitor(session)
+      assert_receive {:owned, %{event: :session_started}}, 2_000
+      child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, 2_000
+      assert_eventually(fn -> not process_alive?(child) end)
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "caller exit cleans the active turn without destroying the reusable session", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      parent = self()
+
+      caller =
+        spawn(fn ->
+          Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(parent, {:caller, event}) end)
+        end)
+
+      on_exit(fn -> Process.exit(caller, :kill) end)
+      assert_receive {:caller, %{event: :session_started}}, 2_000
+      child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
+      Process.exit(caller, :kill)
+      assert_eventually(fn -> :sys.get_state(session).active == nil end)
+      assert_eventually(fn -> not process_alive?(child) end)
+      send(session, {:deadline, make_ref()})
+      assert :sys.get_state(session).active == nil
+      assert {:ok, _} = Backend.run_turn(session, "continue", %{}, [])
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "can stop normally when setsid is unavailable", context do
+      bin = Path.join(context.root, "without-setsid")
+      File.mkdir_p!(bin)
+
+      for name <- ["claude", "bash", "kill"] do
+        File.ln_s!(System.find_executable(name), Path.join(bin, name))
+      end
+
+      previous_path = System.get_env("PATH")
+
+      try do
+        System.put_env("PATH", bin)
+        assert {:ok, session} = Backend.start_session(context.workspace)
+        assert {:ok, _} = Backend.run_turn(session, "review", %{}, [])
+        assert :ok = Backend.stop_session(session)
+      after
+        System.put_env("PATH", previous_path)
+      end
+    end
+
+    for mode <- ["missing", "broken"] do
+      test "cleanup remains idempotent with #{mode} kill executable", context do
+        bin = Path.join(context.root, "kill-" <> unquote(mode))
+        File.mkdir_p!(bin)
+
+        if unquote(mode) == "broken" do
+          path = Path.join(bin, "kill")
+          File.write!(path, "#!/nonexistent-interpreter\n")
+          File.chmod!(path, 0o755)
+        end
+
+        assert {:ok, session} = Backend.start_session(context.workspace)
+        previous_path = System.get_env("PATH")
+
+        try do
+          on_message = fn
+            %{event: :session_started} ->
+              System.put_env("PATH", bin)
+              File.write!(Path.join(context.workspace, ".symphony/release"), "ready")
+
+            _ ->
+              :ok
+          end
+
+          assert {:ok, _} = Backend.run_turn(session, "wait_cleanup", %{}, on_message: on_message)
+          assert :ok = Backend.stop_session(session)
+          assert :ok = Backend.stop_session(session)
+        after
+          System.put_env("PATH", previous_path)
+        end
       end
     end
 
@@ -240,11 +391,12 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
     end
 
     defp write_fake_claude!(path) do
-      python = System.find_executable("python3")
+      {python, 0} = System.cmd("python3", ["-c", "import sys; print(sys.executable)"])
+      python = String.trim(python)
 
       File.write!(path, """
       \#!#{python}
-      import json, os, sys, time
+      import json, os, shutil, sys, time
       os.makedirs('.symphony', exist_ok=True)
       with open('.symphony/calls.jsonl', 'a') as f:
           f.write(json.dumps(sys.argv[1:]) + '\\n')
@@ -252,6 +404,18 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       with open('.symphony/env-presence.json', 'w') as f:
           json.dump({name: name in os.environ for name in names}, f)
       if 'auth' in sys.argv and 'status' in sys.argv:
+          mode = ''
+          if os.path.exists('.symphony/auth-output-mode'):
+              with open('.symphony/auth-output-mode') as f: mode = f.read()
+          if mode == 'invalid':
+              print('{}', flush=True)
+              sys.exit(0)
+          if mode == 'oversized':
+              print('a' * 4194305, flush=True)
+              sys.exit(0)
+          if mode == 'block_print_start':
+              shutil.rmtree('.symphony/claude')
+              with open('.symphony/claude', 'w') as f: f.write('not a directory')
           method = 'claude.ai'
           if os.path.exists('.symphony/auth-method'):
               with open('.symphony/auth-method') as f: method = f.read()
@@ -292,13 +456,26 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       if prompt == 'malformed':
           print('{invalid-json}', flush=True)
           sys.exit(0)
+      if prompt == 'oversized_stream':
+          print('a' * 4194305, flush=True)
+          sys.exit(0)
+      if prompt == 'missing_stderr': os.unlink('.symphony/claude/turn.stderr.log')
       with open(#{inspect(@fixture)}) as f:
           events = [json.loads(line) for line in f]
+      if prompt == 'result_error': events[-1]['is_error'] = True
+      if prompt == 'fragmented':
+          events.insert(1, {'type': 'system', 'subtype': 'api_retry', 'error': 'overloaded'})
+          events[-2]['message']['content'] = [{'type': 'tool_use', 'id': 'tool_fixture', 'name': 'Read', 'input': {}}, {'type': 'text', 'text': 'a' * 1048577}]
       if prompt == 'blank_session': events[-1]['session_id'] = '  '
       if prompt == 'missing_result': events = events[:-1]
       if prompt == 'hang': events = events[:1]
       for event in events:
           print(json.dumps(event), flush=True)
+          if prompt == 'wait_cleanup' and event.get('subtype') == 'init':
+              for _ in range(200):
+                  if os.path.exists('.symphony/release'): break
+                  time.sleep(0.01)
+              else: sys.exit(60)
       if prompt == 'hang': time.sleep(10)
       sys.exit(24 if prompt == 'success_nonzero' else 0)
       """)
