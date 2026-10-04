@@ -662,7 +662,10 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
               with open('.symphony/auth-method') as f: method = f.read()
           if os.path.exists('.symphony/required-config-dir'):
               with open('.symphony/required-config-dir') as f: required = f.read()
-              if os.environ.get('CLAUDE_CONFIG_DIR') != required or os.environ.get('HOME') != os.getcwd():
+              # The workspace is the rewritten HOME. macOS reports the physical cwd
+              # (/private/var/...) for a temp path spelled /var/..., so compare real paths.
+              home = os.environ.get('HOME')
+              if os.environ.get('CLAUDE_CONFIG_DIR') != required or home is None or os.path.realpath(home) != os.path.realpath(os.getcwd()):
                   method = 'none'
           # Simulate a user profile injecting provider/API-key env after process launch.
           settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])
