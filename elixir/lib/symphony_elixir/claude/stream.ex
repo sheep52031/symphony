@@ -51,7 +51,7 @@ defmodule SymphonyElixir.Claude.Stream do
     # provider selection restored by managed/user settings before any print-mode model request.
     command = shell_command([state.executable | isolation_args() ++ ["auth", "status", "--json"]])
 
-    case Rpc.start(state.workspace, command, stderr_path: stderr_path, env: child_environment()) do
+    case start_transport(state.workspace, command, stderr_path) do
       {:ok, transport} ->
         ref = make_ref()
         timer = Process.send_after(self(), {:deadline, ref}, timeout_ms)
@@ -134,7 +134,7 @@ defmodule SymphonyElixir.Claude.Stream do
       {0, {:ok, %{"authMethod" => "claude.ai"}}} ->
         close_transport(active.transport)
 
-        case Rpc.start(state.workspace, command(state, active.prompt), stderr_path: active.transport.stderr_path, env: child_environment()) do
+        case start_transport(state.workspace, command(state, active.prompt), active.transport.stderr_path) do
           {:ok, transport} ->
             {:noreply, %{state | active: %{active | phase: :stream, transport: transport, pending: ""}}}
 
@@ -257,7 +257,21 @@ defmodule SymphonyElixir.Claude.Stream do
     ["--safe-mode", "--setting-sources", "user", "--settings", Jason.encode!(settings)]
   end
 
-  defp shell_command(args), do: Enum.map_join(args, " ", &shell_escape/1)
+  defp start_transport(workspace, command, stderr_path) do
+    # Rpc startup verifies a live process-group leader. Hold short-lived print/status commands
+    # until that verification completes, then release the shell gate (not a Pi RPC request).
+    launch = "IFS= read -r _symphony_ready && exec " <> command
+
+    with {:ok, transport} <- Rpc.start(workspace, launch, stderr_path: stderr_path, env: child_environment()) do
+      Port.command(transport.port, "\n")
+      {:ok, transport}
+    end
+  end
+
+  defp shell_command(args) do
+    # The complete prompt is in argv. Unlike Pi RPC, print mode must not wait on an open input pipe.
+    Enum.map_join(args, " ", &shell_escape/1) <> " < /dev/null"
+  end
 
   defp close_transport(transport) do
     # Rpc.close only signals the group while the port is alive. Claude can exit before its tool

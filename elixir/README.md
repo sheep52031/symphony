@@ -37,6 +37,9 @@ from the Pi child, while tracker polling and lifecycle mutations remain owned by
 Set `agent.backend: claude` for local Claude Code reviews using the official `claude` executable on
 PATH. Symphony checks `claude auth status --json` for `authMethod: "claude.ai"` before each turn,
 then runs `claude -p --output-format stream-json --verbose --include-partial-messages`.
+The prompt is passed as an argument; auth preflight and print mode get stdin EOF via `/dev/null`,
+rather than waiting on the process launcher's open RPC input pipe. A Claude-local shell gate holds
+launch until process-group registration completes, so even an immediately exiting CLI is supported.
 It never reads or copies credential files, passes `--model`, logs in, or falls back to API billing,
 another model, or another backend. The operator's saved default model applies. API-key, bearer-token,
 and cloud-provider environment selectors are removed and overridden in CLI settings; a non-plan

@@ -62,6 +62,34 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert {:error, {:claude_session_exit, _}} = Backend.run_turn(session, "review", %{}, [])
     end
 
+    test "auth preflight and print mode receive stdin EOF without waiting for port closure", context do
+      File.mkdir_p!(Path.join(context.workspace, ".symphony"))
+      File.write!(Path.join(context.workspace, ".symphony/auth-output-mode"), "stdin_eof")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, _} = Backend.run_turn(session, "stdin_eof", %{}, timeout_ms: 1_500)
+      assert File.read!(Path.join(context.workspace, ".symphony/auth-stdin")) == ""
+      assert File.read!(Path.join(context.workspace, ".symphony/turn-stdin")) == ""
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "accepts a CLI that emits fixtures and exits immediately", context do
+      path = Path.join(context.root, "bin/claude")
+
+      File.write!(path, """
+      \#!#{System.find_executable("bash")}
+      case "$*" in
+        *" auth status --json"*) printf '%s\\n' '{"authMethod":"claude.ai"}' ;;
+        *) printf '%s' '#{File.read!(@fixture)}' ;;
+      esac
+      """)
+
+      File.chmod!(path, 0o755)
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, turn} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+      assert :ok = AgentBackend.validate_turn_result(turn)
+      assert :ok = Backend.stop_session(session)
+    end
+
     test "stream fixtures meet the shared lifecycle contract, resume and stop idempotently", context do
       assert {:ok, session} = Backend.start_session(context.workspace)
 
@@ -407,6 +435,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
           mode = ''
           if os.path.exists('.symphony/auth-output-mode'):
               with open('.symphony/auth-output-mode') as f: mode = f.read()
+          if mode == 'stdin_eof':
+              with open('.symphony/auth-stdin', 'w') as f: f.write(sys.stdin.read())
           if mode == 'invalid':
               print('{}', flush=True)
               sys.exit(0)
@@ -429,6 +459,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
           sys.exit(1 if method == 'none' else 0)
       with open('.symphony/cli-pid', 'w') as f: f.write(str(os.getpid()))
       prompt = sys.argv[-1].strip()
+      if prompt == 'stdin_eof':
+          with open('.symphony/turn-stdin', 'w') as f: f.write(sys.stdin.read())
       if prompt == 'descendant':
           child = os.fork()
           if child == 0:
