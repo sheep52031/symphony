@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
 
   test "memory tracker admits exactly three overlapping isolated Pi workers" do
     suffix = System.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "symphony-pi-three-#{suffix}")
+    root = Path.join(System.tmp_dir!(), "symphony-pi-three-#{Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)}")
     workspace_root = Path.join(root, "workspaces")
     barrier_root = Path.join(root, "barrier")
     script = Path.join(root, "fake-pi-barrier")
@@ -76,13 +76,24 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
       end)
 
     assert length(records) == 3
-    Process.sleep(100)
+
+    # get_state writes the barrier before AgentRunner publishes its backend proof.
+    # A fixed 100ms sleep races that publication when process startup is slower.
+    snapshot =
+      eventually_value(fn ->
+        case Orchestrator.snapshot(orchestrator_name, 1_000) do
+          %{running: running} = snapshot when length(running) == 3 ->
+            if Enum.all?(running, &(&1.backend == :pi)), do: snapshot
+
+          _ ->
+            nil
+        end
+      end)
+
+    assert snapshot
+    assert length(snapshot.running) == 3
     assert length(barrier_records(barrier_root)) == 3
     assert length(Task.Supervisor.children(task_supervisor_name)) == 3
-
-    snapshot = Orchestrator.snapshot(orchestrator_name, 1_000)
-    assert length(snapshot.running) == 3
-    assert Enum.all?(snapshot.running, &(&1.backend == :pi))
 
     assert records |> Enum.map(& &1["pid"]) |> Enum.uniq() |> length() == 3
     assert records |> Enum.map(& &1["session_id"]) |> Enum.uniq() |> length() == 3
@@ -121,10 +132,11 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
       : > "$barrier/secret-leak"
       exit 12
     fi
-    identifier=$(basename "$PWD")
+    identifier=${PWD##*/}
     session_id="session-$identifier"
     while IFS= read -r line; do
-      id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+      id=${line#*'"id":"'}
+      id=${id%%'"'*}
       case "$line" in
         *'"type":"get_state"'*)
           printf '{"identifier":"%s","pid":%s,"session_id":"%s","workspace":"%s"}\\n' "$identifier" "$$" "$session_id" "$PWD" > "$barrier/$identifier.json"
@@ -152,7 +164,14 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
     root
     |> Path.join("PI-*.json")
     |> Path.wildcard()
-    |> Enum.map(fn path -> path |> File.read!() |> Jason.decode!() end)
+    |> Enum.flat_map(fn path ->
+      with {:ok, contents} <- File.read(path),
+           {:ok, record} <- Jason.decode(contents) do
+        [record]
+      else
+        _ -> []
+      end
+    end)
   end
 
   defp stop_default_runtime! do
@@ -177,14 +196,17 @@ defmodule SymphonyElixir.Pi.ConcurrencyTest do
     end
   end
 
-  defp eventually_value(fun, attempts \\ 300)
-  defp eventually_value(_fun, 0), do: nil
+  defp eventually_value(fun) do
+    await_value(fun, System.monotonic_time(:millisecond) + 5_000)
+  end
 
-  defp eventually_value(fun, attempts) do
+  defp await_value(fun, deadline) do
     case fun.() do
       nil ->
-        Process.sleep(10)
-        eventually_value(fun, attempts - 1)
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(10)
+          await_value(fun, deadline)
+        end
 
       value ->
         value

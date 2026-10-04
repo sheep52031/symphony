@@ -8,15 +8,22 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
     @session_id "d1e57a6f-4207-4f86-8f25-3b51e1a20a85"
     @fixture Path.expand("fixtures/success.jsonl", __DIR__)
+    @startup_timeout_ms 5_000
 
-    setup do
-      root = Path.join(System.tmp_dir!(), "symphony-claude-#{System.unique_integer([:positive])}")
+    setup_all do
+      {python, 0} = System.cmd("python3", ["-c", "import sys; print(sys.executable)"])
+      {:ok, python: String.trim(python)}
+    end
+
+    setup %{python: python} do
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      root = Path.join(System.tmp_dir!(), "symphony-claude-#{suffix}")
       workspace = Path.join(root, "workspace")
       bin = Path.join(root, "bin")
       File.mkdir_p!(workspace)
       File.mkdir_p!(bin)
       script = Path.join(bin, "claude")
-      write_fake_claude!(script)
+      write_fake_claude!(script, python)
       previous_path = System.get_env("PATH")
       System.put_env("PATH", bin <> ":" <> previous_path)
       write_workflow_file!(Workflow.workflow_file_path(), agent_backend: "claude", workspace_root: root)
@@ -51,13 +58,181 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       end
     end
 
+    test "configured login directory survives an empty rewritten HOME and completes a turn", context do
+      config_dir = Path.join(context.root, "operator-config")
+      File.mkdir_p!(config_dir)
+      require_config_dir!(context.workspace, config_dir)
+      configure_claude!(%{"config_dir" => config_dir})
+      previous_home = System.get_env("HOME")
+      previous_dir = System.get_env("CLAUDE_CONFIG_DIR")
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("CLAUDE_CONFIG_DIR", previous_dir)
+      end)
+
+      System.put_env("CLAUDE_CONFIG_DIR", Path.join(context.root, "wrong-config"))
+      System.put_env("HOME", context.workspace)
+
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, _} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+
+      for phase <- ["auth", "turn"] do
+        assert launch_env(context.workspace, phase) == %{"HOME" => context.workspace, "CLAUDE_CONFIG_DIR" => config_dir}
+      end
+
+      assert File.ls!(config_dir) == []
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "without CLAUDE_CONFIG_DIR the same fake rejects the rewritten HOME before a turn", context do
+      config_dir = Path.join(context.root, "operator-config")
+      File.mkdir_p!(config_dir)
+      require_config_dir!(context.workspace, config_dir)
+      wrapper = Path.join(context.root, "without-config-dir")
+      fake = Path.join(context.root, "bin/claude")
+      File.write!(wrapper, "#!#{System.find_executable("bash")}\nunset CLAUDE_CONFIG_DIR\nexec '#{fake}' \"$@\"\n")
+      File.chmod!(wrapper, 0o755)
+      configure_claude!(%{"command" => wrapper, "config_dir" => config_dir})
+      previous_home = System.get_env("HOME")
+      on_exit(fn -> restore_env("HOME", previous_home) end)
+      System.put_env("HOME", context.workspace)
+
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:error, :claude_not_logged_in} = Backend.run_turn(session, "never dispatched", %{}, timeout_ms: 1_500)
+      assert calls(context.workspace) == []
+      assert launch_env(context.workspace, "auth")["CLAUDE_CONFIG_DIR"] == nil
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "default config directory is captured from the operator HOME before child launch", context do
+      operator_home = Path.join(context.root, "operator-home")
+      File.mkdir_p!(operator_home)
+      require_config_dir!(context.workspace, Path.join(operator_home, ".claude"))
+      previous_home = System.get_env("HOME")
+      previous_dir = System.get_env("CLAUDE_CONFIG_DIR")
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("CLAUDE_CONFIG_DIR", previous_dir)
+      end)
+
+      System.delete_env("CLAUDE_CONFIG_DIR")
+      System.put_env("HOME", operator_home)
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      System.put_env("HOME", context.workspace)
+      assert {:ok, _} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+
+      for phase <- ["auth", "turn"] do
+        assert launch_env(context.workspace, phase)["CLAUDE_CONFIG_DIR"] == Path.join(operator_home, ".claude")
+      end
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "ambient config directory is passed when workflow does not override it", context do
+      config_dir = Path.join(context.root, "ambient-config")
+      require_config_dir!(context.workspace, config_dir)
+      previous_dir = System.get_env("CLAUDE_CONFIG_DIR")
+      previous_home = System.get_env("HOME")
+
+      on_exit(fn ->
+        restore_env("CLAUDE_CONFIG_DIR", previous_dir)
+        restore_env("HOME", previous_home)
+      end)
+
+      System.put_env("CLAUDE_CONFIG_DIR", config_dir)
+      System.put_env("HOME", context.workspace)
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, _} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "rejects malformed Claude configuration without inspecting directories" do
+      for raw <- [nil, "not a map", %{"command" => ""}, %{"command" => 12}, %{"config_dir" => nil}, %{"config_dir" => " "}] do
+        assert {:error, {:invalid_claude_config, _}} = Backend.validate_config(%{claude: raw})
+      end
+    end
+
+    test "loggedIn false is rejected even if authMethod claims claude.ai", context do
+      File.mkdir_p!(Path.join(context.workspace, ".symphony"))
+      File.write!(Path.join(context.workspace, ".symphony/auth-output-mode"), "logged_out")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:error, :claude_not_logged_in} = Backend.run_turn(session, "never dispatched", %{}, [])
+      assert calls(context.workspace) == []
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "invalid command reload retains the last known good workflow without deadlock", context do
+      executable = Path.join(context.root, "real-claude")
+      File.cp!(Path.join(context.root, "bin/claude"), executable)
+      File.chmod!(executable, 0o755)
+      configure_claude!(%{"command" => executable})
+      path = Workflow.workflow_file_path()
+      missing = Path.join(context.root, "missing-real-claude")
+      File.write!(path, String.replace(File.read!(path), Jason.encode!(executable), Jason.encode!(missing)))
+
+      capture_log(fn ->
+        assert {:error, {:backend_executable_not_found, :claude, ^missing}} = WorkflowStore.force_reload()
+        assert {:ok, session} = Backend.start_session(context.workspace)
+        assert :sys.get_state(session).executable == executable
+        assert {:ok, _} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+        assert :ok = Backend.stop_session(session)
+      end)
+    end
+
+    test "absolute command launches that executable instead of the PATH candidate", context do
+      executable = Path.join(context.root, "real claude's binary")
+      File.cp!(Path.join(context.root, "bin/claude"), executable)
+      File.chmod!(executable, 0o755)
+      configure_claude!(%{"command" => executable})
+      File.write!(Path.join(context.root, "bin/claude"), "#!/nonexistent-interpreter\n")
+      assert :ok = Backend.validate_config(%{})
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert :sys.get_state(session).executable == executable
+      assert {:ok, _} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "unset command retains PATH lookup and missing configured paths are named", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert :sys.get_state(session).executable == System.find_executable("claude")
+      assert :ok = Backend.stop_session(session)
+      missing = Path.join(context.root, "missing-claude")
+
+      assert {:error, {:backend_executable_not_found, :claude, ^missing}} =
+               Backend.validate_config(%{claude: %{"command" => missing}})
+
+      configure_claude!(%{"command" => missing}, reload: false)
+      assert {:error, {:backend_executable_not_found, :claude, ^missing}} = Backend.validate_config(%{})
+    end
+
+    test "HOME-dependent wrapper fails promptly with a typed error naming the executable", context do
+      executable = Path.join(context.root, "home-wrapper")
+      fake = Path.join(context.root, "bin/claude")
+      File.write!(executable, "#!#{System.find_executable("bash")}\nif [ \"$HOME\" = '#{context.workspace}' ]; then echo 'config files are not trusted' >&2; exit 42; fi\nexec '#{fake}' \"$@\"\n")
+      File.chmod!(executable, 0o755)
+      configure_claude!(%{"command" => executable})
+      previous_home = System.get_env("HOME")
+      on_exit(fn -> restore_env("HOME", previous_home) end)
+      System.put_env("HOME", context.workspace)
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:error, {:claude_preflight_failed, ^executable, 42, hint}} =
+               Backend.run_turn(session, "never dispatched", %{}, timeout_ms: 1_500)
+
+      assert hint =~ "claude.command"
+      refute File.exists?(Path.join(context.workspace, ".symphony/calls.jsonl"))
+      assert :ok = Backend.stop_session(session)
+    end
+
     test "reports deleted workspaces and validates default config envelopes", context do
       assert :ok = Backend.validate_config(%{})
       missing = Path.join(context.root, "missing")
       assert {:error, {:workspace_not_found, ^missing}} = Backend.start_session(missing)
       assert {:ok, session} = Backend.start_session(context.workspace)
       File.rm_rf!(context.workspace)
-      assert {:error, {:claude_start_failed, {:workspace_not_found, _}}} = Backend.run_turn(session, "review", %{}, [])
+      assert {:error, {:claude_start_failed, _, {:workspace_not_found, _}}} = Backend.run_turn(session, "review", %{}, [])
       assert :ok = Backend.stop_session(session)
       assert {:error, {:claude_session_exit, _}} = Backend.run_turn(session, "review", %{}, [])
     end
@@ -66,7 +241,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       File.mkdir_p!(Path.join(context.workspace, ".symphony"))
       File.write!(Path.join(context.workspace, ".symphony/auth-output-mode"), "stdin_eof")
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:ok, _} = Backend.run_turn(session, "stdin_eof", %{}, timeout_ms: 1_500)
+      assert {:ok, _} = Backend.run_turn(session, "stdin_eof", %{}, timeout_ms: @startup_timeout_ms)
       assert File.read!(Path.join(context.workspace, ".symphony/auth-stdin")) == ""
       assert File.read!(Path.join(context.workspace, ".symphony/turn-stdin")) == ""
       assert :ok = Backend.stop_session(session)
@@ -85,7 +260,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
       File.chmod!(path, 0o755)
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:ok, turn} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+      assert {:ok, turn} = Backend.run_turn(session, "review", %{}, timeout_ms: @startup_timeout_ms)
       assert :ok = AgentBackend.validate_turn_result(turn)
       assert :ok = Backend.stop_session(session)
     end
@@ -119,6 +294,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         assert "stream-json" in args
         assert "--verbose" in args
         assert "--include-partial-messages" in args
+        assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--permission-mode", "dontAsk"])
         refute "--model" in args
         refute "--fallback-model" in args
         refute "--bare" in args
@@ -237,7 +413,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         result = Backend.run_turn(session, "review", %{}, [])
 
         if unquote(mode) == "block_print_start" do
-          assert {:error, {:claude_start_failed, _}} = result
+          assert {:error, {:claude_start_failed, _, _}} = result
         else
           assert {:error, :claude_invalid_auth_status} = result
         end
@@ -267,7 +443,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert {:ok, session} = Backend.start_session(context.workspace)
       parent = self()
       task = Task.async(fn -> Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(parent, {:busy, event}) end) end)
-      assert_receive {:busy, %{event: :session_started}}, 2_000
+      assert_receive {:busy, %{event: :session_started}}, @startup_timeout_ms
       assert {:error, :claude_turn_in_progress} = Backend.run_turn(session, "second", %{}, [])
       assert :ok = Backend.stop_session(session)
       assert {:error, {:claude_session_exit, :normal}} = Task.await(task, 2_000)
@@ -286,7 +462,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       on_exit(fn -> Process.exit(owner, :kill) end)
       assert_receive {:owned_session, session}
       monitor = Process.monitor(session)
-      assert_receive {:owned, %{event: :session_started}}, 2_000
+      assert_receive {:owned, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
       Process.exit(owner, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, 2_000
@@ -304,7 +480,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         end)
 
       on_exit(fn -> Process.exit(caller, :kill) end)
-      assert_receive {:caller, %{event: :session_started}}, 2_000
+      assert_receive {:caller, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
       Process.exit(caller, :kill)
       assert_eventually(fn -> :sys.get_state(session).active == nil end)
@@ -379,8 +555,23 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
     test "absolute timeout stops a streaming child", context do
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:error, :claude_turn_timeout} = Backend.run_turn(session, "hang", %{}, timeout_ms: 250)
+      parent = self()
+
+      # The deadline includes auth preflight and two process launches. 250ms can
+      # expire before the print CLI even exists on macOS. Wait for observable
+      # streaming startup within a bounded budget before checking its cleanup.
+      task =
+        Task.async(fn ->
+          Backend.run_turn(session, "hang", %{},
+            timeout_ms: @startup_timeout_ms,
+            on_message: fn event -> send(parent, {:streaming, event}) end
+          )
+        end)
+
+      assert_receive {:streaming, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
+      assert process_alive?(child)
+      assert {:error, :claude_turn_timeout} = Task.await(task, @startup_timeout_ms + 1_000)
       assert_eventually(fn -> not process_alive?(child) end)
       assert :ok = Backend.stop_session(session)
     end
@@ -389,10 +580,27 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert {:ok, session} = Backend.start_session(context.workspace)
       caller = self()
       task = Task.async(fn -> Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(caller, {:inflight, event}) end) end)
-      assert_receive {:inflight, %{event: :session_started}}, 2_000
+      assert_receive {:inflight, %{event: :session_started}}, @startup_timeout_ms
       assert :ok = Backend.stop_session(session)
       assert {:error, {:claude_session_exit, :normal}} = Task.await(task, 2_000)
       assert :ok = Backend.stop_session(session)
+    end
+
+    defp configure_claude!(config, opts \\ []) do
+      path = Workflow.workflow_file_path()
+      fields = Enum.map_join(config, "\n", fn {key, value} -> "  #{key}: #{Jason.encode!(value)}" end)
+      content = File.read!(path) |> String.replace_prefix("---\n", "---\nclaude:\n#{fields}\n")
+      File.write!(path, content)
+      if Keyword.get(opts, :reload, true), do: assert(:ok == WorkflowStore.force_reload())
+    end
+
+    defp require_config_dir!(workspace, config_dir) do
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/required-config-dir"), config_dir)
+    end
+
+    defp launch_env(workspace, phase) do
+      workspace |> Path.join(".symphony/#{phase}-env.json") |> File.read!() |> Jason.decode!()
     end
 
     defp calls(workspace) do
@@ -418,10 +626,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       end
     end
 
-    defp write_fake_claude!(path) do
-      {python, 0} = System.cmd("python3", ["-c", "import sys; print(sys.executable)"])
-      python = String.trim(python)
-
+    defp write_fake_claude!(path, python) do
       File.write!(path, """
       \#!#{python}
       import json, os, shutil, sys, time
@@ -431,12 +636,18 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       names = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'ANTHROPIC_BASE_URL', 'CLAUDE_TEST_SECRET']
       with open('.symphony/env-presence.json', 'w') as f:
           json.dump({name: name in os.environ for name in names}, f)
+      phase = 'auth' if 'auth' in sys.argv and 'status' in sys.argv else 'turn'
+      with open('.symphony/' + phase + '-env.json', 'w') as f:
+          json.dump({name: os.environ.get(name) for name in ['HOME', 'CLAUDE_CONFIG_DIR']}, f)
       if 'auth' in sys.argv and 'status' in sys.argv:
           mode = ''
           if os.path.exists('.symphony/auth-output-mode'):
               with open('.symphony/auth-output-mode') as f: mode = f.read()
           if mode == 'stdin_eof':
               with open('.symphony/auth-stdin', 'w') as f: f.write(sys.stdin.read())
+          if mode == 'logged_out':
+              print(json.dumps({'loggedIn': False, 'authMethod': 'claude.ai'}), flush=True)
+              sys.exit(0)
           if mode == 'invalid':
               print('{}', flush=True)
               sys.exit(0)
@@ -449,13 +660,20 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
           method = 'claude.ai'
           if os.path.exists('.symphony/auth-method'):
               with open('.symphony/auth-method') as f: method = f.read()
+          if os.path.exists('.symphony/required-config-dir'):
+              with open('.symphony/required-config-dir') as f: required = f.read()
+              # The workspace is the rewritten HOME. macOS reports the physical cwd
+              # (/private/var/...) for a temp path spelled /var/..., so compare real paths.
+              home = os.environ.get('HOME')
+              if os.environ.get('CLAUDE_CONFIG_DIR') != required or home is None or os.path.realpath(home) != os.path.realpath(os.getcwd()):
+                  method = 'none'
           # Simulate a user profile injecting provider/API-key env after process launch.
           settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])
           profile_env = {'CLAUDE_CODE_USE_BEDROCK': '1', 'ANTHROPIC_API_KEY': 'fixture-only'}
           profile_env.update(settings.get('env', {}))
           if profile_env.get('CLAUDE_CODE_USE_BEDROCK'): method = 'third_party'
           if profile_env.get('ANTHROPIC_API_KEY'): method = 'api_key'
-          print(json.dumps({'authMethod': method}, indent=2), flush=True)
+          print(json.dumps({'loggedIn': method != 'none', 'authMethod': method}, indent=2), flush=True)
           sys.exit(1 if method == 'none' else 0)
       with open('.symphony/cli-pid', 'w') as f: f.write(str(os.getpid()))
       prompt = sys.argv[-1].strip()

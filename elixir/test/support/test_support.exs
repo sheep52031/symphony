@@ -28,10 +28,16 @@ defmodule SymphonyElixir.TestSupport do
         workflow_root =
           Path.join(
             System.tmp_dir!(),
-            "symphony-elixir-workflow-#{System.unique_integer([:positive])}"
+            "symphony-elixir-workflow-#{Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)}"
           )
 
         File.mkdir_p!(workflow_root)
+        # Fake app-server tests launch a login shell. Do not source the operator's
+        # profile (which may run slow mise/Homebrew setup or restore real secrets).
+        previous_home = System.get_env("HOME")
+        test_home = Path.join(workflow_root, "home")
+        File.mkdir_p!(test_home)
+        System.put_env("HOME", test_home)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
@@ -42,6 +48,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          restore_env("HOME", previous_home)
           File.rm_rf(workflow_root)
         end)
 

@@ -62,10 +62,12 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
   test "builds the mandatory read-only-root Bubblewrap boundary" do
     root = temporary_root("launcher")
+    home = launcher_home!()
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
     agy = Path.join(root, "agy")
     bwrap = Path.join(root, "bwrap")
+    launcher_opts = [bubblewrap_executable: bwrap, user_home: home]
     File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
     write_executable!(agy, "#!/bin/sh\nexit 0\n")
@@ -80,25 +82,18 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       restore_env("DBUS_SESSION_BUS_ADDRESS", previous_dbus)
     end)
 
-    assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, bubblewrap_executable: bwrap)
+    assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, launcher_opts)
     refute "--model" in launch.args
 
     assert {:ok, tuned} =
-             Launcher.build(workspace, agy, profile, 1_234,
-               bubblewrap_executable: bwrap,
-               model: "gemini-flash",
-               effort: "high"
-             )
+             Launcher.build(workspace, agy, profile, 1_234, [model: "gemini-flash", effort: "high"] ++ launcher_opts)
 
     assert Enum.take(tuned.args, -4) == ["--model", "gemini-flash", "--effort", "high"]
     assert subsequence?(launch.args, ["--sandbox", "--mode", "accept-edits", "--input-format"])
     refute "--dangerously-skip-permissions" in launch.args
 
     assert {:ok, skipping} =
-             Launcher.build(workspace, agy, profile, 1_234,
-               bubblewrap_executable: bwrap,
-               skip_permissions: true
-             )
+             Launcher.build(workspace, agy, profile, 1_234, [skip_permissions: true] ++ launcher_opts)
 
     assert subsequence?(skipping.args, ["--sandbox", "--dangerously-skip-permissions", "--input-format"])
     refute "--mode" in skipping.args
@@ -109,12 +104,16 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     assert subsequence?(launch.args, ["--ro-bind", "/", "/"])
     assert subsequence?(launch.args, ["--tmpfs", "/run/user"])
     assert subsequence?(launch.args, ["--tmpfs", "/tmp"])
-    assert_home_masked_or_private(launch.args, Path.expand(System.user_home!()))
+    # The explicit operator home is outside the private /tmp mount, so it must be masked.
+    assert subsequence?(launch.args, ["--tmpfs", home])
     # Only paths under the private /tmp mount need explicit destination directories.
     # Dedicated /var/tmp paths already exist under the read-only root bind.
     if String.starts_with?(launch.workspace, "/tmp/") do
       assert subsequence?(launch.args, ["--dir", launch.workspace])
       assert subsequence?(launch.args, ["--dir", launch.profile_root])
+    else
+      refute subsequence?(launch.args, ["--dir", launch.workspace])
+      refute subsequence?(launch.args, ["--dir", launch.profile_root])
     end
 
     assert subsequence?(launch.args, ["--dir", "/tmp/symphony-antigravity-runtime", "--chmod", "0700", "/tmp/symphony-antigravity-runtime"])
@@ -134,7 +133,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     refute Enum.any?(launch.args, &(&1 == "/run/user/1000"))
     refute Enum.any?(launch.args, &(&1 == "unix:path=/run/user/1000/bus"))
     assert subsequence?(launch.args, ["/tmp/symphony-antigravity-agy", "--sandbox", "--mode", "accept-edits"])
-    refute subsequence?(launch.args, ["--bind", Path.expand(System.user_home!()), Path.expand(System.user_home!())])
+    refute subsequence?(launch.args, ["--bind", home, home])
     assert List.last(launch.args) == "7s"
     refute "--dangerously-skip-permissions" in launch.args
     refute "--add-dir" in launch.args
@@ -143,21 +142,22 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     write_executable!(mutable_agy, "#!/bin/sh\nexit 0\n")
 
     assert {:error, {:unsafe_antigravity_executable_location, ^mutable_agy}} =
-             Launcher.build(workspace, mutable_agy, profile, 1_234, bubblewrap_executable: bwrap)
+             Launcher.build(workspace, mutable_agy, profile, 1_234, launcher_opts)
 
     File.rm_rf!(root)
   end
 
   test "rejects unsafe writable roots at both workspace and profile boundaries" do
     root = temporary_root("unsafe-launcher")
-    home = Path.expand(System.user_home!())
+    home = launcher_home!()
     home_parent = Path.dirname(home)
     workspace = Path.join(root, "workspace")
-    workspace_two = Path.join(System.tmp_dir!(), "symphony-antigravity-workspace-two-#{System.unique_integer([:positive])}")
+    workspace_two = temporary_root("workspace-two")
     profile = Path.join(workspace, "profile")
     profile_two = Path.join(root, "profile-two")
     agy = Path.join(root, "agy")
     bwrap = Path.join(root, "bwrap")
+    launcher_opts = [bubblewrap_executable: bwrap, user_home: home]
     File.mkdir_p!(workspace)
     File.mkdir_p!(profile)
     File.mkdir_p!(workspace_two)
@@ -166,16 +166,16 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
 
     assert {:error, {:overlapping_antigravity_write_roots, _, _}} =
-             Launcher.build(workspace, agy, profile, 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(workspace, agy, profile, 1_000, launcher_opts)
 
     assert {:error, {:unsafe_antigravity_profile_root, ^home_parent}} =
-             Launcher.build(workspace_two, agy, home_parent, 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(workspace_two, agy, home_parent, 1_000, launcher_opts)
 
     assert {:error, {:unsafe_antigravity_workspace, ^home_parent}} =
-             Launcher.build(home_parent, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(home_parent, agy, profile_two, 1_000, launcher_opts)
 
     assert {:error, {:unsafe_antigravity_workspace, ^home}} =
-             Launcher.build(home, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
+             Launcher.build(home, agy, profile_two, 1_000, launcher_opts)
 
     unsafe_roots = [
       "/",
@@ -210,14 +210,16 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
       assert {:ok, expected_root} = SymphonyElixir.PathSafety.canonicalize(unsafe_root)
 
       assert {:error, {:unsafe_antigravity_profile_root, ^expected_root}} =
-               Launcher.build(workspace_two, agy, unsafe_root, 1_000, bubblewrap_executable: bwrap)
+               Launcher.build(workspace_two, agy, unsafe_root, 1_000, launcher_opts)
 
       assert {:error, {:unsafe_antigravity_workspace, ^expected_root}} =
-               Launcher.build(unsafe_root, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
+               Launcher.build(unsafe_root, agy, profile_two, 1_000, launcher_opts)
     end
 
-    assert {:error, {:antigravity_directory_not_found, :profile_root, "/var/lib/agy-profile"}} =
-             Launcher.build(workspace_two, agy, "/var/lib/agy-profile", 1_000, bubblewrap_executable: bwrap)
+    assert {:ok, missing_profile} = SymphonyElixir.PathSafety.canonicalize("/var/lib/agy-profile")
+
+    assert {:error, {:antigravity_directory_not_found, :profile_root, ^missing_profile}} =
+             Launcher.build(workspace_two, agy, missing_profile, 1_000, launcher_opts)
 
     File.rm_rf!(root)
     File.rm_rf!(workspace_two)
@@ -284,8 +286,9 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   end
 
   test "masks the real home and projects only the canonical writable roots and AGY file" do
-    root = Path.join("/var/tmp", "symphony-antigravity-topology-#{System.unique_integer([:positive])}")
-    home = Path.expand(System.user_home!())
+    # Under /var/tmp, never the private /tmp mount, so no destination directories are created.
+    root = var_tmp_root("topology")
+    home = launcher_home!()
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
     agy = Path.join(root, "bin/agy")
@@ -295,11 +298,11 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     File.mkdir_p!(Path.dirname(agy))
     write_executable!(agy, "#!/bin/sh\nexit 0\n")
     write_executable!(bwrap, "#!/bin/sh\nexit 0\n")
-    assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, bubblewrap_executable: bwrap)
+    assert {:ok, launch} = Launcher.build(workspace, agy, profile, 1_234, bubblewrap_executable: bwrap, user_home: home)
 
     assert subsequence?(launch.args, ["--ro-bind", "/", "/"])
     assert subsequence?(launch.args, ["--tmpfs", "/tmp"])
-    assert_home_masked_or_private(launch.args, home)
+    assert subsequence?(launch.args, ["--tmpfs", home])
     refute subsequence?(launch.args, ["--dir", workspace])
     refute subsequence?(launch.args, ["--dir", profile])
     assert subsequence?(launch.args, ["--bind", workspace, workspace])
@@ -493,10 +496,17 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
     for {prompt, expected, secret} <- cases do
       {root, workspace, profile, agy} = setup_fake_agy!()
-      configure_backend!(agy, profile, first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100)
+
+      overrides =
+        if expected == :timeout,
+          do: [first_event_timeout_ms: 30, turn_timeout_ms: 200, cancel_grace_ms: 100],
+          else: []
+
+      configure_backend!(agy, profile, overrides)
       on_message = fn message -> send(self(), {:agy_message, message}) end
       issue = %{id: "issue-redaction", identifier: "JARVIS-907", title: "Redaction"}
       assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+      await_fake_ready!(session)
 
       result = Backend.run_turn(session, prompt, issue, on_message: on_message)
       assert_redacted_result(result, expected)
@@ -618,6 +628,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     on_message = fn message -> send(self(), {:agy_message, message}) end
 
     assert {:ok, session} = Backend.start_session(workspace, launcher: &direct_launcher/5)
+    await_fake_ready!(session)
 
     assert {:error, {:antigravity_turn_timeout, :first_event, terminal}} =
              Backend.run_turn(session, "silent", issue, on_message: on_message)
@@ -661,8 +672,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
           agent_backend: "antigravity",
           antigravity_executable: agy,
           antigravity_profile_root: profile,
-          antigravity_first_event_timeout_ms: 500,
-          antigravity_turn_timeout_ms: 1_000,
+          # Protocol tests are not startup microbenchmarks. Short deadlines are
+          # reserved for timeout tests, after the fake process proves readiness.
+          antigravity_first_event_timeout_ms: 5_000,
+          antigravity_turn_timeout_ms: 10_000,
           antigravity_cancel_grace_ms: 200
         ],
         overrides
@@ -701,6 +714,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     turn=0
     interrupted=0
     trap 'interrupted=1' INT
+    printf '%s' "$$" > "$PWD/fake-agy.ready"
     while IFS= read -r line; do
       turn=$((turn + 1))
       if [ "$turn" -eq 1 ]; then
@@ -796,14 +810,57 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     """)
   end
 
+  defp await_fake_ready!(session) do
+    path = Path.join(session.workspace, "fake-agy.ready")
+    expected = Integer.to_string(session.transport.process_group_id)
+    await_fake_ready!(path, expected, System.monotonic_time(:millisecond) + 5_000)
+  end
+
+  defp await_fake_ready!(path, expected, deadline) do
+    if File.read(path) != {:ok, expected} do
+      assert System.monotonic_time(:millisecond) < deadline, "fake AntiGravity did not become ready"
+      Process.sleep(10)
+      await_fake_ready!(path, expected, deadline)
+    end
+  end
+
   defp write_executable!(path, contents) do
     File.write!(path, contents)
     File.chmod!(path, 0o755)
   end
 
+  # Prefer the platform temporary directory: on Linux that is /tmp, which exercises the
+  # launcher's private /tmp destination handling. Fall back to the dedicated /var/tmp root
+  # only when it is not an accepted writable root, e.g. macOS's /var/folders.
   defp temporary_root(label) do
-    Path.join(System.tmp_dir!(), "symphony-antigravity-#{label}-#{System.unique_integer([:positive])}")
+    {:ok, tmp} = SymphonyElixir.PathSafety.canonicalize(System.tmp_dir!())
+    parent = if Enum.any?(["/tmp", "/var/tmp"], &path_within?(canonical_path!(&1), tmp)), do: tmp, else: var_tmp_parent()
+    Path.join(parent, unique_name("symphony-antigravity-#{label}"))
   end
+
+  # Always a dedicated /var/tmp path, never under the launcher's private /tmp mount.
+  defp var_tmp_root(label), do: Path.join(var_tmp_parent(), unique_name("symphony-antigravity-#{label}"))
+
+  # An explicit, existing operator home that the launcher must mask (it is outside /tmp).
+  defp launcher_home! do
+    root = var_tmp_root("home")
+    home = Path.join(root, "home")
+    File.mkdir_p!(home)
+    on_exit(fn -> File.rm_rf!(root) end)
+    home
+  end
+
+  defp var_tmp_parent, do: canonical_path!("/var/tmp")
+
+  defp canonical_path!(path) do
+    {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(path)
+    canonical
+  end
+
+  defp path_within?(root, path), do: Enum.take(Path.split(path), length(Path.split(root))) == Path.split(root)
+
+  # Randomness also prevents collisions with leftovers from an earlier BEAM run.
+  defp unique_name(prefix), do: prefix <> "-" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
   defp receive_messages(messages) do
     receive do
@@ -821,14 +878,6 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
 
   defp process_alive?(pid) do
     match?({_output, 0}, System.cmd("kill", ["-0", pid], stderr_to_stdout: true))
-  end
-
-  defp assert_home_masked_or_private(args, home) do
-    if Path.split(home) |> Enum.take(2) == ["/", "tmp"] do
-      refute subsequence?(args, ["--tmpfs", home])
-    else
-      assert subsequence?(args, ["--tmpfs", home])
-    end
   end
 
   defp subsequence?(list, expected) do
