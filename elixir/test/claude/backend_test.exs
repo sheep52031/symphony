@@ -8,8 +8,14 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
     @session_id "d1e57a6f-4207-4f86-8f25-3b51e1a20a85"
     @fixture Path.expand("fixtures/success.jsonl", __DIR__)
+    @startup_timeout_ms 5_000
 
-    setup do
+    setup_all do
+      {python, 0} = System.cmd("python3", ["-c", "import sys; print(sys.executable)"])
+      {:ok, python: String.trim(python)}
+    end
+
+    setup %{python: python} do
       suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
       root = Path.join(System.tmp_dir!(), "symphony-claude-#{suffix}")
       workspace = Path.join(root, "workspace")
@@ -17,7 +23,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       File.mkdir_p!(workspace)
       File.mkdir_p!(bin)
       script = Path.join(bin, "claude")
-      write_fake_claude!(script)
+      write_fake_claude!(script, python)
       previous_path = System.get_env("PATH")
       System.put_env("PATH", bin <> ":" <> previous_path)
       write_workflow_file!(Workflow.workflow_file_path(), agent_backend: "claude", workspace_root: root)
@@ -67,7 +73,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       File.mkdir_p!(Path.join(context.workspace, ".symphony"))
       File.write!(Path.join(context.workspace, ".symphony/auth-output-mode"), "stdin_eof")
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:ok, _} = Backend.run_turn(session, "stdin_eof", %{}, timeout_ms: 1_500)
+      assert {:ok, _} = Backend.run_turn(session, "stdin_eof", %{}, timeout_ms: @startup_timeout_ms)
       assert File.read!(Path.join(context.workspace, ".symphony/auth-stdin")) == ""
       assert File.read!(Path.join(context.workspace, ".symphony/turn-stdin")) == ""
       assert :ok = Backend.stop_session(session)
@@ -86,7 +92,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
       File.chmod!(path, 0o755)
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:ok, turn} = Backend.run_turn(session, "review", %{}, timeout_ms: 1_500)
+      assert {:ok, turn} = Backend.run_turn(session, "review", %{}, timeout_ms: @startup_timeout_ms)
       assert :ok = AgentBackend.validate_turn_result(turn)
       assert :ok = Backend.stop_session(session)
     end
@@ -268,7 +274,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert {:ok, session} = Backend.start_session(context.workspace)
       parent = self()
       task = Task.async(fn -> Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(parent, {:busy, event}) end) end)
-      assert_receive {:busy, %{event: :session_started}}, 2_000
+      assert_receive {:busy, %{event: :session_started}}, @startup_timeout_ms
       assert {:error, :claude_turn_in_progress} = Backend.run_turn(session, "second", %{}, [])
       assert :ok = Backend.stop_session(session)
       assert {:error, {:claude_session_exit, :normal}} = Task.await(task, 2_000)
@@ -287,7 +293,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       on_exit(fn -> Process.exit(owner, :kill) end)
       assert_receive {:owned_session, session}
       monitor = Process.monitor(session)
-      assert_receive {:owned, %{event: :session_started}}, 2_000
+      assert_receive {:owned, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
       Process.exit(owner, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, 2_000
@@ -305,7 +311,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         end)
 
       on_exit(fn -> Process.exit(caller, :kill) end)
-      assert_receive {:caller, %{event: :session_started}}, 2_000
+      assert_receive {:caller, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
       Process.exit(caller, :kill)
       assert_eventually(fn -> :sys.get_state(session).active == nil end)
@@ -388,15 +394,15 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       task =
         Task.async(fn ->
           Backend.run_turn(session, "hang", %{},
-            timeout_ms: 2_000,
+            timeout_ms: @startup_timeout_ms,
             on_message: fn event -> send(parent, {:streaming, event}) end
           )
         end)
 
-      assert_receive {:streaming, %{event: :session_started}}, 1_500
+      assert_receive {:streaming, %{event: :session_started}}, @startup_timeout_ms
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
       assert process_alive?(child)
-      assert {:error, :claude_turn_timeout} = Task.await(task, 3_000)
+      assert {:error, :claude_turn_timeout} = Task.await(task, @startup_timeout_ms + 1_000)
       assert_eventually(fn -> not process_alive?(child) end)
       assert :ok = Backend.stop_session(session)
     end
@@ -405,7 +411,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert {:ok, session} = Backend.start_session(context.workspace)
       caller = self()
       task = Task.async(fn -> Backend.run_turn(session, "hang", %{}, on_message: fn event -> send(caller, {:inflight, event}) end) end)
-      assert_receive {:inflight, %{event: :session_started}}, 2_000
+      assert_receive {:inflight, %{event: :session_started}}, @startup_timeout_ms
       assert :ok = Backend.stop_session(session)
       assert {:error, {:claude_session_exit, :normal}} = Task.await(task, 2_000)
       assert :ok = Backend.stop_session(session)
@@ -434,10 +440,7 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       end
     end
 
-    defp write_fake_claude!(path) do
-      {python, 0} = System.cmd("python3", ["-c", "import sys; print(sys.executable)"])
-      python = String.trim(python)
-
+    defp write_fake_claude!(path, python) do
       File.write!(path, """
       \#!#{python}
       import json, os, shutil, sys, time
