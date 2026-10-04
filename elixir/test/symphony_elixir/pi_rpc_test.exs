@@ -317,7 +317,12 @@ defmodule SymphonyElixir.Pi.RpcTest do
     """)
 
     assert {:error, :process_group_setup_failed} =
-             Rpc.start(workspace, script, env: [{~c"BASH_FUNC_printf%%", ~c"() { command printf invalid; }"}])
+             Rpc.start(workspace, script,
+               env: [
+                 {~c"BASH_FUNC_printf%%", ~c"() { command printf invalid; }"},
+                 {~c"BASH_FUNC_printf()", ~c"() { command printf invalid; }"}
+               ]
+             )
 
     worker_pid = eventually_read_pid!(worker_pid_path)
     refute eventually_process_alive?(worker_pid)
@@ -358,7 +363,8 @@ defmodule SymphonyElixir.Pi.RpcTest do
   end
 
   defp temp_root! do
-    root = Path.join(System.tmp_dir!(), "symphony-pi-rpc-#{System.unique_integer([:positive])}")
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    root = Path.join(System.tmp_dir!(), "symphony-pi-rpc-#{suffix}")
     File.mkdir_p!(root)
     root
   end
@@ -373,10 +379,10 @@ defmodule SymphonyElixir.Pi.RpcTest do
   defp eventually_read_pid!(_path, 0), do: flunk("timed out waiting for child pid")
 
   defp eventually_read_pid!(path, attempts) do
-    case File.read(path) do
-      {:ok, value} ->
-        String.trim(value) |> String.to_integer()
-
+    with {:ok, value} <- File.read(path),
+         {pid, ""} <- Integer.parse(String.trim(value)) do
+      pid
+    else
       _ ->
         Process.sleep(10)
         eventually_read_pid!(path, attempts - 1)

@@ -10,7 +10,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
     @fixture Path.expand("fixtures/success.jsonl", __DIR__)
 
     setup do
-      root = Path.join(System.tmp_dir!(), "symphony-claude-#{System.unique_integer([:positive])}")
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      root = Path.join(System.tmp_dir!(), "symphony-claude-#{suffix}")
       workspace = Path.join(root, "workspace")
       bin = Path.join(root, "bin")
       File.mkdir_p!(workspace)
@@ -379,8 +380,23 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
 
     test "absolute timeout stops a streaming child", context do
       assert {:ok, session} = Backend.start_session(context.workspace)
-      assert {:error, :claude_turn_timeout} = Backend.run_turn(session, "hang", %{}, timeout_ms: 250)
+      parent = self()
+
+      # The deadline includes auth preflight and two process launches. 250ms can
+      # expire before the print CLI even exists on macOS. Wait for observable
+      # streaming startup within a bounded budget before checking its cleanup.
+      task =
+        Task.async(fn ->
+          Backend.run_turn(session, "hang", %{},
+            timeout_ms: 2_000,
+            on_message: fn event -> send(parent, {:streaming, event}) end
+          )
+        end)
+
+      assert_receive {:streaming, %{event: :session_started}}, 1_500
       child = context.workspace |> Path.join(".symphony/cli-pid") |> File.read!() |> String.trim()
+      assert process_alive?(child)
+      assert {:error, :claude_turn_timeout} = Task.await(task, 3_000)
       assert_eventually(fn -> not process_alive?(child) end)
       assert :ok = Backend.stop_session(session)
     end

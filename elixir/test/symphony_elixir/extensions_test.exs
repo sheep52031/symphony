@@ -170,34 +170,37 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, manual_pid} = WorkflowStore.start_link()
     assert Process.alive?(manual_pid)
 
-    state = :sys.get_state(manual_pid)
-    File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
-    assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
-    assert returned_state.workflow.prompt == "Manual workflow prompt"
-    refute returned_state.stamp == nil
-    assert_receive :poll, 1_100
+    # Keep temporary service ownership inside this test even when an assertion
+    # fails; leaving the supervised store stopped causes suite-wide cascades.
+    try do
+      state = :sys.get_state(manual_pid)
+      File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
+      assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
+      assert returned_state.workflow.prompt == "Manual workflow prompt"
+      refute returned_state.stamp == nil
+      assert_receive :poll, 3_000
 
-    Workflow.set_workflow_file_path(missing_path)
-    assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
-    assert path_error_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+      Workflow.set_workflow_file_path(missing_path)
+      assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
+      assert path_error_state.workflow.prompt == "Manual workflow prompt"
+      assert_receive :poll, 3_000
 
-    Workflow.set_workflow_file_path(manual_path)
-    File.rm!(manual_path)
-    assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
-    assert removed_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+      Workflow.set_workflow_file_path(manual_path)
+      File.rm!(manual_path)
+      assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
+      assert removed_state.workflow.prompt == "Manual workflow prompt"
+      assert_receive :poll, 3_000
+    after
+      if Process.alive?(manual_pid), do: GenServer.stop(manual_pid)
+      Workflow.set_workflow_file_path(existing_path)
 
-    assert :ok = GenServer.stop(manual_pid)
+      restart_result = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
 
-    Workflow.set_workflow_file_path(existing_path)
+      assert match?({:ok, _pid}, restart_result) or
+               match?({:error, {:already_started, _pid}}, restart_result)
 
-    restart_result = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
-
-    assert match?({:ok, _pid}, restart_result) or
-             match?({:error, {:already_started, _pid}}, restart_result)
-
-    assert :ok = WorkflowStore.force_reload()
+      assert :ok = WorkflowStore.force_reload()
+    end
   end
 
   test "tracker delegates to memory and linear adapters" do

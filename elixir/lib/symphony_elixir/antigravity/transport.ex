@@ -14,10 +14,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
   @process_group_detection_attempts 400
   @graceful_close_ms 250
   @forced_close_ms 500
-  @bash_path "/usr/bin/bash"
-  @setsid_path "/usr/bin/setsid"
-  @kill_path "/usr/bin/kill"
-  @ps_path "/usr/bin/ps"
+  @bash_path if(File.exists?("/usr/bin/bash"), do: "/usr/bin/bash", else: "/bin/bash")
+  @kill_path if(File.exists?("/usr/bin/kill"), do: "/usr/bin/kill", else: "/bin/kill")
+  @ps_path if(File.exists?("/usr/bin/ps"), do: "/usr/bin/ps", else: "/bin/ps")
   @usage_fields ~w(input_tokens output_tokens thinking_tokens cache_read_tokens total_tokens)
   @secret_name_pattern ~r/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE[_-]?KEY)/i
 
@@ -102,7 +101,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
 
     with :ok <- prepare_runtime_file(stderr_path),
          :ok <- prepare_runtime_file(process_group_path),
-         :ok <- trusted_system_executable(@setsid_path, "setsid"),
+         prefix when is_binary(prefix) <- SymphonyElixir.ProcessSession.prefix("/usr/bin/setsid", "/usr/bin/perl"),
          :ok <- trusted_system_executable(@bash_path, "bash"),
          :ok <- trusted_system_executable(@kill_path, "kill"),
          :ok <- trusted_system_executable(@ps_path, "ps") do
@@ -112,7 +111,7 @@ defmodule SymphonyElixir.Antigravity.Transport do
         "umask 077; printf '%s' \"$$\" > #{shell_escape(process_group_path)}; exec #{command}"
 
       launch_command =
-        "exec #{shell_escape(@setsid_path)} --wait #{shell_escape(@bash_path)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
+        "exec #{prefix} #{shell_escape(@bash_path)} -c #{shell_escape(grouped_command)} 2> #{shell_escape(stderr_path)}"
 
       port =
         Port.open(
@@ -128,6 +127,9 @@ defmodule SymphonyElixir.Antigravity.Transport do
         )
 
       finalize_started_port(port, launch, stderr_path, process_group_path, opts)
+    else
+      nil -> {:error, {:antigravity_runtime_executable_not_found, "setsid or perl", "/usr/bin"}}
+      error -> error
     end
   end
 

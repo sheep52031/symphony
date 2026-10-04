@@ -153,7 +153,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
     home = Path.expand(System.user_home!())
     home_parent = Path.dirname(home)
     workspace = Path.join(root, "workspace")
-    workspace_two = Path.join(System.tmp_dir!(), "symphony-antigravity-workspace-two-#{System.unique_integer([:positive])}")
+    workspace_two = temporary_root("workspace-two")
     profile = Path.join(workspace, "profile")
     profile_two = Path.join(root, "profile-two")
     agy = Path.join(root, "agy")
@@ -216,8 +216,10 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
                Launcher.build(unsafe_root, agy, profile_two, 1_000, bubblewrap_executable: bwrap)
     end
 
-    assert {:error, {:antigravity_directory_not_found, :profile_root, "/var/lib/agy-profile"}} =
-             Launcher.build(workspace_two, agy, "/var/lib/agy-profile", 1_000, bubblewrap_executable: bwrap)
+    assert {:ok, missing_profile} = SymphonyElixir.PathSafety.canonicalize("/var/lib/agy-profile")
+
+    assert {:error, {:antigravity_directory_not_found, :profile_root, ^missing_profile}} =
+             Launcher.build(workspace_two, agy, missing_profile, 1_000, bubblewrap_executable: bwrap)
 
     File.rm_rf!(root)
     File.rm_rf!(workspace_two)
@@ -284,7 +286,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   end
 
   test "masks the real home and projects only the canonical writable roots and AGY file" do
-    root = Path.join("/var/tmp", "symphony-antigravity-topology-#{System.unique_integer([:positive])}")
+    root = temporary_root("topology")
     home = Path.expand(System.user_home!())
     workspace = Path.join(root, "workspace")
     profile = Path.join(root, "profile")
@@ -802,7 +804,11 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   end
 
   defp temporary_root(label) do
-    Path.join(System.tmp_dir!(), "symphony-antigravity-#{label}-#{System.unique_integer([:positive])}")
+    # Use a dedicated allowed root, not macOS's /var/folders temporary directory.
+    # Randomness also prevents collisions with leftovers from an earlier BEAM run.
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    {:ok, parent} = SymphonyElixir.PathSafety.canonicalize("/var/tmp")
+    Path.join(parent, "symphony-antigravity-#{label}-#{suffix}")
   end
 
   defp receive_messages(messages) do

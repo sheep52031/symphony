@@ -53,9 +53,11 @@ defmodule SymphonyElixir.Pi.BackendTest do
 
     on_exit(fn -> restore_env("PI_TEST_SECRET", previous_secret) end)
 
+    child_pid_path = Path.join(workspace, "child.pid")
+
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_backend: "pi",
-      pi_command: script,
+      pi_command: "sleep 30 & printf '%s' \"$!\" > '#{child_pid_path}'; #{script}",
       tracker_api_token: "$PI_TEST_SECRET",
       codex_turn_timeout_ms: 1_000
     )
@@ -87,7 +89,16 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert_receive {:pi_message, %{event: :usage, usage: %{"total_tokens" => 19}, backend: :pi}}
     assert_receive {:pi_message, %{event: :turn_completed, backend: :pi}}
 
+    child_pid = File.read!(child_pid_path) |> String.trim()
+    assert is_integer(session.rpc.process_group_id)
+    assert {pgid, 0} = System.cmd("ps", ["-o", "pgid=", "-p", child_pid])
+    assert String.trim(pgid) == Integer.to_string(session.rpc.process_group_id)
     assert :ok = Backend.stop_session(session)
+
+    assert_eventually!(fn ->
+      match?({_output, status} when status != 0, System.cmd("kill", ["-0", child_pid], stderr_to_stdout: true))
+    end)
+
     File.rm_rf!(root)
   end
 
@@ -340,7 +351,8 @@ defmodule SymphonyElixir.Pi.BackendTest do
   defp assert_eventually!(_predicate, 0), do: flunk("timed out waiting for Pi child to exit")
 
   defp setup_fake_pi! do
-    root = Path.join(System.tmp_dir!(), "symphony-pi-backend-#{System.unique_integer([:positive])}")
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    root = Path.join(System.tmp_dir!(), "symphony-pi-backend-#{suffix}")
     workspace = Path.join(root, "workspace")
     script = Path.join(root, "fake-pi")
     File.mkdir_p!(workspace)
