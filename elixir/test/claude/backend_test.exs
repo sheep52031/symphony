@@ -359,6 +359,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert payload == String.slice(text, 0, 2_000)
       assert File.read!(result_file(context.workspace)) == text
       assert Bitwise.band(File.stat!(result_file(context.workspace)).mode, 0o777) == 0o600
+      # The private directory is closed to other users, whatever the umask, so a temporary file can never be reached.
+      assert Bitwise.band(File.stat!(Path.dirname(result_file(context.workspace))).mode, 0o777) == 0o700
 
       # The status API shows the same 2000 characters, not the 140-character event summary.
       expected = payload |> String.replace("\n", " ") |> String.trim()

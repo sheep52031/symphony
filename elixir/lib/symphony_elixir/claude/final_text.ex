@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Claude.FinalText do
   @summary_characters 2_000
   @file_bytes 65_536
   @file_mode 0o600
+  @directory_mode 0o700
   @relative_path ".symphony/claude/last-result.txt"
 
   @doc "The first #{@summary_characters} characters of the final text, or nil when the turn produced none."
@@ -52,21 +53,35 @@ defmodule SymphonyElixir.Claude.FinalText do
     end
   end
 
-  # The workspace is writable by the child, so never follow a path it could have pre-created: write
-  # an exclusive private temporary file, then rename it over the destination (rename replaces a
-  # symlink instead of following it). The mode is set before any text is written.
+  # The workspace is writable by the child, so never follow a path it could have pre-created and never
+  # expose the text to another user. The private directory is mode 0700 (other users cannot even reach
+  # the temporary file, whatever the umask), the temporary file is created exclusively under a random
+  # name, chmod to 0600 BEFORE any text is written, and the text goes through that same open file
+  # descriptor (the path is never reopened). Finally rename replaces a symlink instead of following it.
   defp write_private(path, text) do
+    directory = Path.dirname(path)
     temporary = path <> "." <> Base.url_encode64(:crypto.strong_rand_bytes(6), padding: false) <> ".tmp"
 
-    with :ok <- File.write(temporary, "", [:exclusive]),
-         :ok <- File.chmod(temporary, @file_mode),
-         :ok <- File.write(temporary, text),
-         :ok <- File.rename(temporary, path) do
-      :ok
-    else
-      {:error, _reason} = error ->
-        _ = File.rm(temporary)
-        error
+    with :ok <- File.mkdir_p(directory),
+         :ok <- File.chmod(directory, @directory_mode),
+         {:ok, io} <- File.open(temporary, [:write, :exclusive, :binary]) do
+      written = write_through(io, temporary, text)
+      _ = File.close(io)
+
+      with :ok <- written,
+           :ok <- File.rename(temporary, path) do
+        :ok
+      else
+        {:error, _reason} = error ->
+          _ = File.rm(temporary)
+          error
+      end
+    end
+  end
+
+  defp write_through(io, temporary, text) do
+    with :ok <- File.chmod(temporary, @file_mode) do
+      IO.binwrite(io, text)
     end
   end
 end
