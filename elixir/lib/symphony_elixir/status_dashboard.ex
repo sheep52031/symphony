@@ -1085,6 +1085,11 @@ defmodule SymphonyElixir.StatusDashboard do
   @spec humanize_codex_message(term()) :: String.t()
   def humanize_codex_message(nil), do: "no codex message yet"
 
+  # A turn_completed message that is plain text is a backend's already bounded final assistant
+  # text (Claude, 2000 characters). Show it whole rather than at the 140-character event width.
+  def humanize_codex_message(%{event: :turn_completed, message: text}) when is_binary(text),
+    do: humanize_codex_payload(text)
+
   def humanize_codex_message(%{event: event, message: message}) do
     payload = unwrap_codex_message_payload(message)
 

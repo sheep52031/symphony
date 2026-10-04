@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Claude.Backend do
 
   @behaviour SymphonyElixir.AgentBackend
 
-  alias SymphonyElixir.{Claude.Stream, Config, Workflow}
+  alias SymphonyElixir.{Claude.FinalText, Claude.Stream, Config, Workflow}
 
   @impl true
   def validate_config(%{worker: %{ssh_hosts: hosts}} = settings) do
@@ -61,7 +61,9 @@ defmodule SymphonyElixir.Claude.Backend do
         await_turn(session, monitor, ref, on_message)
 
       {:claude_stream, ^ref, {:done, {:ok, result}}} ->
-        emit(on_message, :turn_completed, result, %{session_id: result["session_id"]})
+        # The orchestrator keeps this payload as the issue's last message. The final assistant text
+        # is the verdict; the full result event already reached the caller as an earlier update.
+        emit(on_message, :turn_completed, FinalText.summary(result) || result, %{session_id: result["session_id"]})
         {:ok, %{session_id: result["session_id"], result: result, backend: :claude}}
 
       {:claude_stream, ^ref, {:done, {:error, reason}}} ->

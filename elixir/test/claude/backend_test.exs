@@ -313,6 +313,135 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       assert length(calls(Path.join(context.root, "JARVIS-1198"))) == 1
     end
 
+    test "the final assistant text is the turn_completed payload, the file content and the held API message", context do
+      lines = [
+        "VERDICT: PASS",
+        "evidence: mix test, 0 failures",
+        "evidence: mix format --check-formatted, clean",
+        "evidence: the diff stays inside elixir/lib/symphony_elixir/claude and its tests",
+        "evidence: no environment value or credential is read, logged or written"
+      ]
+
+      text = Enum.join(lines, "\n")
+      assert String.length(text) > 140
+      write_result_text!(context.workspace, text)
+      held = hold_issue!(context, "JARVIS-HELD")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, turn} = Backend.run_turn(session, "custom_result", %{}, on_message: held.on_message)
+      assert turn.result["result"] == text
+
+      # The exact field the orchestrator keeps as the issue's last message.
+      assert_receive {:update, %{event: :turn_completed, payload: payload, session_id: @session_id}}
+      assert payload == text
+      assert File.read!(result_file(context.workspace)) == text
+
+      expected = Enum.join(lines, " ")
+      assert {:ok, %{status: "held", held: held_payload, recent_events: [recent]}} = held.payload.()
+      assert held_payload.last_event == :turn_completed
+      assert held_payload.last_message == expected
+      assert recent.message == expected
+      assert %{held: [%{last_message: ^expected}]} = held.state_payload.()
+      refute held_payload.last_message =~ "session started"
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "a long final text is truncated to 2000 characters in the update but complete in the 0600 file", context do
+      text = "VERDICT: PASS\n" <> String.duplicate("evidence line with a ü and 日本語 characters\n", 300)
+      assert String.length(text) > 2_000 and byte_size(text) < 65_536
+      write_result_text!(context.workspace, text)
+      held = hold_issue!(context, "JARVIS-LONG")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, turn} = Backend.run_turn(session, "custom_result", %{}, on_message: held.on_message)
+      assert turn.result["result"] == text
+
+      assert_receive {:update, %{event: :turn_completed, payload: payload}}
+      assert String.length(payload) == 2_000
+      assert payload == String.slice(text, 0, 2_000)
+      assert File.read!(result_file(context.workspace)) == text
+      assert Bitwise.band(File.stat!(result_file(context.workspace)).mode, 0o777) == 0o600
+
+      # The status API shows the same 2000 characters, not the 140-character event summary.
+      expected = payload |> String.replace("\n", " ") |> String.trim()
+      assert {:ok, %{held: %{last_message: ^expected}}} = held.payload.()
+      assert String.length(expected) >= 1_999
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "the result file is capped at 64 KiB on a character boundary", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      for {text, expected} <- [
+            {String.duplicate("a", 70_000), String.duplicate("a", 65_536)},
+            {String.duplicate("€", 30_000), String.duplicate("€", 21_845)}
+          ] do
+        write_result_text!(context.workspace, text)
+        assert {:ok, _} = run_custom_turn(session)
+        assert_receive {:update, %{event: :turn_completed, payload: payload}}
+        assert String.length(payload) == 2_000
+        assert File.read!(result_file(context.workspace)) == expected
+        assert byte_size(expected) <= 65_536
+      end
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "the result file is overwritten per turn, replaces a planted symlink and ignores failed turns", context do
+      sentinel = Path.join(context.root, "sentinel")
+      File.write!(sentinel, "untouched")
+      directory = Path.dirname(result_file(context.workspace))
+      File.mkdir_p!(directory)
+      File.ln_s!(sentinel, result_file(context.workspace))
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      for text <- ["first verdict", "second verdict"] do
+        write_result_text!(context.workspace, text)
+        assert {:ok, _} = run_custom_turn(session)
+        assert File.read!(result_file(context.workspace)) == text
+      end
+
+      assert File.read!(sentinel) == "untouched"
+      assert {:ok, %File.Stat{type: :regular}} = File.lstat(result_file(context.workspace))
+      assert {:error, {:claude_exit, 23}} = Backend.run_turn(session, "exit_nonzero", %{}, [])
+      assert File.read!(result_file(context.workspace)) == "second verdict"
+      refute Enum.any?(File.ls!(directory), &String.ends_with?(&1, ".tmp"))
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "a successful turn without final text keeps the result event as payload and clears the file", context do
+      write_result_text!(context.workspace, "VERDICT: PASS")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+      assert {:ok, _} = run_custom_turn(session)
+      assert File.read!(result_file(context.workspace)) == "VERDICT: PASS"
+
+      for {prompt, blank} <- [{"custom_result", " \n "}, {"result_without_text", nil}] do
+        if blank, do: write_result_text!(context.workspace, blank)
+        assert {:ok, _} = run_custom_turn(session, prompt)
+        assert_receive {:update, %{event: :turn_completed, payload: %{"type" => "result", "session_id" => @session_id}}}
+        assert File.read!(result_file(context.workspace)) == ""
+        write_result_text!(context.workspace, "VERDICT: PASS")
+        assert {:ok, _} = run_custom_turn(session)
+      end
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "an unwritable result file neither fails the turn nor hides the summary and logs no text", context do
+      File.mkdir_p!(result_file(context.workspace))
+      write_result_text!(context.workspace, "VERDICT: PASS")
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _} = run_custom_turn(session)
+        end)
+
+      assert_receive {:update, %{event: :turn_completed, payload: "VERDICT: PASS"}}
+      assert log =~ "Claude final result file not written session_id=\"#{@session_id}\" reason=:"
+      refute log =~ "VERDICT"
+      refute Enum.any?(File.ls!(Path.dirname(result_file(context.workspace))), &String.ends_with?(&1, ".tmp"))
+      assert :ok = Backend.stop_session(session)
+    end
+
     test "scrubs ambient secrets and provider routing without reading any credential file", context do
       names = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BASE_URL", "CLAUDE_TEST_SECRET"]
 
@@ -594,6 +723,76 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       if Keyword.get(opts, :reload, true), do: assert(:ok == WorkflowStore.force_reload())
     end
 
+    # Runs an issue through the real orchestrator: updates are forwarded exactly as AgentRunner does,
+    # then the normal exit puts the issue on hold, which is where reviewer verdicts are read.
+    defp hold_issue!(context, identifier) do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_backend: "claude",
+        workspace_root: context.root,
+        tracker_kind: "memory",
+        hold_after_normal_completion: true
+      )
+
+      assert :ok = WorkflowStore.force_reload()
+      name = Module.concat(__MODULE__, :"Orchestrator#{System.unique_integer([:positive])}")
+      {:ok, pid} = Orchestrator.start_link(name: name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+      issue = %Issue{id: "id-" <> identifier, identifier: identifier, state: "In Progress", url: "https://example.org/issues/" <> identifier, dispatchable: true}
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      ref = make_ref()
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: identifier,
+        issue: issue,
+        backend: :claude,
+        session_id: nil,
+        last_codex_message: nil,
+        last_codex_timestamp: nil,
+        last_codex_event: nil,
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_total_tokens: 0,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue.id => running_entry})
+        |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue.id))
+      end)
+
+      hold = fn ->
+        send(pid, {:DOWN, ref, :process, self(), :normal})
+        assert_eventually(fn -> match?(%{blocked: [_]}, Orchestrator.snapshot(name, 1_000)) end)
+      end
+
+      %{
+        on_message: fn update ->
+          send(self(), {:update, update})
+          send(pid, {:codex_worker_update, issue.id, Map.put_new(update, :backend, :claude)})
+        end,
+        payload: fn ->
+          hold.()
+          SymphonyElixirWeb.Presenter.issue_payload(identifier, name, 1_000)
+        end,
+        state_payload: fn -> SymphonyElixirWeb.Presenter.state_payload(name, 1_000) end
+      }
+    end
+
+    defp write_result_text!(workspace, text) do
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/result-text"), text)
+    end
+
+    defp result_file(workspace), do: Path.join(workspace, ".symphony/claude/last-result.txt")
+
+    defp run_custom_turn(session, prompt \\ "custom_result") do
+      Backend.run_turn(session, prompt, %{}, on_message: fn update -> send(self(), {:update, update}) end)
+    end
+
     defp require_config_dir!(workspace, config_dir) do
       File.mkdir_p!(Path.join(workspace, ".symphony"))
       File.write!(Path.join(workspace, ".symphony/required-config-dir"), config_dir)
@@ -713,6 +912,11 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
       with open(#{inspect(@fixture)}) as f:
           events = [json.loads(line) for line in f]
       if prompt == 'result_error': events[-1]['is_error'] = True
+      if prompt == 'result_without_text': del events[-1]['result']
+      if prompt == 'custom_result':
+          with open('.symphony/result-text', encoding='utf-8') as f: final_text = f.read()
+          events[-1]['result'] = final_text
+          events[-2]['message']['content'][0]['text'] = final_text
       if prompt == 'fragmented':
           events.insert(1, {'type': 'system', 'subtype': 'api_retry', 'error': 'overloaded'})
           events[-2]['message']['content'] = [{'type': 'tool_use', 'id': 'tool_fixture', 'name': 'Read', 'input': {}}, {'type': 'text', 'text': 'a' * 1048577}]

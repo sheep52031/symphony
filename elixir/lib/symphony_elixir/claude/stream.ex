@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Claude.Stream do
 
   use GenServer
 
+  alias SymphonyElixir.Claude.FinalText
   alias SymphonyElixir.Pi.Rpc
 
   @max_line_bytes 4_194_304
@@ -192,9 +193,14 @@ defmodule SymphonyElixir.Claude.Stream do
     Process.cancel_timer(active.timer)
     Process.demonitor(active.caller_monitor, [:flush])
     close_transport(active.transport)
+    persist_final_text(state.workspace, outcome)
     send(active.caller, {:claude_stream, active.ref, {:done, outcome}})
     {:noreply, %{state | active: nil}}
   end
+
+  # Before the caller is told the turn is done, so the file exists whenever turn_completed is seen.
+  defp persist_final_text(workspace, {:ok, result}), do: FinalText.write(workspace, result)
+  defp persist_final_text(_workspace, {:error, _reason}), do: :ok
 
   defp exit_outcome(status, result, stderr_path) do
     stderr =
