@@ -57,6 +57,14 @@ deadline, including auth preflight. Stderr is retained in
 sending Pi RPC messages or changing Pi behavior; dedicated process groups are cleaned up even after
 the CLI exits. No tracker tools are injected. Scheduler retry policy is unchanged and stays on Claude.
 
+A reviewer's verdict is the turn's final assistant text, and it is visible without opening Claude's own
+transcript. When a turn succeeds, the dashboard and the `last_message` of `GET /api/v1/state` and
+`GET /api/v1/<ISSUE>` (including a held issue's `held.last_message`) show its first 2000 characters
+instead of `session started (<id>)`, with line breaks collapsed to spaces. The full text, capped at
+64 KiB, is written with mode `0600` to `<workspace>/.symphony/claude/last-result.txt`, overwritten by
+each successful turn; a failed turn leaves the previous file untouched. Nothing but that text is
+written, and a failed file write is logged without its content and does not fail the turn.
+
 Symphony passes `CLAUDE_CONFIG_DIR` to both auth preflight and the turn, independently of the child's
 HOME. `claude.config_dir` overrides the operator process's `CLAUDE_CONFIG_DIR`, otherwise the default
 is `<operator HOME>/.claude`. The path is captured at session start; Symphony never reads, copies,
