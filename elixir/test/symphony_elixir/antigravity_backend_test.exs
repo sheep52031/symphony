@@ -14,7 +14,7 @@ defmodule SymphonyElixir.Antigravity.BackendTest do
   end
 
   test "registers AntiGravity without changing the Codex default or Pi support" do
-    assert MapSet.new(AgentBackend.supported_names()) == MapSet.new(["antigravity", "codex", "pi"])
+    assert MapSet.subset?(MapSet.new(["antigravity", "codex", "pi"]), MapSet.new(AgentBackend.supported_names()))
     assert {:ok, :antigravity, Backend} = AgentBackend.resolve("antigravity")
     assert {:ok, :pi, SymphonyElixir.Pi.Backend} = AgentBackend.resolve("pi")
 

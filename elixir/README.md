@@ -34,6 +34,33 @@ Symphony uses Pi's native RPC/session lifecycle only: it does not inject tracker
 bridge, or a host-side handoff into Pi. Configured tracker credential environment names are removed
 from the Pi child, while tracker polling and lifecycle mutations remain owned by Symphony.
 
+Set `agent.backend: claude` for local Claude Code reviews using the official `claude` executable on
+PATH. Symphony checks `claude auth status --json` for `authMethod: "claude.ai"` before each turn,
+then runs `claude -p --output-format stream-json --verbose --include-partial-messages`.
+The prompt is passed as an argument; auth preflight and print mode get stdin EOF via `/dev/null`,
+rather than waiting on the process launcher's open RPC input pipe. A Claude-local shell gate holds
+launch until process-group registration completes, so even an immediately exiting CLI is supported.
+It never reads or copies credential files, passes `--model`, logs in, or falls back to API billing,
+another model, or another backend. The operator's saved default model applies. API-key, bearer-token,
+and cloud-provider environment selectors are removed and overridden in CLI settings; a non-plan
+login, auth failure, quota message, or nonzero exit produces a typed failure. SSH workers are rejected.
+Safe mode disables hooks/plugins/project customizations while preserving CLI auth/model defaults;
+`dontAsk` denies interactive approvals and strict MCP configuration excludes ambient MCP servers.
+Use a current Claude Code version supporting these flags (verified against local `claude --help`).
+Turns resume the CLI session with `--resume`; success requires both a successful `result` with a
+nonblank session ID and exit status zero. `codex.turn_timeout_ms` supplies the absolute Claude turn
+deadline, including auth preflight; no new configuration section is required. Stderr is retained in
+`<workspace>/.symphony/claude/turn.stderr.log`. The existing Pi process launcher is reused without
+sending Pi RPC messages or changing Pi behavior; dedicated process groups are cleaned up even after
+the CLI exits. No tracker tools are injected. Scheduler retry policy is unchanged and stays on Claude.
+
+Tests use a fake executable and stored, official-schema-shaped stream samples, not live service calls.
+The real `claude -p` canary under Symphony's sandbox is owner-gated: rewritten HOME may hide the
+operator's login. Do not copy login files into the sandbox or log in automatically to resolve this gap.
+Protocol references: [headless usage](https://code.claude.com/docs/en/headless),
+[CLI reference](https://code.claude.com/docs/en/cli-reference), and
+[message types](https://code.claude.com/docs/en/agent-sdk/typescript#sdkmessage).
+
 Set `agent.backend` to `antigravity` only on the accepted native Linux route. It is a local-only,
 opt-in backend that speaks AntiGravity's native NDJSON protocol. It requires absolute paths for the
 `agy` executable and one explicit profile root. Optional `antigravity.model` and `antigravity.effort`
@@ -272,8 +299,8 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the execution adapter and defaults to `codex`. `pi` and `antigravity`
-  are explicit, local-only opt-ins in this fork; configured SSH workers are rejected for both.
+- `agent.backend` selects the execution adapter and defaults to `codex`. `pi`, `claude`, and
+  `antigravity` are explicit, local-only opt-ins in this fork; configured SSH workers are rejected.
 - Pi completion waits for the authoritative `agent_settled` event; `agent_end` with `willRetry: false`
   is not treated as final evidence. Pi returns lifecycle outcomes and neutral session/runtime evidence
   only; it does not receive a tracker bridge, host handoff path, or receipt store.

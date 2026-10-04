@@ -28,7 +28,8 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
-  # Keep the default on Codex; Pi and AntiGravity are explicit local-only opt-ins.
+  # Keep the default on Codex; pi, claude, and antigravity are explicit local-only opt-ins.
+  # claude uses the logged-in official CLI on PATH and the operator's default model; no API fallback.
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
