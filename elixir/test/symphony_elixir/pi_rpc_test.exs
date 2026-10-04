@@ -201,7 +201,7 @@ defmodule SymphonyElixir.Pi.RpcTest do
       case "$line" in
         *'"type":"prompt"'*)
           i=0
-          while [ "$i" -lt 50 ]; do
+          while [ "$i" -lt 150 ]; do
             printf '%s\\n' '{"type":"heartbeat"}'
             sleep 0.01
             i=$((i + 1))
@@ -217,7 +217,9 @@ defmodule SymphonyElixir.Pi.RpcTest do
     assert {:error, :timeout} =
              Rpc.request(session, "prompt", %{"message" => "chatter"}, timeout_ms: 60)
 
-    assert System.monotonic_time(:millisecond) - started_at < 300
+    # The request timeout is 60 ms and the fake Pi chatters for about 1.5 s. If chatter extended the timeout the
+    # request would last at least that long; a 1 s ceiling separates the two cases with wide margins.
+    assert System.monotonic_time(:millisecond) - started_at < 1_000
     assert :ok = Rpc.close(session)
     File.rm_rf!(test_root)
   end

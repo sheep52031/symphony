@@ -750,6 +750,8 @@ if "claude" in SymphonyElixir.AgentBackend.supported_names() do
         identifier: identifier,
         issue: issue,
         backend: :claude,
+        backend_route_explicit?: false,
+        worker_host: nil,
         session_id: nil,
         last_codex_message: nil,
         last_codex_timestamp: nil,

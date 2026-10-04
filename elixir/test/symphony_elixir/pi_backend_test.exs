@@ -331,7 +331,7 @@ defmodule SymphonyElixir.Pi.BackendTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       agent_backend: "pi",
       pi_command: script,
-      pi_request_timeout_ms: 1_000,
+      pi_request_timeout_ms: 5_000,
       pi_first_event_timeout_ms: 200,
       pi_turn_timeout_ms: 70
     )
@@ -343,8 +343,11 @@ defmodule SymphonyElixir.Pi.BackendTest do
     assert {:error, {:turn_timeout, {:absolute_turn_deadline, :abort_acknowledged}}} =
              Backend.run_turn(session, "chatter", issue, [])
 
+    # The fake Pi is a single-threaded shell: it cannot read the abort request until its heartbeat loop ends, so
+    # the abort acknowledgement arrives after about 250 ms (more on a loaded machine). The request timeout above
+    # and this ceiling are therefore generous hang guards; the exact error above is what proves the deadline held.
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
-    assert elapsed_ms < 750
+    assert elapsed_ms < 4_000
     assert :ok = Backend.stop_session(session)
     File.rm_rf!(root)
   end
