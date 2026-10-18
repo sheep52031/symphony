@@ -93,6 +93,25 @@ Protocol references: [headless usage](https://code.claude.com/docs/en/headless),
 [CLI reference](https://code.claude.com/docs/en/cli-reference), and
 [message types](https://code.claude.com/docs/en/agent-sdk/typescript#sdkmessage).
 
+Set `agent.backend: deepseek` to run turns through the DeepSeek Harness (`dsh`, 0.2.0-rc.2 or later)
+as a local-only opt-in. Each turn runs `<deepseek.command> --profile headless --json [--session-id <id>] -`
+in the issue workspace with the prompt on stdin. The first turn's session id is resumed on later turns.
+`deepseek.dsh_home` is required and must not be `~/.dsh`; Symphony sets it as `DSH_HOME` and never reads
+the harness state inside it. `DEEPSEEK_API_KEY` is the only secret-named variable passed through; it is
+supplied by the operator's wrapper or environment and its value is never read or logged. Symphony scrubs
+other secret-named variables from the child. A turn fails with a typed error on a non-zero exit, a
+turn end whose reason is not `completed`, a missing final event, an unknown session id, a bad or oversized
+JSON line, the turn timeout (`codex.turn_timeout_ms`), or silence longer than `agent.stall_timeout_ms`;
+the harness process group is then terminated. Usage is reported as a session running total.
+
+```yaml
+agent:
+  backend: deepseek
+deepseek:
+  command: /absolute/path/to/dsh-wrapper
+  dsh_home: /absolute/path/to/deepseek-harness-state
+```
+
 Worker-host eligibility is evaluated together with the selected backend. Codex may use the local
 host or a configured `worker.ssh_hosts` entry; Pi and AntiGravity always use the local host, even
 when SSH workers are configured for Codex. Per-host capacity limits apply only to that SSH host and
@@ -369,7 +388,7 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the default execution adapter and defaults to `codex`. `pi`, `claude`, and
+- `agent.backend` selects the default execution adapter and defaults to `codex`. `pi`, `claude`, `deepseek`, and
   `antigravity` are local-only opt-ins in this fork. A workflow may configure SSH workers for
   Codex while routing exact issue identifiers to local Pi/AntiGravity; a global Pi/Claude/AntiGravity
   default with configured SSH workers remains invalid.
