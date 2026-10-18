@@ -143,6 +143,17 @@ if "deepseek" in SymphonyElixir.AgentBackend.supported_names() do
       assert :ok = Backend.stop_session(session)
     end
 
+    test "a stalled turn also terminates grandchild processes of the harness", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:error, :deepseek_stall_timeout} =
+               Backend.run_turn(session, "grandchild", %{}, timeout_ms: 5_000, stall_timeout_ms: 400)
+
+      pid = context.workspace |> Path.join(".symphony/deepseek/grandchild-pid") |> File.read!() |> String.trim()
+      assert_eventually(fn -> not process_alive?(pid) end)
+      assert :ok = Backend.stop_session(session)
+    end
+
     test "a zero stall timeout disables the silence watchdog", context do
       assert {:ok, session} = Backend.start_session(context.workspace)
       assert {:ok, _} = Backend.run_turn(session, "ok", %{}, run_options(self(), stall_timeout_ms: 0))
@@ -325,6 +336,11 @@ if "deepseek" in SymphonyElixir.AgentBackend.supported_names() do
           hang)
             printf '{"type":"session","sessionId":"%s","cwd":"%s"}\n' "$session" "$PWD"
             echo $$ > .symphony/deepseek/pid
+            sleep 60
+            ;;
+          grandchild)
+            printf '{"type":"session","sessionId":"%s","cwd":"%s"}\n' "$session" "$PWD"
+            (sleep 300 </dev/null >/dev/null 2>&1 & echo $! > .symphony/deepseek/grandchild-pid)
             sleep 60
             ;;
           partial-usage)
