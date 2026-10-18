@@ -87,7 +87,7 @@ defmodule SymphonyElixir.AgentBackendContractTest do
     assert routed.agent.issue_backends == %{"JARVIS-979-PI" => "pi"}
 
     assert {:error, {:invalid_workflow_config, message}} =
-             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{"JARVIS-979-X" => "deepseek"}}})
+             Config.Schema.parse(%{"agent" => %{"issue_backends" => %{"JARVIS-979-X" => "unknown"}}})
 
     assert message =~ "issue_backends"
 
