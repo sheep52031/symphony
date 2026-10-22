@@ -162,7 +162,7 @@ JARVIS-3794（S5）。母票 JARVIS-3789。本文件只記錄現況，不改任�
 
 每一步的驗收：`mix test` 在預設設定下，與 `upstream/main` 的測試結果相同；fork 的 `make all` 通過。
 
-## 4. 禁區（S2、S3 必須遵守）
+## 4. 禁區（S2、S3、S6 必須遵守）
 
 目標：新的 patch 不能擴大第 2 節那張表的 diff，否則第 3 節的順序會被堵死。
 
@@ -199,20 +199,43 @@ S2 不得：動 `linear/client.ex`（`awaiting_owner_reply?` 之外的查詢欄�
 
 ### 4.4 禁區區段一覽
 
-| 檔案 | 區段 | S2 | S3 |
-| --- | --- | --- | --- |
-| `orchestrator.ex` | `handle_agent_down(:normal …)` 的 `cond` | 禁止 | **允許，一個子句** |
-| `orchestrator.ex` | `should_dispatch_issue?`／`choose_issues` | **允許，一處** | 禁止 |
-| `orchestrator.ex` | O2、O3、O6–O15 其餘所有區段 | 禁止 | 禁止 |
-| `config/schema.ex` | `Agent` embed 的 field／cast 清單 | **允許，一個旗標** | **允許，一個旗標** |
-| `config/schema.ex` | 其餘（validators、`finalize_settings`、`Pi`／`Antigravity` embed） | 禁止 | 禁止 |
-| `config.ex` | 新增存取器一個 | **允許** | **允許** |
-| `config.ex` | 其餘 | 禁止 | 禁止 |
-| `agent_runner.ex`、`workspace.ex`、`linear/client.ex`、`tracker/issue.ex` | 全部 | 禁止 | 禁止 |
-| A 組（所有後端與 `agent_backend.ex`） | 全部 | 禁止 | 禁止 |
-| 新模組（`dispatch_lint.ex`、`verify_gate.ex` 等） | 新增 | **允許** | **允許** |
+| 檔案 | 區段 | S2 | S3 | S6 |
+| --- | --- | --- | --- | --- |
+| `orchestrator.ex` | `handle_agent_down(:normal …)` 的 `cond` | 禁止 | **允許，一個子句** | **允許，改寫該子句一處**（見 4.5） |
+| `orchestrator.ex` | `should_dispatch_issue?`／`choose_issues` | **允許，一處** | 禁止 | **允許，換掉最後一項**（見 4.5） |
+| `orchestrator.ex` | O2、O3、O6–O15 其餘所有區段 | 禁止 | 禁止 | 禁止 |
+| `config/schema.ex` | `Agent` embed 的 field／cast 清單 | **允許，一個旗標** | **允許，一個旗標** | **允許，三個旗標** |
+| `config/schema.ex` | 其餘（validators、`finalize_settings`、`Pi`／`Antigravity` embed） | 禁止 | 禁止 | 禁止 |
+| `config.ex` | 新增存取器 | **允許，一個** | **允許，一個** | **允許，三個** |
+| `config.ex` | 其餘 | 禁止 | 禁止 | 禁止 |
+| `agent_runner.ex`、`workspace.ex`、`linear/client.ex`、`tracker/issue.ex` | 全部 | 禁止 | 禁止 | 禁止 |
+| A 組（所有後端與 `agent_backend.ex`） | 全部 | 禁止 | 禁止 | 禁止 |
+| 新模組（`dispatch_lint.ex`、`verify_gate.ex`、`state_extras.ex`、`verify_gate_rework.ex` 等） | 新增 | **允許** | **允許** | **允許** |
+| `presenter.ex`、`dashboard_live.ex`（C1，不在 4.1 核心清單） | 見 4.5 | — | — | **允許，最小行數** |
 
 S1（`after_run` 驗證腳本，純 config）不動 `lib/`，不受本節約束；若 S1 需要改 `workspace.ex` 的 hook 行為，要先在母票上提出。
+
+### 4.5 S6 允許動的位置
+
+S6（JARVIS-3796）把 S1–S5 已存在的零件接上線：STOP 檔、嘗試欄位、閘門失敗轉 Rework。三項都是旗標，預設 `false`，旗標關閉時行為與 `a78e2e6` 相同。
+
+| 檔案 | 呼叫點 | 預算 |
+| --- | --- | --- |
+| `orchestrator.ex` | `should_dispatch_issue?` 述詞鏈：把最後一項 `DispatchLint.dispatch_allowed?(issue)` 換成 `DispatchGate.allowed?(issue)`（新模組，先問 STOP 檔再問 lint）。述詞鏈不多一個 `and`，因為 credo 的複雜度上限是 9，加一個 `and` 會超過 | +1／−1 |
+| `orchestrator.ex` | `handle_agent_down(:normal …)` 的 S3 子句：把 `VerifyGate.hold_reason(…)` 換成 `VerifyGateRework.hold(…)`，回傳 `{reason, disposition}`，不新增子句 | +3／−2（兩處合計 +4／−3，預算上限 +6／−3） |
+| `config/schema.ex` | `Agent` embed 加 `stop_file_enabled`、`attempt_fields_enabled`、`verify_gate_rework_enabled` 三個 field 與 cast 各一行 | +6 |
+| `config.ex` | 三個存取器（各含 `@spec`） | +9 |
+| `presenter.ex`（C1） | `state_payload` 一個 `Map.merge`；`retry_entry_payload`、`blocked_entry_payload` 各接一個 `StateExtras.put_attempt_fields/2`，邏輯全在 `StateExtras` | +4／−1 |
+| `dashboard_live.ex`（C1） | `stopped` 時顯示一個橫幅區塊 | +7 |
+
+新模組：`dispatch_gate.ex`（STOP 檔加 lint 的單一入口）、`state_extras.ex`（`stopped` 與嘗試欄位的投影）、`verify_gate_rework.ex`（失敗時留言、轉 Rework／Human Review 與計次）。`stop_file.ex` 加 `dispatch_blocked?/0`。
+
+規則：
+
+- 旗標為 `false` 時 `/api/v1/state` 的 JSON 與現況逐位元相同（新鍵不出現），S3 的 `:normal_completion_hold` 行為不變。
+- 不新增 disposition：達到 `agent.max_attempts_per_issue` 時用既有的 `:attempt_limit_hold`，它的 `hold_released_by_config?` 子句已存在（預算不再用盡就釋放），所以不需要新子句。
+- 不改 `block_issue_from_entry`、`block_issue_from_retry`、`terminate_running_issue`、`schedule_issue_retry` 的簽名，也不新增 `_for_test` 函式。
+- 任何一步失敗（非 Linear tracker、留言失敗、轉狀態失敗）都退回 S3 的 hold，不會讓失敗的 run 悄悄通過。
 
 ## 5. 重現指令
 

@@ -123,6 +123,9 @@ defmodule SymphonyElixir.TestSupport do
           allowed_issue_identifiers: nil,
           hold_after_normal_completion: false,
           verify_gate_enabled: nil,
+          verify_gate_rework_enabled: nil,
+          stop_file_enabled: nil,
+          attempt_fields_enabled: nil,
           verify_record_path: nil,
           max_attempts_per_issue: nil,
           agent_stall_timeout_ms: nil,
@@ -186,6 +189,9 @@ defmodule SymphonyElixir.TestSupport do
     allowed_issue_identifiers = Keyword.get(config, :allowed_issue_identifiers)
     hold_after_normal_completion = Keyword.get(config, :hold_after_normal_completion)
     verify_gate_enabled = Keyword.get(config, :verify_gate_enabled)
+    verify_gate_rework_enabled = Keyword.get(config, :verify_gate_rework_enabled)
+    stop_file_enabled = Keyword.get(config, :stop_file_enabled)
+    attempt_fields_enabled = Keyword.get(config, :attempt_fields_enabled)
     verify_record_path = Keyword.get(config, :verify_record_path)
     max_attempts_per_issue = Keyword.get(config, :max_attempts_per_issue)
     agent_stall_timeout_ms = Keyword.get(config, :agent_stall_timeout_ms)
@@ -253,6 +259,9 @@ defmodule SymphonyElixir.TestSupport do
           "  allowed_issue_identifiers: #{yaml_value(allowed_issue_identifiers)}",
         "  hold_after_normal_completion: #{yaml_value(hold_after_normal_completion)}",
         !is_nil(verify_gate_enabled) && "  verify_gate_enabled: #{yaml_value(verify_gate_enabled)}",
+        !is_nil(verify_gate_rework_enabled) && "  verify_gate_rework_enabled: #{yaml_value(verify_gate_rework_enabled)}",
+        !is_nil(stop_file_enabled) && "  stop_file_enabled: #{yaml_value(stop_file_enabled)}",
+        !is_nil(attempt_fields_enabled) && "  attempt_fields_enabled: #{yaml_value(attempt_fields_enabled)}",
         !is_nil(verify_record_path) && "  verify_record_path: #{yaml_value(verify_record_path)}",
         !is_nil(max_attempts_per_issue) &&
           "  max_attempts_per_issue: #{yaml_value(max_attempts_per_issue)}",

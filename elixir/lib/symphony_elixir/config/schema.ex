@@ -173,6 +173,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_attempts_per_issue, :integer)
       field(:stall_timeout_ms, :integer)
       field(:dispatch_lint_enabled, :boolean, default: false)
+      field(:stop_file_enabled, :boolean, default: false)
+      field(:attempt_fields_enabled, :boolean, default: false)
+      field(:verify_gate_rework_enabled, :boolean, default: false)
       field(:required_sections, {:array, :string}, default: [])
     end
 
@@ -197,6 +200,9 @@ defmodule SymphonyElixir.Config.Schema do
           :max_attempts_per_issue,
           :stall_timeout_ms,
           :dispatch_lint_enabled,
+          :stop_file_enabled,
+          :attempt_fields_enabled,
+          :verify_gate_rework_enabled,
           :required_sections
         ],
         empty_values: []

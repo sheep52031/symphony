@@ -171,6 +171,15 @@ defmodule SymphonyElixir.Config do
   @spec verify_gate_enabled?() :: boolean()
   def verify_gate_enabled?, do: settings!().agent.verify_gate_enabled == true
 
+  @spec stop_file_enabled?() :: boolean()
+  def stop_file_enabled?, do: settings!().agent.stop_file_enabled == true
+
+  @spec attempt_fields_enabled?() :: boolean()
+  def attempt_fields_enabled?, do: settings!().agent.attempt_fields_enabled == true
+
+  @spec verify_gate_rework_enabled?() :: boolean()
+  def verify_gate_rework_enabled?, do: settings!().agent.verify_gate_rework_enabled == true
+
   @spec max_attempts_per_issue() :: pos_integer() | nil
   def max_attempts_per_issue, do: settings!().agent.max_attempts_per_issue
 
