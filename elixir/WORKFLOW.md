@@ -47,6 +47,10 @@ agent:
   backend: codex
   max_concurrent_agents: 10
   max_turns: 20
+  # Dispatch lint (JARVIS-3791): an issue is only dispatched when its description has every required section as a
+  # line start (`Why:`, `Plan:`) or a whole line (`Approval: 已核准`). Missing sections: one signed comment, no dispatch.
+  dispatch_lint_enabled: true
+  required_sections: ["Why:", "Plan:", "Approval: 已核准"]
   # Optional exact issue bindings. Unlisted issues continue using `backend`.
   # issue_backends: {"JARVIS-917": "pi"}
   # Keep enabled through restarts while previous mixed attempts may be active,
