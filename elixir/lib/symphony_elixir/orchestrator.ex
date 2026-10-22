@@ -1117,7 +1117,8 @@ defmodule SymphonyElixir.Orchestrator do
       !writer_conflict?(issue, running) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      issue_worker_slots_available?(issue, state)
+      issue_worker_slots_available?(issue, state) and
+      SymphonyElixir.DispatchLint.dispatch_allowed?(issue)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false

@@ -170,6 +170,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:hold_after_normal_completion, :boolean, default: false)
       field(:max_attempts_per_issue, :integer)
       field(:stall_timeout_ms, :integer)
+      field(:dispatch_lint_enabled, :boolean, default: false)
+      field(:required_sections, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -189,7 +191,9 @@ defmodule SymphonyElixir.Config.Schema do
           :allowed_issue_identifiers,
           :hold_after_normal_completion,
           :max_attempts_per_issue,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :dispatch_lint_enabled,
+          :required_sections
         ],
         empty_values: []
       )
