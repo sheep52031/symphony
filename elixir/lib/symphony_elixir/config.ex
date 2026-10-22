@@ -162,6 +162,9 @@ defmodule SymphonyElixir.Config do
   @spec hold_after_normal_completion?() :: boolean()
   def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
 
+  @spec verify_gate_enabled?() :: boolean()
+  def verify_gate_enabled?, do: settings!().agent.verify_gate_enabled == true
+
   @spec max_attempts_per_issue() :: pos_integer() | nil
   def max_attempts_per_issue, do: settings!().agent.max_attempts_per_issue
 

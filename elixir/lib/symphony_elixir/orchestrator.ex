@@ -214,6 +214,9 @@ defmodule SymphonyElixir.Orchestrator do
       input_required_blocker?(running_entry) ->
         block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
+      gate_reason = Config.verify_gate_enabled?() && SymphonyElixir.VerifyGate.hold_reason(running_entry, issue_id) ->
+        block_issue_from_entry(state, issue_id, running_entry, gate_reason, :normal_completion_hold)
+
       Config.hold_after_normal_completion?() ->
         Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; holding active issue after normal completion")
 

@@ -105,10 +105,37 @@ verdict is written. The same WORKFLOW turns on `agent.hold_after_normal_completi
 `agent.max_attempts_per_issue: 3`, so a normally finished attempt is held for the verdict and a stuck issue stops
 after three tries instead of looping.
 
+## Runtime veto: `agent.verify_gate_enabled` (JARVIS-3792)
+
+The hook's own result is still discarded by `Workspace.run_after_run_hook/3`. The veto is therefore a separate,
+opt-in read of `verify.json` on the normal-exit path (`Orchestrator.handle_agent_down(:normal …)`, one `cond`
+clause, logic in `SymphonyElixir.VerifyGate`).
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `agent.verify_gate_enabled` | `false` | off: the clause is skipped and nothing is read; behaviour is identical to before |
+| `agent.verify_record_path` | `runs/<issue>/verify.json` | `<issue>` = issue identifier; a relative path is resolved against the local workspace root |
+
+With the flag on, a normal exit completes only if the record exists, is a fresh (`checked_at` not before the run
+start), real (`dry_run: false`) `pass` and every fact is ok. Anything else (missing → "閘門未產出", dry run → "乾跑不算通過",
+unparsable, stale, failing facts) puts the issue in the existing `normal_completion_hold` with the failing facts as
+reason and posts a fact comment (Linear only, best effort, signed `🤖 Symphony`). A pass falls through to the old
+flow, including `hold_after_normal_completion`.
+
+- Keep `agent.hold_after_normal_completion: true` together with the gate: the gate reuses the
+  `normal_completion_hold` disposition, which a config reload releases when that flag is off.
+- A hold is sticky (no automatic retry): the operator releases it by moving the issue out of the active states or
+  restarting. The Rework state change and the comment on a real fail still come from the S1 script.
+- The record must be where the runtime looks: either set `VERIFY_RUNS_DIR=<workspace root>/runs` for the hook or set
+  `agent.verify_record_path` to an absolute path template matching `<repo>/runs/<issue>/verify.json`.
+- `SymphonyElixir.StopFile.stopped?/0` (a `STOP` file in the workspace root) and
+  `SymphonyElixir.VerifyGate.attempt_fields/1` (`last_line`, `diagnostic_tail` from the record) exist but are not
+  wired yet; see JARVIS-3793.
+
 ## Known limits
 
 - The runtime does not tell the hook which backend ran or whether the attempt failed, and does not put the diagnostic
-  tail into its own attempt record; the tail is taken from the Symphony log file (`verify.worker_log`).
-  Putting it in the attempt record, or letting the hook veto a result, needs an Elixir change (S3).
+  tail into its own attempt record; the tail is taken from the Symphony log file (`verify.worker_log`) and exposed by
+  `VerifyGate.attempt_fields/1` (not yet on `/api/v1/state`).
 - Linear comment and state change need `LINEAR_API_KEY`; without it the script still writes `verify.json`.
 - Run `scripts/test-verify-run.sh` to self-test (temporary git workspaces, fake `gh` and `curl`).
