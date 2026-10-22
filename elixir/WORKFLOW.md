@@ -31,8 +31,11 @@ hooks:
   # PR, CI, tests re-run) instead of trusting the worker, writes runs/<issue>/verify.json, comments on the issue
   # and moves it to Rework (fail) or Human Review (pass). The script lives in the operator checkout, not the
   # workspace, so a worker cannot edit its own verifier. Set SYMPHONY_REPO if that checkout is elsewhere.
+  # JARVIS-3793: scripts/after-run.sh runs verify-run.sh, then (real pass with a PR only) starts the headless Operator
+  # detached: ${JARVIS_PERSONAL:-~/Developer/Project/jarvis-personal}/scripts/operator/run.sh merges, sets Done, hands off.
+  # It also puts verify.json at <workspace root>/runs/<issue>/, the file agent.verify_record_path makes the runtime read.
   after_run: |
-    bash "${SYMPHONY_REPO:-$HOME/Developer/Project/symphony}/scripts/verify-run.sh" "$PWD"
+    bash "${SYMPHONY_REPO:-$HOME/Developer/Project/symphony}/scripts/after-run.sh" "$PWD"
   # Must exceed verify.test_timeout_s + verify.ci_wait_s, or the runtime kills the gate mid-run.
   timeout_ms: 2100000
 verify:
@@ -40,7 +43,9 @@ verify:
   test_command: cd elixir && mise exec -- mix test
   test_timeout_s: 1500
   ci_wait_s: 300
-  worker_log: ~/code/symphony/log/symphony.log
+  # <--logs-root>/log/symphony.log of the lane that runs this file (symphony-fork.service: --logs-root ~/.local/state/symphony/symphony-fork).
+  # disk_log wrap segment under <--logs-root>/log; a plain symphony.log does not exist
+  worker_log: ~/.local/state/symphony/symphony-fork/log/symphony.log.1
 agent:
   # Keep the default on Codex; pi, claude, deepseek, and antigravity are explicit local-only opt-ins.
   # claude uses the logged-in official CLI on PATH and the operator's default model; no API fallback.
@@ -64,6 +69,9 @@ agent:
   # Post-run gate: hold a normally-finished attempt for the gate verdict, and stop after three attempts.
   hold_after_normal_completion: true
   max_attempts_per_issue: 3
+  # Runtime veto (JARVIS-3792/3793): the normal exit completes only on a fresh real pass in <workspace root>/runs/<issue>/verify.json,
+  # the file scripts/after-run.sh makes verify-run.sh write. Needs hold_after_normal_completion above.
+  verify_gate_enabled: true
 pi:
   # Base command for non-interactive, non-login bash -c; Symphony supplies isolation/session flags.
   command: pi --mode rpc

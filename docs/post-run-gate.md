@@ -132,6 +132,45 @@ flow, including `hold_after_normal_completion`.
   `SymphonyElixir.VerifyGate.attempt_fields/1` (`last_line`, `diagnostic_tail` from the record) exist but are not
   wired yet; see JARVIS-3793.
 
+## Operator (`scripts/after-run.sh`, JARVIS-3793)
+
+After a real pass, a headless `claude -p` (Sonnet 5.5) merges the PR, sets the issue Done, tidies the local checkout and
+writes a memory handoff. It is event-driven: the only trigger is the `after_run` hook below. No desktop session, no cron.
+The Operator itself (merge gate, prompt, failure handling) lives in jarvis-personal `scripts/operator/` and is described
+in its `docs/operator.md`; this repo only wires it in.
+
+```mermaid
+flowchart LR
+  A[attempt ends] --> B["after_run: scripts/after-run.sh"]
+  B --> C["verify-run.sh → &lt;root&gt;/runs/ISSUE/verify.json"]
+  C --> D["runtime: verify_gate_enabled<br/>fail → hold + fact comment"]
+  C --> E{"real pass<br/>with a PR?"}
+  E -- yes --> F["setsid nohup run.sh ISSUE PR"]
+  E -- no --> G[nothing more]
+  F --> H["merge → Done → handoff<br/>failure → Human Review + comment"]
+```
+
+- **One file for both readers.** `verify-run.sh` defaults to `<repo>/runs`, the runtime reads
+  `agent.verify_record_path` (default `runs/<issue>/verify.json`) relative to the workspace root. Chosen: the hook sets
+  `VERIFY_RUNS_DIR=<workspace root>/runs` (the parent directory of the workspace), so `verify_record_path` keeps its
+  default and nothing in `lib/` or the runtime config changes. The alternative (an absolute `verify_record_path` under
+  `<repo>/runs`) would pin the runtime to one checkout path; deriving from the workspace follows whatever
+  `workspace.root` the lane uses. `VERIFY_RUNS_DIR` in the lane environment still overrides it, but then
+  `agent.verify_record_path` must point at the same directory.
+- **Gate on.** `agent.verify_gate_enabled: true` with `hold_after_normal_completion: true`, `max_attempts_per_issue: 3`
+  and `dispatch_lint_enabled: true`. A failing gate holds with a fact comment; a pass is also held until the Operator
+  moves the issue (Done) or the owner does (Human Review).
+- **Asynchronous.** The Operator is detached with `setsid nohup`, so the hook returns right after the verdict and the
+  Operator's 20 minutes do not count against `hooks.timeout_ms`. Its output goes to `runs/<issue>/operator.log` (token-redacted).
+  Only a `pass` with `dry_run: false` and a PR starts it; a fail never does.
+- **Paths.** `SYMPHONY_REPO` (this checkout, default `~/Developer/Project/symphony`), `JARVIS_PERSONAL`
+  (default `~/Developer/Project/jarvis-personal`), `OPERATOR_LOCAL_REPO` (default `$SYMPHONY_REPO`, fast-forwarded in
+  step 4), `OPERATOR_DISABLE=1` to verify only. A missing `run.sh` is reported and skipped, never fatal.
+- **`verify.worker_log`** is `~/.local/state/symphony/symphony-fork/log/symphony.log.1`, i.e. `<--logs-root>/log/symphony.log.1` (the runtime writes a disk_log wrap log: `symphony.log.1` plus `.idx`/`.siz`; there is no plain `symphony.log`)
+  of `symphony-fork.service`; a lane with another `--logs-root` sets `VERIFY_WORKER_LOG`.
+- **Self-test:** `scripts/test-after-run.sh` (fake verify script and fake Operator).
+- **Open, not wired:** the `STOP` file check and `VerifyGate.attempt_fields/1` still need runtime changes (S6).
+
 ## Known limits
 
 - The runtime does not tell the hook which backend ran or whether the attempt failed, and does not put the diagnostic
