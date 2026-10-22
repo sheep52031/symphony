@@ -44,7 +44,8 @@ verify:
   test_timeout_s: 1500
   ci_wait_s: 300
   # <--logs-root>/log/symphony.log of the lane that runs this file (symphony-fork.service: --logs-root ~/.local/state/symphony/symphony-fork).
-  worker_log: ~/.local/state/symphony/symphony-fork/log/symphony.log.1  # disk_log wrap segment under <--logs-root>/log; symphony.log itself does not exist
+  # disk_log wrap segment under <--logs-root>/log; a plain symphony.log does not exist
+  worker_log: ~/.local/state/symphony/symphony-fork/log/symphony.log.1
 agent:
   # Keep the default on Codex; pi, claude, deepseek, and antigravity are explicit local-only opt-ins.
   # claude uses the logged-in official CLI on PATH and the operator's default model; no API fallback.
