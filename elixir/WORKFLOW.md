@@ -27,6 +27,20 @@ hooks:
     fi
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
+  # Post-run gate (docs/post-run-gate.md): after every attempt the runtime re-derives the facts (clean tree, pushed,
+  # PR, CI, tests re-run) instead of trusting the worker, writes runs/<issue>/verify.json, comments on the issue
+  # and moves it to Rework (fail) or Human Review (pass). The script lives in the operator checkout, not the
+  # workspace, so a worker cannot edit its own verifier. Set SYMPHONY_REPO if that checkout is elsewhere.
+  after_run: |
+    bash "${SYMPHONY_REPO:-$HOME/Developer/Project/symphony}/scripts/verify-run.sh" "$PWD"
+  # Must exceed verify.test_timeout_s + verify.ci_wait_s, or the runtime kills the gate mid-run.
+  timeout_ms: 2100000
+verify:
+  # Read by scripts/verify-run.sh, not by the Elixir runtime. Flat `key: value` lines only.
+  test_command: cd elixir && mise exec -- mix test
+  test_timeout_s: 1500
+  ci_wait_s: 300
+  worker_log: ~/code/symphony/log/symphony.log
 agent:
   # Keep the default on Codex; pi, claude, deepseek, and antigravity are explicit local-only opt-ins.
   # claude uses the logged-in official CLI on PATH and the operator's default model; no API fallback.
@@ -43,8 +57,9 @@ agent:
   # accepted_antigravity_issue_identifiers: ["JARVIS-918"]
   # Optional exact-issue canary gate; omit all three for current behavior.
   # allowed_issue_identifiers: ["JARVIS-917"]
-  # hold_after_normal_completion: true
-  # max_attempts_per_issue: 1
+  # Post-run gate: hold a normally-finished attempt for the gate verdict, and stop after three attempts.
+  hold_after_normal_completion: true
+  max_attempts_per_issue: 3
 pi:
   # Base command for non-interactive, non-login bash -c; Symphony supplies isolation/session flags.
   command: pi --mode rpc
