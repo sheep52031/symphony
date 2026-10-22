@@ -168,6 +168,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:accepted_antigravity_issue_identifiers, {:array, :string}, default: [])
       field(:allowed_issue_identifiers, {:array, :string})
       field(:hold_after_normal_completion, :boolean, default: false)
+      field(:verify_gate_enabled, :boolean, default: false)
+      field(:verify_record_path, :string, default: "runs/<issue>/verify.json")
       field(:max_attempts_per_issue, :integer)
       field(:stall_timeout_ms, :integer)
       field(:dispatch_lint_enabled, :boolean, default: false)
@@ -190,6 +192,8 @@ defmodule SymphonyElixir.Config.Schema do
           :accepted_antigravity_issue_identifiers,
           :allowed_issue_identifiers,
           :hold_after_normal_completion,
+          :verify_gate_enabled,
+          :verify_record_path,
           :max_attempts_per_issue,
           :stall_timeout_ms,
           :dispatch_lint_enabled,

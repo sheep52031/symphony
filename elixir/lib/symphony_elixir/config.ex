@@ -168,6 +168,9 @@ defmodule SymphonyElixir.Config do
     if agent.dispatch_lint_enabled == true, do: agent.required_sections, else: []
   end
 
+  @spec verify_gate_enabled?() :: boolean()
+  def verify_gate_enabled?, do: settings!().agent.verify_gate_enabled == true
+
   @spec max_attempts_per_issue() :: pos_integer() | nil
   def max_attempts_per_issue, do: settings!().agent.max_attempts_per_issue
 
