@@ -162,6 +162,12 @@ defmodule SymphonyElixir.Config do
   @spec hold_after_normal_completion?() :: boolean()
   def hold_after_normal_completion?, do: settings!().agent.hold_after_normal_completion == true
 
+  @spec dispatch_lint_required_sections() :: [String.t()]
+  def dispatch_lint_required_sections do
+    agent = settings!().agent
+    if agent.dispatch_lint_enabled == true, do: agent.required_sections, else: []
+  end
+
   @spec verify_gate_enabled?() :: boolean()
   def verify_gate_enabled?, do: settings!().agent.verify_gate_enabled == true
 
