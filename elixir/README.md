@@ -112,6 +112,26 @@ deepseek:
   dsh_home: /absolute/path/to/deepseek-harness-state
 ```
 
+Set `agent.backend: minimax` to run turns through the MiniMax Code CLI (`mcode`) as a local-only
+opt-in. Each turn runs `<minimax.command> exec --cwd <workspace> --output-format stream-json
+--permission full --max-steps <minimax.max_steps> [--session <id>] --input -` with the prompt on
+stdin, so a long issue prompt never has to fit in an argument list. The first turn's session id is
+resumed on later turns. `minimax.data_dir` defaults to `~/.minimax` and is passed as
+`MINIMAX_DATA_DIR`; Symphony passes the path only and never reads the credential inside it. The
+operator's own `mcode login` owns authentication; there is no API fallback and no silent provider
+switch. Symphony scrubs secret-named variables from the child environment. A turn fails with a typed
+error on a non-zero exit, a failed turn, a missing result, an oversized stream buffer, the turn
+timeout (`codex.turn_timeout_ms`), or a caller exit; the CLI process group is then terminated.
+
+```yaml
+agent:
+  backend: minimax
+minimax:
+  command: /absolute/path/to/mcode
+  data_dir: /home/operator/.minimax
+  max_steps: 60
+```
+
 Worker-host eligibility is evaluated together with the selected backend. Codex may use the local
 host or a configured `worker.ssh_hosts` entry; Pi and AntiGravity always use the local host, even
 when SSH workers are configured for Codex. Per-host capacity limits apply only to that SSH host and
@@ -388,8 +408,8 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.backend` selects the default execution adapter and defaults to `codex`. `pi`, `claude`, `deepseek`, and
-  `antigravity` are local-only opt-ins in this fork. A workflow may configure SSH workers for
+- `agent.backend` selects the default execution adapter and defaults to `codex`. `pi`, `claude`, `deepseek`,
+  `minimax`, and `antigravity` are local-only opt-ins in this fork. A workflow may configure SSH workers for
   Codex while routing exact issue identifiers to local Pi/AntiGravity; a global Pi/Claude/AntiGravity
   default with configured SSH workers remains invalid.
 - Pi completion waits for the authoritative `agent_settled` event; `agent_end` with `willRetry: false`

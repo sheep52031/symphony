@@ -9,7 +9,7 @@ defmodule SymphonyElixir.AgentBackend do
 
   @type session :: term()
   @type backend :: module()
-  @type backend_id :: :antigravity | :claude | :codex | :deepseek | :pi
+  @type backend_id :: :antigravity | :claude | :codex | :deepseek | :minimax | :pi
   @type update :: %{
           required(:event) => atom(),
           required(:timestamp) => DateTime.t(),
@@ -28,6 +28,7 @@ defmodule SymphonyElixir.AgentBackend do
     "claude" => {:claude, SymphonyElixir.Claude.Backend},
     "codex" => {:codex, SymphonyElixir.Codex.AppServer},
     "deepseek" => {:deepseek, SymphonyElixir.Deepseek.Backend},
+    "minimax" => {:minimax, SymphonyElixir.MiniMax.Backend},
     "pi" => {:pi, SymphonyElixir.Pi.Backend}
   }
 
