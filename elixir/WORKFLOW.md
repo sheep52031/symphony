@@ -47,7 +47,7 @@ verify:
   # disk_log wrap segment under <--logs-root>/log; a plain symphony.log does not exist
   worker_log: ~/.local/state/symphony/symphony-fork/log/symphony.log.1
 agent:
-  # Keep the default on Codex; pi, claude, deepseek, and antigravity are explicit local-only opt-ins.
+  # Keep the default on Codex; pi, claude, deepseek, minimax, and antigravity are explicit local-only opt-ins.
   # claude uses the logged-in official CLI on PATH and the operator's default model; no API fallback.
   backend: codex
   max_concurrent_agents: 10
@@ -82,6 +82,16 @@ antigravity:
   first_event_timeout_ms: 30000
   turn_timeout_ms: 3600000
   cancel_grace_ms: 1000
+minimax:
+  # MiniMax Code CLI (`mcode`) on PATH. Authentication belongs to the operator's own `mcode login`;
+  # Symphony never reads, logs, or stores the credential, and never falls back to another source.
+  # MINIMAX_DATA_DIR points at the operator's MiniMax Code data directory; its contents are not read.
+  command: mcode
+  data_dir: ~/.minimax
+  # Optional provider/model override for the turn. Omit to use the operator's default model.
+  # model: minimax/MiniMax-M3.1-Flash
+  # Maximum assistant steps the CLI may take in one turn.
+  max_steps: 60
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
