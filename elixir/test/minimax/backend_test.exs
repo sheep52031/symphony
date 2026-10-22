@@ -9,6 +9,9 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
     @session_id "mvs_fixture_session_1"
     @turn_ms 2_000
     @fixture Path.expand("fixtures/run.jsonl", __DIR__)
+    @unbalanced_brace_fixture Path.expand("fixtures/unbalanced-brace.jsonl", __DIR__)
+    @balanced_braces_fixture Path.expand("fixtures/balanced-braces.jsonl", __DIR__)
+    @stray_closing_brace_fixture Path.expand("fixtures/stray-closing-brace.jsonl", __DIR__)
 
     setup do
       suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
@@ -154,6 +157,42 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
       assert :ok = Backend.stop_session(session)
     end
 
+    test "a brace inside a string value does not break the event scanner", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:ok, %{session_id: @session_id, result: %{"result" => "Done."}}} =
+               Backend.run_turn(session, "unbalanced-brace", %{}, run_options(self()))
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "a balanced brace pair inside a string value does not break the event scanner", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:ok, %{session_id: @session_id, result: %{"result" => "Done."}}} =
+               Backend.run_turn(session, "balanced-braces", %{}, run_options(self()))
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "a stray closing brace inside a string value does not close the event early", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:ok, %{session_id: @session_id, result: %{"result" => "Done."}}} =
+               Backend.run_turn(session, "stray-closing-brace", %{}, run_options(self()))
+
+      assert :ok = Backend.stop_session(session)
+    end
+
+    test "a malformed event fails the turn with a typed error instead of stalling", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      assert {:error, {:minimax_invalid_event, _}} =
+               Backend.run_turn(session, "bad-event", %{}, run_options(self()))
+
+      assert :ok = Backend.stop_session(session)
+    end
+
     defp run_options(caller, extra \\ []) do
       Keyword.merge([timeout_ms: @turn_ms, on_message: fn update -> send(caller, {:update, update}) end], extra)
     end
@@ -211,12 +250,19 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
             exit 0
             ;;
           no-result) exit 0 ;;
+          unbalanced-brace) cat UNBALANCED_BRACE_FIXTURE ;;
+          balanced-braces) cat BALANCED_BRACES_FIXTURE ;;
+          stray-closing-brace) cat STRAY_CLOSING_BRACE_FIXTURE ;;
+          bad-event) printf '{"type": broken}\n' ; exit 0 ;;
           huge) head -c 12000000 /dev/zero | tr '\0' a ; sleep 3 ;;
           silent) sleep 60 ;;
         esac
         cat FIXTURE_PATH
         """
         |> String.replace("FIXTURE_PATH", @fixture)
+        |> String.replace("UNBALANCED_BRACE_FIXTURE", @unbalanced_brace_fixture)
+        |> String.replace("BALANCED_BRACES_FIXTURE", @balanced_braces_fixture)
+        |> String.replace("STRAY_CLOSING_BRACE_FIXTURE", @stray_closing_brace_fixture)
       )
 
       File.chmod!(path, 0o755)

@@ -58,6 +58,19 @@ if System.get_env("SYMPHONY_RUN_LIVE_MINIMAX") == "1" do
       assert :ok = Backend.stop_session(session)
     end
 
+    test "a real turn whose answer contains braces still completes", context do
+      assert {:ok, session} = Backend.start_session(context.workspace)
+
+      prompt = "Reply with exactly this Rust code and nothing else: fn main() { println!(\"hi\"); }"
+
+      assert {:ok, %{session_id: session_id, result: %{"result" => text}}} =
+               Backend.run_turn(session, prompt, %{}, run_options(self()))
+
+      assert is_binary(session_id) and String.trim(session_id) != ""
+      assert text =~ "{"
+      assert :ok = Backend.stop_session(session)
+    end
+
     defp run_options(caller) do
       [timeout_ms: @turn_ms, on_message: fn update -> send(caller, {:update, update}) end]
     end

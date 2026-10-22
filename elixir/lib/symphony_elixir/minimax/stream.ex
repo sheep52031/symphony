@@ -14,6 +14,7 @@ defmodule SymphonyElixir.MiniMax.Stream do
   alias SymphonyElixir.Pi.Rpc
 
   @max_buffer_bytes 8_388_608
+  @invalid_event_preview 200
   @secret_name ~r/(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE[_-]?KEY)/i
   # Managed-login providers are selected through the operator's own credential store. The
   # environment copies are cleared so a stray host variable cannot silently pick another source.
@@ -92,7 +93,7 @@ defmodule SymphonyElixir.MiniMax.Stream do
     if byte_size(buffer) > @max_buffer_bytes do
       finish(state, {:error, :minimax_stream_too_large})
     else
-      {:noreply, consume(state, buffer)}
+      consume(state, buffer)
     end
   end
 
@@ -135,7 +136,10 @@ defmodule SymphonyElixir.MiniMax.Stream do
         consume(handle_event(state, event), rest)
 
       :none ->
-        %{state | active: %{state.active | pending: buffer}}
+        {:noreply, %{state | active: %{state.active | pending: buffer}}}
+
+      {:error, reason} ->
+        finish(state, {:error, reason})
     end
   end
 
@@ -158,13 +162,16 @@ defmodule SymphonyElixir.MiniMax.Stream do
 
   defp decode_json(buffer, offset, rest_offset) do
     size = rest_offset - offset
+    span = binary_part(buffer, offset, size)
 
-    case Jason.decode(binary_part(buffer, offset, size)) do
+    case Jason.decode(span) do
       {:ok, event} when is_map(event) ->
         {:ok, event, binary_part(buffer, rest_offset, byte_size(buffer) - rest_offset)}
 
       _other ->
-        :none
+        # The scanner found a complete object that is not valid JSON. Retrying would stall the
+        # turn on this span forever and silently drop every later event, including the result.
+        {:error, {:minimax_invalid_event, String.slice(span, 0, @invalid_event_preview)}}
     end
   end
 
@@ -182,6 +189,11 @@ defmodule SymphonyElixir.MiniMax.Stream do
 
       char == <<?">> ->
         scan_object(binary, offset + 1, depth, not in_string, false)
+
+      # A brace inside a string value is content, not structure. Agent messages and tool output
+      # routinely contain code and JSON, so this must be consumed before the structural clauses.
+      in_string ->
+        scan_object(binary, offset + 1, depth, true, false)
 
       char == <<?{>> ->
         scan_object(binary, offset + 1, depth + 1, false, false)
