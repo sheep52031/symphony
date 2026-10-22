@@ -137,9 +137,5 @@ defmodule SymphonyElixir.DispatchLint do
     end
   end
 
-  defp create_table do
-    :ets.new(@table, [:named_table, :public, :set])
-  rescue
-    ArgumentError -> @table
-  end
+  defp create_table, do: :ets.new(@table, [:named_table, :public, :set])
 end
