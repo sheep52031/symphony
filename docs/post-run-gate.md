@@ -166,7 +166,7 @@ flowchart LR
 - **Paths.** `SYMPHONY_REPO` (this checkout, default `~/Developer/Project/symphony`), `JARVIS_PERSONAL`
   (default `~/Developer/Project/jarvis-personal`), `OPERATOR_LOCAL_REPO` (default `$SYMPHONY_REPO`, fast-forwarded in
   step 4), `OPERATOR_DISABLE=1` to verify only. A missing `run.sh` is reported and skipped, never fatal.
-- **`verify.worker_log`** is `~/.local/state/symphony/symphony-fork/log/symphony.log`, i.e. `<--logs-root>/log/symphony.log`
+- **`verify.worker_log`** is `~/.local/state/symphony/symphony-fork/log/symphony.log.1`, i.e. `<--logs-root>/log/symphony.log.1` (the runtime writes a disk_log wrap log: `symphony.log.1` plus `.idx`/`.siz`; there is no plain `symphony.log`)
   of `symphony-fork.service`; a lane with another `--logs-root` sets `VERIFY_WORKER_LOG`.
 - **Self-test:** `scripts/test-after-run.sh` (fake verify script and fake Operator).
 - **Open, not wired:** the `STOP` file check and `VerifyGate.attempt_fields/1` still need runtime changes (S6).
