@@ -6,7 +6,7 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
 
     alias SymphonyElixir.{AgentBackend, MiniMax.Backend, Workflow, WorkflowStore}
 
-    @session_id "session-fixture-1"
+    @session_id "mvs_fixture_session_1"
     @turn_ms 2_000
     @fixture Path.expand("fixtures/run.jsonl", __DIR__)
 
@@ -70,7 +70,7 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
       assert Enum.any?(updates, &(&1[:assistant_text_delta] == "I'll create the file."))
       assert Enum.any?(updates, &(&1[:assistant_text] == "I'll create the file."))
       assert %{usage: usage} = updates |> Enum.filter(&(&1.event == :usage)) |> List.last()
-      assert usage["totalTokens"] == 8724
+      assert usage["totalTokens"] == 14_418
       assert %{event: :turn_completed, session_id: @session_id} = List.last(updates)
 
       assert [first | _] = calls(context.workspace)
@@ -191,7 +191,7 @@ if "minimax" in SymphonyElixir.AgentBackend.supported_names() do
           if [ "$previous" = "--session" ]; then session="$argument"; fi
           previous="$argument"
         done
-        [ -n "$session" ] || session="session-fixture-1"
+        [ -n "$session" ] || session="mvs_fixture_session_1"
         prompt=$(cat)
         printf '%s\n' "$*" >> .symphony/minimax/calls.txt
         printf '%s\n' "$MINIMAX_DATA_DIR" > .symphony/minimax/data-dir.txt

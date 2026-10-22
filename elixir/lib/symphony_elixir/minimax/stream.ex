@@ -208,7 +208,12 @@ defmodule SymphonyElixir.MiniMax.Stream do
         when is_binary(text) ->
           %{active | last_message: text}
 
-        %{"type" => "exec.result"} ->
+        # The CLI reports the authoritative result inside exec.completed. A standalone
+        # exec.result event is accepted too, so a framing change cannot drop the result.
+        %{"type" => "exec.completed", "result" => result} when is_map(result) ->
+          %{active | result: result}
+
+        %{"type" => "exec.result"} when is_map(event) ->
           %{active | result: event}
 
         %{"type" => "turn.failed"} ->
