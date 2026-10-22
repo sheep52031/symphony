@@ -68,6 +68,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </div>
       </header>
 
+      <%= if @payload[:stopped] do %>
+        <section class="error-card">
+          <h2 class="error-title">Stopped</h2>
+          <p class="error-copy">STOP file present in the workspace root: no new issues are dispatched.</p>
+        </section>
+      <% end %>
+
       <%= if @payload[:error] do %>
         <section class="error-card">
           <h2 class="error-title">
