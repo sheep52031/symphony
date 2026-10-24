@@ -495,6 +495,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec failure_retry_delay_for_test(pos_integer()) :: pos_integer()
+  def failure_retry_delay_for_test(attempt) when is_integer(attempt) and attempt > 0, do: failure_retry_delay(attempt)
+
+  @doc false
   @spec dispatch_active_retry_for_test(term(), Issue.t(), pos_integer(), map()) :: term()
   def dispatch_active_retry_for_test(%State{} = state, %Issue{} = issue, attempt, metadata)
       when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1713,11 +1717,13 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
+      # A capacity refusal is not a failed attempt: keep `attempt` so the backoff
+      # does not climb to the cap and the next run is not handed an inflated attempt.
       {:noreply,
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
            error: "no available orchestrator slots"
