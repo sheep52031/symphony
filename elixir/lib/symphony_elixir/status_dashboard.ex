@@ -580,7 +580,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp held_count(blocked) when is_list(blocked) do
     Enum.count(blocked, fn
-      %{disposition: disposition} when disposition in [:normal_completion_hold, :attempt_limit_hold] -> true
+      %{disposition: disposition} when disposition in [:normal_completion_hold, :attempt_limit_hold, :capacity_refusal_hold] -> true
       _ -> false
     end)
   end

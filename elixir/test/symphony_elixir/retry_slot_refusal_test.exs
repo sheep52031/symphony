@@ -30,57 +30,99 @@ defmodule SymphonyElixir.RetrySlotRefusalTest do
       claimed: MapSet.new([issue.id]),
       running: %{"other" => %{identifier: "JARVIS-1", issue: %Issue{id: "other", state: "In Progress"}, pid: self()}},
       retry_attempts: %{},
-      attempts: %{issue.id => 1}
+      attempts: %{issue.id => 1},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
   end
 
-  defp refuse(state, issue, attempt) do
-    Orchestrator.dispatch_active_retry_for_test(state, issue, attempt, %{
+  # Feed the stored refusal count back in, as the retry timer does through pop_retry_attempt_state.
+  defp next_refusal(state, issue, attempt) do
+    entry = state.retry_attempts[issue.id]
+    refusals = if entry, do: entry.capacity_refusals, else: 0
+
+    next =
+      Orchestrator.dispatch_active_retry_for_test(state, issue, attempt, %{
+        identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: false,
+        capacity_refusals: refusals
+      })
+
+    if entry = next.retry_attempts[issue.id], do: Process.cancel_timer(entry.timer_ref)
+    next
+  end
+
+  defp remaining_ms(state, issue) do
+    state.retry_attempts[issue.id].due_at_ms - System.monotonic_time(:millisecond)
+  end
+
+  test "slot refusals keep attempt and budget but back off to the cap" do
+    issue = issue()
+
+    {_, delays} =
+      Enum.reduce(1..8, {full_state(issue), []}, fn _, {st, acc} ->
+        next = next_refusal(st, issue, 5)
+        assert next.retry_attempts[issue.id].attempt == 5
+        assert next.attempts[issue.id] == 1
+        {next, [remaining_ms(next, issue) | acc]}
+      end)
+
+    expected = [10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000, 300_000]
+
+    delays
+    |> Enum.reverse()
+    |> Enum.zip(expected)
+    |> Enum.each(fn {actual, cap} -> assert actual > cap - 1_000 and actual <= cap end)
+  end
+
+  test "a real failure still advances the attempt and resets the refusal count" do
+    issue = issue()
+    state = full_state(issue)
+    state = Enum.reduce(1..3, state, fn _, st -> next_refusal(st, issue, 5) end)
+    assert state.retry_attempts[issue.id].capacity_refusals == 3
+
+    running_entry = %{
+      pid: spawn(fn -> Process.sleep(:infinity) end),
+      ref: nil,
       identifier: issue.identifier,
+      issue: issue,
       backend: "codex",
-      backend_route_explicit?: false
-    })
+      backend_route_explicit?: false,
+      retry_attempt: 5,
+      started_at: DateTime.add(DateTime.utc_now(), -60, :second),
+      last_codex_timestamp: DateTime.add(DateTime.utc_now(), -60, :second)
+    }
+
+    state = %{state | running: Map.put(state.running, issue.id, running_entry), retry_attempts: %{}}
+
+    retried = Orchestrator.restart_stalled_issue_for_test(state, issue.id, running_entry, DateTime.utc_now(), 10)
+    entry = retried.retry_attempts[issue.id]
+    Process.cancel_timer(entry.timer_ref)
+
+    assert entry.attempt == 6
+    assert entry.capacity_refusals == 0
+    assert retried.attempts[issue.id] == 1
   end
 
-  test "slot refusals keep the retry attempt and never spend the attempt budget" do
+  test "consecutive slot refusals past the cap hold the issue without spending the budget" do
     issue = issue()
     state = full_state(issue)
 
-    final =
-      Enum.reduce(1..30, state, fn _, acc ->
-        next = refuse(acc, issue, acc.retry_attempts[issue.id][:attempt] || 2)
-        Process.cancel_timer(next.retry_attempts[issue.id].timer_ref)
-        next
-      end)
+    held =
+      Orchestrator.dispatch_active_retry_for_test(state, issue, 5, %{
+        identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: false,
+        capacity_refusals: 24
+      })
 
-    assert final.retry_attempts[issue.id].attempt == 2
-    assert final.retry_attempts[issue.id].error == "no available orchestrator slots"
-    assert final.attempts[issue.id] == 1
-  end
+    assert %{disposition: :capacity_refusal_hold} = held.blocked[issue.id]
+    refute Map.has_key?(held.retry_attempts, issue.id)
+    assert MapSet.member?(held.claimed, issue.id)
+    assert held.attempts[issue.id] == 1
 
-  test "slot refusal delay stays at the attempt's backoff instead of climbing to the cap" do
-    issue = issue()
-    state = full_state(issue)
-
-    after_many =
-      Enum.reduce(1..10, state, fn _, acc ->
-        next = refuse(acc, issue, acc.retry_attempts[issue.id][:attempt] || 2)
-        Process.cancel_timer(next.retry_attempts[issue.id].timer_ref)
-        next
-      end)
-
-    entry = after_many.retry_attempts[issue.id]
-    remaining = entry.due_at_ms - System.monotonic_time(:millisecond)
-    # attempt 2 => 10s * 2^1 = 20s; before the fix the 10th refusal was capped at 300s
-    assert remaining > 0 and remaining <= 20_000
-  end
-
-  test "failure backoff doubles per attempt and caps at max_retry_backoff_ms past the boundary" do
-    write_workflow_file!(Workflow.workflow_file_path(), max_retry_backoff_ms: 300_000)
-
-    delays = Enum.map(1..8, &Orchestrator.failure_retry_delay_for_test/1)
-    assert delays == [10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000, 300_000]
-    # the exponent saturates at 2^10, far past the cap, without overflow
-    assert Orchestrator.failure_retry_delay_for_test(500) == 300_000
+    # the 24th refusal is still retried
+    still = next_refusal(state, issue, 5)
+    assert still.retry_attempts[issue.id].capacity_refusals == 1
   end
 end
