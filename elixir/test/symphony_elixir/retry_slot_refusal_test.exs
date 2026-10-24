@@ -28,7 +28,22 @@ defmodule SymphonyElixir.RetrySlotRefusalTest do
     %Orchestrator.State{
       max_concurrent_agents: 1,
       claimed: MapSet.new([issue.id]),
-      running: %{"other" => %{identifier: "JARVIS-1", issue: %Issue{id: "other", state: "In Progress"}, pid: self()}},
+      running: %{
+        "other" => %{
+          identifier: "JARVIS-1",
+          issue: %Issue{id: "other", state: "In Progress"},
+          pid: self(),
+          session_id: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          started_at: DateTime.utc_now(),
+          last_codex_timestamp: nil,
+          last_codex_message: nil,
+          last_codex_event: nil
+        }
+      },
       retry_attempts: %{},
       attempts: %{issue.id => 1},
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
@@ -81,8 +96,11 @@ defmodule SymphonyElixir.RetrySlotRefusalTest do
     state = Enum.reduce(1..3, state, fn _, st -> next_refusal(st, issue, 5) end)
     assert state.retry_attempts[issue.id].capacity_refusals == 3
 
+    {:ok, sleeper} = Agent.start(fn -> :ok end)
+    on_exit(fn -> if Process.alive?(sleeper), do: Process.exit(sleeper, :kill) end)
+
     running_entry = %{
-      pid: spawn(fn -> Process.sleep(:infinity) end),
+      pid: sleeper,
       ref: nil,
       identifier: issue.identifier,
       issue: issue,
@@ -124,5 +142,46 @@ defmodule SymphonyElixir.RetrySlotRefusalTest do
     # the 24th refusal is still retried
     still = next_refusal(state, issue, 5)
     assert still.retry_attempts[issue.id].capacity_refusals == 1
+  end
+
+  test "the 24th consecutive refusal is still retried" do
+    issue = issue()
+    state = full_state(issue)
+
+    next =
+      Orchestrator.dispatch_active_retry_for_test(state, issue, 5, %{
+        identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: false,
+        capacity_refusals: 23
+      })
+
+    entry = next.retry_attempts[issue.id]
+    Process.cancel_timer(entry.timer_ref)
+    assert entry.capacity_refusals == 24
+    refute Map.has_key?(next.blocked, issue.id)
+  end
+
+  test "a capacity hold is released by the periodic refresh once a slot frees up" do
+    issue = issue()
+    saturated = full_state(issue)
+
+    held =
+      Orchestrator.dispatch_active_retry_for_test(saturated, issue, 5, %{
+        identifier: issue.identifier,
+        backend: "codex",
+        backend_route_explicit?: false,
+        capacity_refusals: 24
+      })
+
+    # still saturated: the periodic refresh keeps the hold
+    {:reply, _, still_held} = Orchestrator.handle_call(:snapshot, self(), held)
+    assert %{disposition: :capacity_refusal_hold} = still_held.blocked[issue.id]
+
+    # the other agent finished: next refresh releases the hold, budget intact
+    {:reply, _, released} = Orchestrator.handle_call(:snapshot, self(), %{still_held | running: %{}})
+    refute Map.has_key?(released.blocked, issue.id)
+    refute MapSet.member?(released.claimed, issue.id)
+    assert released.attempts[issue.id] == 1
   end
 end

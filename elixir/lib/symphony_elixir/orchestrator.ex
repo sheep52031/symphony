@@ -2283,6 +2283,13 @@ defmodule SymphonyElixir.Orchestrator do
     not attempt_budget_exhausted?(state, issue_id)
   end
 
+  # In-memory only (no tracker call): once a slot is free again the saturated issue is released
+  # and the next poll dispatches it with its attempt budget intact.
+  defp hold_released_by_config?(state, _issue_id, %{disposition: :capacity_refusal_hold, issue: %Issue{} = issue} = blocked_entry) do
+    dispatch_slots_available?(issue, state) and
+      worker_slots_available?(state, Map.get(blocked_entry, :backend), Map.get(blocked_entry, :worker_host))
+  end
+
   defp hold_released_by_config?(_state, _issue_id, %{disposition: :backend_route_revoked} = blocked_entry) do
     Config.issue_backend_binding_matches?(
       Map.get(blocked_entry, :identifier),
