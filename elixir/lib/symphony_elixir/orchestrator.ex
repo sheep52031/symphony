@@ -12,6 +12,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # A slot refusal is not a failed attempt, but it must still back off and must not poll forever.
+  # With the 5 min backoff cap, 24 refusals is roughly 1.7 hours of waiting.
+  @max_capacity_refusals 24
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @assistant_text_bytes 65_536
@@ -992,6 +995,33 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp block_issue_from_retry(%State{} = state, issue_id, metadata, :capacity_refusal_hold) do
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(metadata, :identifier, issue_id),
+      issue: Map.get(metadata, :issue),
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      backend: Map.get(metadata, :backend),
+      backend_route_explicit?: Map.get(metadata, :backend_route_explicit?),
+      disposition: :capacity_refusal_hold,
+      reason: "no orchestrator slot after #{@max_capacity_refusals} retries; attempt budget untouched",
+      error: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.put(state.claimed, issue_id),
+        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
   defp block_issue_from_retry(%State{} = state, issue_id, metadata, :backend_route_revoked) do
     blocked_entry = %{
       issue_id: issue_id,
@@ -1474,7 +1504,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_unlimited_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata)
+    capacity_refusals = Map.get(metadata, :capacity_refusals, 0)
+
+    delay_ms =
+      if capacity_refusals > 0,
+        do: failure_retry_delay(capacity_refusals),
+        else: retry_delay(next_attempt, metadata)
+
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
@@ -1501,6 +1537,7 @@ defmodule SymphonyElixir.Orchestrator do
       | retry_attempts:
           Map.put(state.retry_attempts, issue_id, %{
             attempt: next_attempt,
+            capacity_refusals: capacity_refusals,
             timer_ref: timer_ref,
             retry_token: retry_token,
             due_at_ms: due_at_ms,
@@ -1532,7 +1569,8 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry_entry, :workspace_path),
           backend: Map.get(retry_entry, :backend),
           backend_route_explicit?: Map.get(retry_entry, :backend_route_explicit?),
-          session_id: Map.get(retry_entry, :session_id)
+          session_id: Map.get(retry_entry, :session_id),
+          capacity_refusals: Map.get(retry_entry, :capacity_refusals, 0)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1557,7 +1595,7 @@ defmodule SymphonyElixir.Orchestrator do
            state,
            issue_id,
            attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           Map.merge(metadata, %{capacity_refusals: 0, error: "retry poll failed: #{inspect(reason)}"})
          )}
     end
   end
@@ -1705,6 +1743,7 @@ defmodule SymphonyElixir.Orchestrator do
              issue.id,
              attempt + 1,
              Map.merge(metadata, %{
+               capacity_refusals: 0,
                identifier: issue.identifier,
                error: "retry dispatch refresh failed: #{inspect(reason)}"
              })
@@ -1713,16 +1752,23 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+      # A capacity refusal is not a failed attempt: keep `attempt` and the attempt budget, but
+      # count refusals separately so the wait still backs off, and hold after a hard cap.
+      refusals = Map.get(metadata, :capacity_refusals, 0) + 1
+      metadata = Map.merge(metadata, %{identifier: issue.identifier, issue: issue})
+
+      if refusals > @max_capacity_refusals do
+        Logger.warning("Holding #{issue_context(issue)} after #{@max_capacity_refusals} consecutive slot refusals")
+        {:noreply, block_issue_from_retry(state, issue.id, metadata, :capacity_refusal_hold)}
+      else
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt,
+           Map.merge(metadata, %{capacity_refusals: refusals, error: "no available orchestrator slots"})
+         )}
+      end
     end
   end
 
@@ -2235,6 +2281,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp hold_released_by_config?(state, issue_id, %{disposition: :attempt_limit_hold}) do
     not attempt_budget_exhausted?(state, issue_id)
+  end
+
+  # In-memory only (no tracker call): once a slot is free again the saturated issue is released
+  # and the next poll dispatches it with its attempt budget intact.
+  defp hold_released_by_config?(state, _issue_id, %{disposition: :capacity_refusal_hold, issue: %Issue{} = issue} = blocked_entry) do
+    dispatch_slots_available?(issue, state) and
+      worker_slots_available?(state, Map.get(blocked_entry, :backend), Map.get(blocked_entry, :worker_host))
   end
 
   defp hold_released_by_config?(_state, _issue_id, %{disposition: :backend_route_revoked} = blocked_entry) do
